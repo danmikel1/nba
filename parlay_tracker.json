@@ -1,0 +1,131 @@
+[
+    {
+        "id": 1766818799944,
+        "name": "Parlay #1",
+        "date": "2025-12-27 14:59",
+        "legs": [
+            {
+                "player": "Jaylon Tyson",
+                "opponent": "HOU",
+                "market": "PTS",
+                "line": 8.5,
+                "side": "OVER",
+                "odds": 1.83,
+                "prob": 0.5814,
+                "proj": 10.34215323194866,
+                "ev": 0.06396200000000007,
+                "position": "PG",
+                "result": "Win"
+            },
+            {
+                "player": "Nickeil Alexander-Walker",
+                "opponent": "NYK",
+                "market": "PTS",
+                "line": 18.5,
+                "side": "UNDER",
+                "odds": 1.83,
+                "prob": 0.5678,
+                "proj": 17.30953974711779,
+                "ev": 0.039074,
+                "position": "PG",
+                "result": "Loss"
+            }
+        ],
+        "num_legs": 2,
+        "stake": 50.0,
+        "combined_odds": 3.35,
+        "combined_prob": 0.3301,
+        "potential_payout": 167.45,
+        "potential_profit": 117.45,
+        "result": "Loss",
+        "legs_hit": 1,
+        "legs_decided": 2,
+        "actual_payout": 0.0
+    },
+    {
+        "id": 1766819283564,
+        "name": "Parlay #2",
+        "date": "2025-12-27 15:08",
+        "legs": [
+            {
+                "player": "Sam Merrill",
+                "opponent": "HOU",
+                "market": "PTS",
+                "line": 10.5,
+                "side": "OVER",
+                "odds": 1.83,
+                "prob": 0.5887,
+                "proj": 12.09912054915835,
+                "ev": 0.07732100000000003,
+                "position": "PG",
+                "result": "Win"
+            },
+            {
+                "player": "Evan Mobley",
+                "opponent": "HOU",
+                "market": "PTS",
+                "line": 14.5,
+                "side": "OVER",
+                "odds": 1.83,
+                "prob": 0.5944,
+                "proj": 16.334449486548372,
+                "ev": 0.08775200000000011,
+                "position": "C",
+                "result": "Loss"
+            }
+        ],
+        "num_legs": 2,
+        "stake": 50.0,
+        "combined_odds": 3.35,
+        "combined_prob": 0.3499,
+        "potential_payout": 167.45,
+        "potential_profit": 117.45,
+        "result": "Loss",
+        "legs_hit": 1,
+        "legs_decided": 2,
+        "actual_payout": 0.0
+    },
+    {
+        "id": 1766819693249,
+        "name": "Parlay #3",
+        "date": "2025-12-27 15:14",
+        "legs": [
+            {
+                "player": "Jabari Smith Jr.",
+                "opponent": "CLE",
+                "market": "PTS",
+                "line": 15.5,
+                "side": "OVER",
+                "odds": 1.83,
+                "prob": 0.5924,
+                "proj": 16.512751033277127,
+                "ev": 0.08409200000000011,
+                "position": "SF",
+                "result": "Loss"
+            },
+            {
+                "player": "Michael Porter Jr.",
+                "opponent": "MIN",
+                "market": "PTS",
+                "line": 23.5,
+                "side": "OVER",
+                "odds": 1.83,
+                "prob": 0.609,
+                "proj": 26.21545138059866,
+                "ev": 0.11447000000000007,
+                "position": "SF",
+                "result": "Win"
+            }
+        ],
+        "num_legs": 2,
+        "stake": 30.0,
+        "combined_odds": 3.35,
+        "combined_prob": 0.3608,
+        "potential_payout": 100.47,
+        "potential_profit": 70.47,
+        "result": "Loss",
+        "legs_hit": 1,
+        "legs_decided": 2,
+        "actual_payout": 0.0
+    }
+]
