@@ -22,4 +22,5 @@ COPY . .
 EXPOSE 9625
 
 # Run the app
-CMD ["streamlit", "run", "nbav13_refactored.py", "--server.port=9625", "--server.address=0.0.0.0"]
+
+CMD ["streamlit", "run", "nba_prediction.py", "--server.port=9625", "--server.address=0.0.0.0"]
