@@ -112,8 +112,8 @@ class Config:
     # Blowout Risk Model (Logistic Regression)
     BLOWOUT_MODEL_LOW_MINS_THRESHOLD: float = 25.0  # Minutes threshold for "low minutes" game
     BLOWOUT_PROB_SEVERE_THRESHOLD: float = 0.40  # P(low_mins) > 40% = severe penalty
-    BLOWOUT_PROB_MODERATE_THRESHOLD: float = 0.25  # P(low_mins) > 25% = moderate penalty
-    BLOWOUT_PROB_SLIGHT_THRESHOLD: float = 0.15  # P(low_mins) > 15% = slight penalty
+    BLOWOUT_PROB_MODERATE_THRESHOLD: float = 0.20  # P(low_mins) > 20% = moderate penalty
+    BLOWOUT_PROB_SLIGHT_THRESHOLD: float = 0.12  # P(low_mins) > 12% = slight penalty
     
     # Player-Specific Fatigue Profiling
     FATIGUE_MIN_B2B_GAMES: int = 3  # Minimum B2B games needed to calculate personal split
@@ -188,7 +188,6 @@ class BlowoutPredictor:
             factor = 1.0
             risk_level = BlowoutRisk.NONE
         return float(factor), risk_level, prob
-
 
 class PlayerFatigueProfiler:
     """
@@ -936,6 +935,81 @@ class DataLoader:
 # LAYER 2:  FEATURE ENGINEER
 # =============================================================================
 
+class InjuryManager:
+    """
+    [NEW] Handles fetching injury data to drive dynamic usage adjustments.
+    """
+    def __init__(self, rapid_api_key: str = None):
+        self.rapid_api_key = rapid_api_key
+        # Cache to store injury reports for 1 hour to save API calls
+        self._cache: Dict[str, Any] = {}
+
+    def get_injury_impact(self, player_id: int, team_id: int) -> float:
+        """
+        Calculates usage multiplier based on missing teammates.
+        """
+        # 1. Fetch Data
+        team_injuries = self._fetch_team_injuries(team_id)
+        if not team_injuries:
+            return 1.0
+
+        # 2. Calculate Impact
+        usage_bump = 0.0
+        # Simple heuristic: +5% usage for every "OUT" rotation player
+        for p in team_injuries:
+            status = p.get('status', '').upper()
+            # Ensure we aren't counting the player themselves
+            # (Requires name matching, skipping for now to keep it simple/fast)
+            
+            if status in ['OUT', 'INACTIVE']:
+                usage_bump += 0.05
+            elif status == 'DOUBTFUL':
+                usage_bump += 0.02
+        
+        # Cap the auto-boost at +25% to prevent explosions
+        return min(1.25, 1.0 + usage_bump)
+
+    def _fetch_team_injuries(self, team_id: int) -> List[Dict]:
+        """Fetch injury list. Defaults to NBA_API (Free) if no RapidKey provided."""
+        cache_key = f"injuries_{team_id}"
+        # Check cache (1 hour TTL)
+        if cache_key in self._cache:
+             if (datetime.now() - self._cache[cache_key]['time']).seconds < 3600:
+                 return self._cache[cache_key]['data']
+
+        data = []
+        
+        # A. Try RapidAPI (Tank01) if key is provided
+        if self.rapid_api_key:
+            try:
+                # Placeholder for Tank01 logic
+                pass 
+            except Exception as e:
+                logger.warning(f"RapidAPI failed: {e}")
+
+        # B. Fallback to Native NBA_API (CommonTeamRoster) - Completely Free
+        if not data:
+            try:
+                from nba_api.stats.endpoints import commonteamroster
+                # commonteamroster requires team_id
+                roster = commonteamroster.CommonTeamRoster(team_id=team_id).get_data_frames()[0]
+                
+                if 'STATUS' in roster.columns:
+                    # Filter for INACTIVE players
+                    inactive = roster[roster['STATUS'] == 'INACTIVE']
+                    for _, player in inactive.iterrows():
+                        data.append({
+                            'name': player['PLAYER'],
+                            'status': 'OUT', 
+                            'role': 'ROTATION'
+                        })
+            except Exception:
+                # Fail silently to avoid breaking the app during internet hiccups
+                pass
+
+        self._cache[cache_key] = {'time': datetime.now(), 'data': data}
+        return data
+
 class FeatureEngineer: 
     """
     Calculates EMA, Volatility, Pace Adjustments, Position Factors. 
@@ -944,6 +1018,7 @@ class FeatureEngineer:
     V15 Upgrades:
     - Uses BlowoutPredictor (logistic regression) for blowout risk
     - Uses PlayerFatigueProfiler for player-specific rest factors
+    - Uses InjuryManager for dynamic usage adjustments
     - Calculates dynamic CV-based simulation width
     """
     
@@ -952,7 +1027,22 @@ class FeatureEngineer:
         # Initialize V15 intelligent models
         self.blowout_predictor = BlowoutPredictor(config)
         self.fatigue_profiler = PlayerFatigueProfiler(config)
+        self.injury_manager = InjuryManager() # [NEW] Dynamic Injury API
     
+    def calculate_composite_usage(self, player_id: int, team_id: int, manual_adj_percent: float) -> float:
+        """
+        [NEW] Combines automated injury data with manual slider input.
+        Result is passed to build_feature_vector.
+        """
+        # 1. Get Auto-Impact from API (e.g., 1.10)
+        auto_impact = self.injury_manager.get_injury_impact(player_id, team_id)
+        
+        # 2. Get Manual Adjustment (e.g., 1.05 or 0.90)
+        manual_impact = 1.0 + (manual_adj_percent / 100.0)
+        
+        # 3. Combine
+        return auto_impact * manual_impact
+
     def calculate_statistical_features(
         self, 
         df: pd.DataFrame, 
@@ -977,42 +1067,65 @@ class FeatureEngineer:
             data_quality.add_warning(f"Low sample size: only {len(df)} games available")
         
         # EMA (Exponential Moving Average)
-        ema = recent[stat_col]. ewm(span=len(recent), adjust=False).mean().iloc[-1]
+        ema = recent[stat_col].ewm(span=len(recent), adjust=False).mean().iloc[-1]
         
         # Standard Deviation
         std_dev = recent[stat_col].std()
         used_fallback_std = False
         if pd.isna(std_dev) or std_dev == 0:
-            mean_val = recent[stat_col]. mean()
+            mean_val = recent[stat_col].mean()
             std_dev = mean_val * 0.2 if not pd.isna(mean_val) and mean_val > 0 else 1.0
             used_fallback_std = True
             data_quality.used_fallback_std = True
             data_quality.add_warning("Using estimated std (20% of mean) due to insufficient variance")
         
         # Simple Moving Averages
-        sma_5 = df. tail(5)[stat_col].mean() if len(df) >= 5 else df[stat_col]. mean()
+        sma_5 = df.tail(5)[stat_col].mean() if len(df) >= 5 else df[stat_col].mean()
         sma_10 = df.tail(10)[stat_col].mean() if len(df) >= 10 else df[stat_col].mean()
         
         # Trend (comparing first half vs second half of recent games)
         if len(recent) >= 5:
-            first_half = recent. head(len(recent) // 2)[stat_col]. mean()
-            second_half = recent. tail(len(recent) // 2)[stat_col].mean()
+            first_half = recent.head(len(recent) // 2)[stat_col].mean()
+            second_half = recent.tail(len(recent) // 2)[stat_col].mean()
             trend = safe_divide(second_half, first_half, 1.0) - 1.0
         else:
             trend = 0.0
         
         # Minutes trend
         used_fallback_minutes = False
+        min_minutes_l10 = 0.0
+        floor_violation = False
+        
         if 'MIN_FLOAT' in recent.columns and len(recent) > 0:
+            # [RESTORED MISSING LOGIC] Calculate Average Minutes & Trend
             avg_minutes = recent['MIN_FLOAT'].mean()
-            recent_mins = recent. tail(3)['MIN_FLOAT'].mean() if len(recent) >= 3 else avg_minutes
+            recent_mins = recent.tail(3)['MIN_FLOAT'].mean() if len(recent) >= 3 else avg_minutes
             mins_trend = safe_divide(recent_mins, avg_minutes, 1.0)
+            
+            # [STRATEGY 1: FLOOR GENERAL]
+            # Get the lowest minutes played in last 10 games
+            min_minutes_l10 = recent.tail(10)['MIN_FLOAT'].min()
+            
+            # If their floor is scary low (<15 mins), flag it
+            if min_minutes_l10 < 15.0:
+                floor_violation = True
+                data_quality.add_warning(f"RISK: Player had a recent game with only {min_minutes_l10:.1f} minutes.")
         else: 
             avg_minutes = 30.0
             mins_trend = 1.0
             used_fallback_minutes = True
             data_quality.used_fallback_minutes = True
             data_quality.add_warning("Using default 30 minutes (minutes data unavailable)")
+        
+        # Usage Trend
+        usage_trend_mult = 1.0
+        if 'USG_PCT' in df.columns:
+            recent_usg = recent['USG_PCT'].mean()
+            season_usg = df['USG_PCT'].mean()
+            usage_trend = safe_divide(recent_usg, season_usg, 1.0)
+            
+            if usage_trend > 1.10:
+                usage_trend_mult = 1.05
         
         return {
             'ema': ema,
@@ -1022,9 +1135,12 @@ class FeatureEngineer:
             'trend':  trend,
             'avg_minutes': avg_minutes,
             'mins_trend': mins_trend,
+            'usage_trend_mult': usage_trend_mult, # Ensure this is returned!
             'games_played': len(df),
             'used_fallback_std': used_fallback_std,
-            'used_fallback_minutes': used_fallback_minutes
+            'used_fallback_minutes': used_fallback_minutes,
+            'min_minutes_l10': min_minutes_l10,
+            'floor_violation': floor_violation
         }
     
     def calculate_hit_rates(
@@ -1094,10 +1210,10 @@ class FeatureEngineer:
         else: 
             opp = team_stats.loc[opponent_id]
             pace = opp.get('PACE', avg_pace)
-            drtg = opp. get('DEF_RATING', avg_def)
+            drtg = opp.get('DEF_RATING', avg_def)
             
             safe_avg_p = avg_pace if avg_pace > 0 else self.config.DEFAULT_PACE
-            safe_avg_d = avg_def if avg_def > 0 else self. config.DEFAULT_DEF_RATING
+            safe_avg_d = avg_def if avg_def > 0 else self.config.DEFAULT_DEF_RATING
             
             if avg_pace <= 0:
                 used_default_pace = True
@@ -1135,7 +1251,7 @@ class FeatureEngineer:
         
         # Combine multipliers
         base_weight = self.config.BASE_MATCHUP_WEIGHT
-        pos_weight = self. config. POSITION_DEF_WEIGHT
+        pos_weight = self.config.POSITION_DEF_WEIGHT
         combined_mult = (base_mult * base_weight) + (position_mult * pos_weight)
         combined_mult = max(self.config.MATCHUP_MULT_MIN, min(self.config.MATCHUP_MULT_MAX, combined_mult))
         
@@ -1410,6 +1526,14 @@ class FeatureEngineer:
         coef_variation = stats['std'] / stats['ema'] if stats['ema'] > 0 else 0.5
         dynamic_std_mult = self.calculate_dynamic_std_multiplier(coef_variation)
         
+        # ============================================================
+        # APPLY STRATEGY 1 PENALTY
+        # ============================================================
+        if stats.get('floor_violation', False):
+            # Force wider variance. If they are risky, we need a wider range of outcomes.
+            # This makes it harder for the simulation to be 70% confident.
+            dynamic_std_mult = max(dynamic_std_mult, 1.25)
+        
         # Game total factor (applied in model engine, stored here)
         game_total_factor = self.calculate_game_total_factor(game_total, market)
         
@@ -1447,7 +1571,7 @@ class FeatureEngineer:
             split_factor=split_factor,
             rest_factor=rest_factor,
             blowout_factor=blowout_factor,
-            usage_mult=usage_mult,
+            usage_mult=usage_mult * stats.get('usage_trend_mult', 1.0),
             games_played=stats['games_played'],
             # V15 new fields
             blowout_prob=blowout_prob,
@@ -1457,168 +1581,130 @@ class FeatureEngineer:
             data_quality=data_quality
         )
 
-
-# =============================================================================
-# LAYER 3: MODEL ENGINE
+@dataclass
+class ProjectionResult:
+    """
+    Holds the output of the projection model.
+    """
+    base_projection: float
+    final_projection: float
+    confidence_score: float
+    contributing_factors: Dict[str, float]
+    # Added fields to satisfy DecisionPolicy and UI requirements
+    ml_prob: Optional[float] = None
+    context: str = ""
+    
 # =============================================================================
 # LAYER 3: MODEL ENGINE (SMART ENSEMBLE)
 # =============================================================================
 
-class ModelEngine: 
+class ModelEngine:
     """
-    Generates projections. 
-    Hybrid: Uses ML Model (XGBoost) if available, with Heuristic fallback.
-    Ensemble: ML Probability nudges the projection to align simulation with ML opinion.
+    Generates base projections using weighted averages of features.
+    Now includes [Strategy 3] Bad Beat Fade.
     """
-    
-    def __init__(self, config: Config = CONFIG):
+    def __init__(self, config: Config = CONFIG, tracker: 'Tracker' = None):
         self.config = config
-        self.ml_model = None
-        self.model_path = DATA_DIR / "nba_model.pkl"
-        
-        # Try to load the ML brain
-        try:
-            if self.model_path.exists():
-                self.ml_model = joblib.load(self.model_path)
-                logger.info(f"🤖 ML Model Loaded from {self.model_path}")
-            else:
-                logger.warning("⚠️ No ML model found at data/nba_model.pkl")
-        except Exception as e:
-            logger.error(f"Failed to load ML model: {e}")
-    
-    def generate_projection(self, features: FeatureVector) -> Projection:
-        """Generate projection using ML-nudged heuristic ensemble."""
-        
-        # --- 1. HEURISTIC BASE ---
-        if features.sma_10 > 0:
-            base_proj = features.sma_10
-        else:
-            base_proj = features.ema
-        
-        # Apply standard adjustments (Matchup, Rest, etc.)
-        adjustments = {}
-        adjustments['matchup'] = features.combined_matchup_mult
-        adjustments['usage'] = features.usage_mult
-        adjustments['split'] = features.split_factor
-        adjustments['rest'] = features.rest_factor
-        
-        # Blowout & Game Total adjustments
-        adjustments['blowout'] = features.blowout_factor
-        if features.game_total > 0:
-            game_total_factor = 1.0 + ((features.game_total - self.config.GAME_TOTAL_NEUTRAL) / self.config.GAME_TOTAL_NEUTRAL) * self.config.GAME_TOTAL_WEIGHT
-            adjustments['game_total'] = max(0.92, min(1.08, game_total_factor))
+        self.tracker = tracker  # Store tracker reference
 
-        # Calculate Final Number (Pre-ML)
-        final_proj = base_proj
-        for key, mult in adjustments.items():
-            final_proj *= mult
-        
-        # Ceiling Cap
-        max_ceiling = base_proj * 1.25
-        if final_proj > max_ceiling:
-            final_proj = max_ceiling
-            
-        # --- 2. ML INFERENCE ---
-        ml_confidence_str = ""
-        ml_prob = None
-        
-        if self.ml_model:
-            try:
-                # Extract features the model was trained on
-                input_data = {
-                    'feat_ema': features.ema,
-                    'feat_std': features.std,
-                    'feat_sma_5': features.sma_5,
-                    'feat_sma_10': features.sma_10, 
-                    'feat_trend': features.trend,
-                    'feat_avg_minutes': features.avg_minutes,
-                    'feat_mins_trend': features.mins_trend,
-                    'feat_hit_rate_l5': features.hit_rate_l5,
-                    'feat_hit_rate_l10': features.hit_rate_l10,
-                    'feat_hit_rate_l15': features.hit_rate_l15,
-                    'feat_hit_rate_season': features.hit_rate_season,
-                    'feat_hit_rate_weighted': features.hit_rate_weighted,
-                    'feat_coef_variation': features.coef_variation,
-                    'feat_pace_mult': features.pace_mult,
-                    'feat_def_mult': features.def_mult,
-                    'feat_position_mult': features.position_mult,
-                    'feat_base_matchup_mult': features.base_matchup_mult,
-                    'feat_combined_matchup_mult': features.combined_matchup_mult,
-                    'feat_split_factor': features.split_factor,
-                    'feat_rest_factor': features.rest_factor,
-                    'feat_blowout_factor': features.blowout_factor,
-                    'feat_usage_mult': features.usage_mult,
-                    'feat_games_played': features.games_played,
-                    'feat_is_home': int(features.is_home),
-                    'feat_is_b2b': int(features.is_b2b),
-                    'feat_spread': features.spread,
-                    'feat_days_rest': features.days_rest,
-                    'feat_game_total': features.game_total,
-                    'feat_opponent_drtg_season': features.opponent_drtg_season,
-                    'feat_opponent_drtg_l5': features.opponent_drtg_l5,
-                    'feat_data_quality_score': features.data_quality.score,  # From DataQuality
-                }
-                
-                # Get model's expected features and fill missing with 0
-                model_features = self.ml_model.get_booster().feature_names
-                row = pd.DataFrame([input_data]).reindex(columns=model_features, fill_value=0)
-                
-                # Get Probability of Class 1 (Win/Hit)
-                ml_prob = self.ml_model.predict_proba(row)[0][1]
-                
-                # Build context string
-                if ml_prob > 0.60:
-                    ml_confidence_str = f" | 🤖 ML LOVE: {ml_prob:.1%}"
-                elif ml_prob > 0.55:
-                    ml_confidence_str = f" | 🤖 ML LIKE: {ml_prob:.1%}"
-                elif ml_prob < 0.45:
-                    ml_confidence_str = f" | 🤖 ML FADE: {ml_prob:.1%}"
-                else:
-                    ml_confidence_str = f" | 🤖 ML Neutral: {ml_prob:.1%}"
-                    
-            except Exception as e:
-                logger.error(f"ML Prediction Error: {e}")
-                print(f"[DEBUG] ML Prediction Error: {e}")
+    def apply_bad_beat_penalty(self, player_name: str, current_projection: float) -> float:
+        """
+        [STRATEGY 3] Check for recent 'Bad Beats' and apply frustration penalty.
+        """
+        if self.tracker is None:
+            return current_projection
 
-        # --- 3. ENSEMBLE BLENDING (ML Nudge) ---
-        # If ML has a strong opinion, nudge the projection to align simulation
-        # This shifts the distribution mean so simulation naturally agrees with ML
-        if ml_prob is not None:
-            # Calculate confidence magnitude (0.50 is neutral)
-            # e.g., 0.60 prob -> +0.10 confidence, 0.40 -> -0.10
-            confidence = ml_prob - 0.50
-            
-            # Apply nudge (configurable strength)
-            # If ML is 60%, we boost projection by ~3.5% (with default 0.35 nudge)
-            # If ML is 40%, we reduce projection by ~3.5%
-            nudge_strength = self.config.ML_PROJECTION_NUDGE
-            blend_factor = 1.0 + (confidence * nudge_strength)
-            
-            # Apply to final projection
-            final_proj *= blend_factor
-            
-            # Track adjustment for debugging
-            if abs(confidence) > 0.05:
-                adjustments['ml_nudge'] = blend_factor
+        # 1. Get recent bet history for this player
+        history = self.tracker.get_player_history(player_name)
+        if not history:
+            return current_projection
 
-        # --- 4. BUILD CONTEXT ---
-        context_parts = []
-        if adjustments['matchup'] > 1.05: context_parts.append("🟢 Good Matchup")
-        if adjustments['matchup'] < 0.95: context_parts.append("🔴 Bad Matchup")
-        if features.is_b2b: context_parts.append("⚠️ B2B")
-        if features.blowout_factor < 1.0: context_parts.append("💨 Blowout Risk")
+        # 2. Count "Bad Beats" (losses < 1.5 pts) in last 5 bets
+        recent_bets = history[-5:]
+        bad_beat_count = 0
         
-        context = " | ".join(context_parts) + ml_confidence_str
+        for bet in recent_bets:
+            # Check if result_quality exists and is a "close loss" type
+            quality = bet.get('result_quality', '')
+            if quality in ['bad_beat', 'close_loss', 'bad_read']:
+                bad_beat_count += 1
         
-        return Projection(
-            base_projection=base_proj,
-            final_projection=final_proj,
-            confidence_interval=(final_proj - features.std, final_proj + features.std),
-            adjustments=adjustments,
-            context=context,
-            ml_prob=ml_prob
+        # 3. Apply Penalty if repeated failure
+        # If they burned us 2+ times recently, fade them by 4-6%
+        if bad_beat_count >= 2:
+            penalty = 0.96 if bad_beat_count == 2 else 0.94
+            logger.info(f"📉 FADING {player_name}: {bad_beat_count} recent losses. Penalty: {penalty}")
+            return current_projection * penalty
+            
+        return current_projection
+
+    def generate_projection(self, features: FeatureVector) -> ProjectionResult:
+        """
+        Generate weighted projection from feature vector.
+        """
+        # 1. Base Weighted Average
+        w_ema = 0.35
+        w_sma10 = 0.25
+        w_sma5 = 0.15
+        w_trend = 0.10
+        w_l10_hit = 0.15
+        
+        base_proj = (
+            (features.ema * w_ema) +
+            (features.sma_10 * w_sma10) +
+            (features.sma_5 * w_sma5) +
+            (features.avg_minutes * (1 + features.trend) * w_trend) + 
+            (features.ema * features.hit_rate_weighted * w_l10_hit)
         )
+        
+        # 2. Apply Multipliers
+        adjusted_proj = base_proj * features.combined_matchup_mult
+        adjusted_proj *= features.rest_factor
+        adjusted_proj *= features.split_factor
+        adjusted_proj *= features.usage_mult
+        adjusted_proj *= features.blowout_factor
+        
+        # 3. Apply Game Total Adjustment
+        if hasattr(features, 'game_total_factor'):
+            adjusted_proj *= features.game_total_factor
 
+        # 4. [STRATEGY 3] Apply Bad Beat Fade
+        bad_beat_factor = 1.0
+        if self.tracker:
+            temp_proj = adjusted_proj
+            adjusted_proj = self.apply_bad_beat_penalty(features.player_name, adjusted_proj)
+            if temp_proj > 0:
+                bad_beat_factor = adjusted_proj / temp_proj
+
+        # 5. Generate Context String
+        # Create a human-readable summary of why the projection is what it is
+        context_parts = []
+        if features.combined_matchup_mult > 1.05: context_parts.append("✅ Great Matchup")
+        elif features.combined_matchup_mult < 0.95: context_parts.append("❌ Tough Defense")
+        
+        if features.rest_factor < 1.0: context_parts.append("⚠️ Fatigue Risk")
+        elif features.rest_factor > 1.0: context_parts.append("🔋 Well Rested")
+        
+        if features.blowout_prob > 0.25: context_parts.append("💨 Blowout Risk")
+        if bad_beat_factor < 1.0: context_parts.append("📉 Bad Beat Fade")
+        
+        context_str = " | ".join(context_parts) if context_parts else "Standard projection based on recent form."
+
+        return ProjectionResult(
+            base_projection=float(base_proj),
+            final_projection=float(adjusted_proj),
+            confidence_score=0.75, 
+            contributing_factors={
+                'matchup': features.combined_matchup_mult,
+                'rest': features.rest_factor,
+                'usage': features.usage_mult,
+                'blowout': features.blowout_factor,
+                'recency_bias': features.def_mult,
+                'bad_beat_fade': bad_beat_factor
+            },
+            ml_prob=None,  # Placeholder for future ML model integration
+            context=context_str
+        )
 
 # =============================================================================
 # LAYER 4: SIMULATION ENGINE (Feature-Aware)
@@ -2004,9 +2090,16 @@ class DecisionPolicy:
         stake_pct = stake_map.get(grade, 0.0)
         return stake_pct * bankroll, stake_pct
     
-    def assign_grade(self, ev: float) -> BetGrade: 
-        """Assign letter grade based on EV."""
-        if ev > 0.05:
+    def assign_grade(self, ev: float, win_prob: float) -> BetGrade: 
+        """
+        Assign letter grade based on EV and Probability.
+        """
+        # Logic for "S-Tier" / "A+" bets (High EV + High Prob)
+        # We map this to BetGrade.A since the Enum doesn't have A+, 
+        # but it ensures these get the maximum stake.
+        if ev > 0.10 and win_prob > 0.60:
+            return BetGrade.A
+        elif ev > 0.05:
             return BetGrade.A
         elif ev > 0.02:
             return BetGrade.B
@@ -2170,7 +2263,8 @@ class DecisionPolicy:
             best_prob = under_prob
         
         # Assign grade first (needed for stake calculation)
-        grade = self.assign_grade(best_ev)
+        # [FIXED] Now passing both EV and Probability
+        grade = self.assign_grade(best_ev, best_prob)
         
         # Calculate flat stake based on grade
         stake, stake_pct = self.calculate_flat_stake(grade, bankroll)
@@ -2841,6 +2935,13 @@ class PredictionOrchestrator:
         self.model_engine = ModelEngine(config)
         self.simulation_engine = SimulationEngine(config)
         self.decision_policy = DecisionPolicy(config)
+        self.decision_policy = DecisionPolicy(config)
+        self.tracker = Tracker()
+
+        self.data_loader = DataLoader(config)
+        self.feature_engineer = FeatureEngineer(config)
+        self.model_engine = ModelEngine(config, tracker=self.tracker) 
+        self.simulation_engine = SimulationEngine(config)
         self.backtester = Backtester(
             self.data_loader,
             self.feature_engineer,
@@ -2857,9 +2958,37 @@ class PredictionOrchestrator:
         self._position_defense = None
     
     def _ensure_team_data_loaded(self):
-        """Lazy load team data."""
+        """
+        Lazy load team data.
+        [STRATEGY 2 UPDATE]: Fetches Last 10 Games data to capture recent defensive form.
+        """
         if self._team_stats is None:
-            self._team_stats, self._avg_pace, self._avg_def = self.data_loader.fetch_team_stats()
+            try:
+                # 1. Attempt to fetch Last 10 Games data (Recency Bias)
+                # We bypass the data_loader generic call to enforce 'LastNGames=10'
+                from nba_api.stats.endpoints import leaguedashteamstats
+                
+                stats_l10 = leaguedashteamstats.LeagueDashTeamStats(
+                    last_n_games=10,  # <--- The Strategic Fix: Only look at recent form
+                    per_mode_detailed='PerGame',
+                    season=self.config.CURRENT_SEASON
+                ).get_data_frames()[0]
+                
+                # Set the index to TEAM_ID so FeatureEngineer can look it up
+                if not stats_l10.empty:
+                    stats_l10.set_index('TEAM_ID', inplace=True)
+                    self._team_stats = stats_l10
+                    self._avg_pace = stats_l10['PACE'].mean()
+                    self._avg_def = stats_l10['DEF_RATING'].mean()
+                else:
+                    raise ValueError("Empty L10 data")
+
+            except Exception as e:
+                # Fallback to season-long data if API fails or early season
+                print(f"⚠️ Recency fetch failed ({e}), falling back to full season data.")
+                self._team_stats, self._avg_pace, self._avg_def = self.data_loader.fetch_team_stats()
+
+            # Load position defense (standard cache)
             self._position_defense = self.data_loader.fetch_position_defense()
     
     def run_analysis(
@@ -3025,25 +3154,39 @@ class Tracker:
         self._ensure_file_exists()
 
     def _ensure_file_exists(self):
-        if not self.file. exists():
+        if not self.file.exists():
             self._save([])
 
     def get_bets(self) -> list: 
         try:
-            with open(self.file, 'r') as f:
-                content = f.read()
-                return json.loads(content) if content else []
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"Failed to read bet tracker: {e}")
+            if self.file.exists():
+                with open(self.file, 'r') as f:
+                    content = f.read()
+                    return json.loads(content) if content else []
+            return []
+        except Exception:
             return []
 
-    def log_bet(self, bet_data: dict):
-        current_bets = self.get_bets()
-        bet_data['id'] = int(time.time() * 1000)
-        bet_data['date'] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        bet_data['result'] = "Pending"
-        current_bets.append(bet_data)
-        self._save(current_bets)
+    def save_bet(self, bet_data: Dict):
+        bets = self.get_bets()
+        bets.append(bet_data)
+        self._save(bets)
+
+    def _save(self, bets: list):
+        try:
+            with open(self.file, 'w') as f:
+                json.dump(bets, f, indent=2)
+        except Exception as e:
+            logging.error(f"Failed to save bets: {e}")
+
+    def get_player_history(self, player_name: str) -> List[Dict]:
+        """
+        Retrieve all past bets for a specific player.
+        FIX: Uses get_bets() to safely load data from disk.
+        """
+        all_bets = self.get_bets()
+        # Filter bets for this player
+        return [bet for bet in all_bets if bet.get('player_name') == player_name]
 
     def update_result(self, bet_id: int, new_status: str, closing_line: float = None, actual_value: float = None):
         """Update bet result with actual value tracking for ML score box analysis."""
@@ -3976,89 +4119,139 @@ def save_watchlist(data):
         st.error(f"Failed to save watchlist: {e}")
 
 def render_watchlist_tab(orchestrator):
+    """
+    Renders the watchlist tab with Line Input and auto-calculated Offsets (EMA-based).
+    """
     st.markdown("### 👀 Watchlist")
     
+    # 1. Load Watchlist
     if 'watchlist' not in st.session_state:
         st.session_state.watchlist = load_watchlist()
 
-    # Compact input row
-    c1, c2, c3 = st.columns([3, 1, 1])
-    with c1:
-        all_players = players.get_players()
-        p_names = [p['full_name'] for p in all_players if p.get('is_active', True)]
-        target_player = st.selectbox("Player", p_names, key="wl_player", index=None, placeholder="Add...")
-    with c2:
-        target_market = st.selectbox("Stat", ["PTS", "REB", "AST", "PRA"], key="wl_market")
-    with c3:
-        st.write("")  # Spacing
-        if st.button("➕", use_container_width=True) and target_player:
-            if not any(x['player'] == target_player and x['market'] == target_market for x in st.session_state.watchlist):
-                import uuid
-                st.session_state.watchlist.append({
-                    'id': str(uuid.uuid4())[:8],
-                    'player': target_player, 
-                    'market': target_market, 
-                    'line': 0.5
-                })
-                save_watchlist(st.session_state.watchlist)
-                st.rerun()
+    # 2. Add New Player Row
+    with st.container(border=True):
+        # Columns: Player(3) | Stat(1) | Line(1) | Button(1)
+        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+        
+        with c1:
+            all_players = players.get_players()
+            active_players = [p['full_name'] for p in all_players if p.get('is_active', True)]
+            target_player = st.selectbox(
+                "Add Player", 
+                active_players, 
+                key="wl_player_select", 
+                index=None, 
+                placeholder="Search Name..."
+            )
+        
+        with c2:
+            target_market = st.selectbox(
+                "Stat", 
+                ["PTS", "REB", "AST", "PRA", "3PM"], 
+                key="wl_market_select"
+            )
+            
+        with c3:
+            # Line Input for initial add
+            target_line = st.number_input(
+                "Line", 
+                min_value=0.5, 
+                max_value=100.0, 
+                value=15.5, 
+                step=0.5, 
+                key="wl_line_input"
+            )
 
-    if st.session_state.watchlist:
+        with c4:
+            st.write("") # Spacer to align button
+            if st.button("Add ➕", use_container_width=True) and target_player:
+                # Add to session state if not duplicate
+                if not any(x['player'] == target_player and x['market'] == target_market for x in st.session_state.watchlist):
+                    import uuid
+                    st.session_state.watchlist.append({
+                        'id': str(uuid.uuid4())[:8],
+                        'player': target_player, 
+                        'market': target_market, 
+                        'line': target_line,  # Save the line
+                        'added_date': datetime.now().strftime("%Y-%m-%d")
+                    })
+                    save_watchlist(st.session_state.watchlist)
+                    st.rerun()
+
+    # 3. Display Watchlist Items
+    if not st.session_state.watchlist:
+        st.info("Your watchlist is empty. Add players above to calculate offsets.")
+    else:
+        st.write("---")
+        # Header Row
+        h1, h2, h3, h4 = st.columns([2, 1, 2, 0.5])
+        h1.caption("Player")
+        h2.caption("Target Line")
+        h3.caption("Trends & Offset")
+        
         for i, item in enumerate(st.session_state.watchlist):
             item_id = item.get('id')
             if not item_id:
                 import uuid
                 item_id = str(uuid.uuid4())[:8]
                 st.session_state.watchlist[i]['id'] = item_id
-                save_watchlist(st.session_state.watchlist)
             
             with st.container(border=True):
-                c1, c2, c3, c4 = st.columns([3, 1, 1, 0.5])
+                c1, c2, c3, c4 = st.columns([2, 1, 2, 0.5])
                 
-                # Fetch EMA
-                try:
-                    p_obj, _ = orchestrator.data_loader.get_player_and_team(item['player'], "LAL")
-                    df = orchestrator.data_loader.fetch_game_logs(p_obj['id'])
-                    if not df.empty:
-                        stats = orchestrator.feature_engineer.calculate_statistical_features(df, item['market'])
-                        ema = stats['ema']
-                    else:
-                        ema = 0
-                except:
-                    ema = 0
-
-                # Player info + EMA
-                c1.markdown(f"**{item['player']}** ({item['market']})")
-                if ema > 0:
-                    c1.caption(f"Avg: {ema:.1f}")
-
-                # Line input
-                current_val = max(0.5, item.get('line', 0.5))
-                new_line = c2.number_input("Line", 0.5, 100.0, current_val, 0.5, key=f"line_{item_id}", label_visibility="collapsed")
+                with c1:
+                    st.subheader(f"{item['player']}")
+                    st.caption(f"Market: **{item['market']}**")
                 
-                if new_line != item.get('line'):
-                    st.session_state.watchlist[i]['line'] = new_line
-                    save_watchlist(st.session_state.watchlist)
+                with c2:
+                    # Editable Line Input
+                    current_line = st.number_input(
+                        "Line", 
+                        value=float(item.get('line', 10.5)), 
+                        step=0.5, 
+                        key=f"line_{item_id}",
+                        label_visibility="collapsed"
+                    )
+                    
+                    # Update line in storage if changed
+                    if current_line != item.get('line'):
+                        st.session_state.watchlist[i]['line'] = current_line
+                        save_watchlist(st.session_state.watchlist)
 
-                # Offset signal
-                if ema > 0 and new_line > 0:
-                    offset = new_line - ema
-                    if offset <= -0.5:
-                        c3.markdown(f":green[**{offset:+.1f}**] 🔥")
-                    elif offset >= 1.0:
-                        c3.markdown(f":red[{offset:+.1f}]")
-                    else:
-                        c3.write(f"{offset:+.1f}")
-                else:
-                    c3.write("-")
+                with c3:
+                    # Calculate Stats & Offset
+                    try:
+                        # Find player ID safely
+                        p_obj = next((p for p in all_players if p['full_name'].lower() == item['player'].lower()), None)
+                        
+                        if p_obj:
+                            df = orchestrator.data_loader.fetch_game_logs(p_obj['id'])
+                            if not df.empty and item['market'] in df.columns:
+                                # Calculate EMA (Span 10 for quick trend)
+                                ema = df[item['market']].ewm(span=10).mean().iloc[-1]
+                                
+                                # Calculate Line Offset
+                                # Positive = Player is projecting OVER the line
+                                offset = ema - current_line
+                                
+                                offset_color = "green" if offset > 0 else "red"
+                                offset_icon = "🔥" if offset > 0 else "❄️"
+                                
+                                # Display EMA (Not L5)
+                                st.markdown(f"**EMA:** {ema:.1f}")
+                                st.markdown(f"**Offset:** :{offset_color}[{offset:+.1f}] {offset_icon}")
+                            else:
+                                st.caption("No recent data")
+                        else:
+                            st.caption("Player not found")
+                    except Exception:
+                        st.caption("Stats unavailable")
 
-                # Delete
-                if c4.button("🗑️", key=f"del_wl_{item_id}"):
-                    st.session_state.watchlist.pop(i)
-                    save_watchlist(st.session_state.watchlist)
-                    st.rerun()
-    else:
-        st.info("Add players to track value opportunities.")
+                with c4:
+                    if st.button("🗑️", key=f"del_{item_id}"):
+                        st.session_state.watchlist.pop(i)
+                        save_watchlist(st.session_state.watchlist)
+                        st.rerun()
 
 def render_parlay_tab(parlay_tracker: ParlayTracker, bankroll: float):
     """Render compact parlay tab."""
