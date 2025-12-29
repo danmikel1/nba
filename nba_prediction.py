@@ -145,114 +145,48 @@ FATIGUE_PROFILE_CACHE_FILE = DATA_DIR / "fatigue_profiles.json"
 
 class BlowoutPredictor:
     """
-    Logistic regression model to predict probability of playing < 25 minutes.
-    
-    Instead of guessing blowout risk from static spread thresholds, this model
-    learns from real game context: spread, player importance (avg minutes),
-    home/away, opponent strength.
-    
-    Features:
-    - abs_spread: Absolute point spread
-    - avg_minutes: Player's average minutes (proxy for star status)
-    - is_home: Home/away (home favorites rest more in blowouts)
-    - is_star: Binary flag for high-minute players
-    - spread_x_star: Interaction term (stars sit more in blowouts)
-    
-    Output: P(minutes < 25) - probability of reduced playing time
+    Predicts blowout risk to adjust minute projections.
     """
-    
     def __init__(self, config: Config = CONFIG):
         self.config = config
-        # Logistic regression coefficients (trained offline or can be updated)
-        # These coefficients are derived from NBA play pattern analysis:
-        # - Higher spreads → more blowout risk
-        # - Star players (high avg minutes) → more likely to rest in blowouts
-        # - Home favorites → slightly more likely to rest starters
-        self.intercept = -3.5  # Base log-odds (low baseline probability)
-        self.coef_abs_spread = 0.12  # Each point of spread increases risk
-        self.coef_avg_minutes = 0.04  # Higher minute players get rested more
-        self.coef_is_home_favorite = 0.25  # Home team favorites rest more
-        self.coef_spread_x_star = 0.03  # Interaction: stars + big spread
-        self.coef_opponent_weak = 0.15  # Playing weak opponent
+        self.intercept = -3.5  
+        self.coef_abs_spread = 0.12  
+        self.coef_avg_minutes = 0.04  
+        self.coef_is_home_favorite = 0.25  
+        self.coef_spread_x_star = 0.03  
+        self.coef_opponent_weak = 0.15  
     
-    def predict_low_minutes_prob(
-        self,
-        spread: float,
-        avg_minutes: float,
-        is_home: bool,
-        opponent_drtg: float = 115.0,
-        league_avg_drtg: float = 115.0
-    ) -> float:
-        """
-        Predict probability of playing < 25 minutes.
-        
-        Args:
-            spread: Point spread (negative = favorite)
-            avg_minutes: Player's average minutes per game
-            is_home: Whether player's team is home
-            opponent_drtg: Opponent's defensive rating
-            league_avg_drtg: League average defensive rating
-            
-        Returns:
-            Probability between 0 and 1
-        """
+    def predict_low_minutes_prob(self, spread, avg_minutes, is_home, opponent_drtg=115.0, league_avg_drtg=115.0):
         abs_spread = abs(spread)
         is_favorite = spread < 0 if is_home else spread > 0
         is_home_favorite = is_home and is_favorite
         is_star = avg_minutes >= self.config.STAR_MINUTES_THRESHOLD
-        opponent_weak = opponent_drtg > league_avg_drtg + 3  # Poor defense
+        opponent_weak = opponent_drtg > league_avg_drtg + 3
         
-        # Calculate log-odds
         log_odds = self.intercept
         log_odds += self.coef_abs_spread * abs_spread
-        log_odds += self.coef_avg_minutes * (avg_minutes - 28)  # Center around 28 min
+        log_odds += self.coef_avg_minutes * (avg_minutes - 28)
         log_odds += self.coef_is_home_favorite * float(is_home_favorite)
         log_odds += self.coef_spread_x_star * abs_spread * float(is_star)
         log_odds += self.coef_opponent_weak * float(opponent_weak)
         
-        # Convert to probability via sigmoid
         prob = 1.0 / (1.0 + np.exp(-log_odds))
-        
         return float(np.clip(prob, 0.01, 0.95))
     
-    def get_blowout_factor(
-        self,
-        spread: float,
-        avg_minutes: float,
-        is_home: bool,
-        opponent_drtg: float = 115.0,
-        league_avg_drtg: float = 115.0
-    ) -> Tuple[float, 'BlowoutRisk', float]:
-        """
-        Calculate blowout factor based on predicted low-minutes probability.
-        
-        Returns:
-            Tuple of (blowout_factor, risk_level, predicted_prob)
-        """
-        prob = self.predict_low_minutes_prob(
-            spread, avg_minutes, is_home, opponent_drtg, league_avg_drtg
-        )
-        
-        # Convert probability to factor
-        # Higher probability of low minutes → lower factor (more penalty)
+    def get_blowout_factor(self, spread, avg_minutes, is_home, opponent_drtg=115.0, league_avg_drtg=115.0):
+        prob = self.predict_low_minutes_prob(spread, avg_minutes, is_home, opponent_drtg, league_avg_drtg)
         if prob >= self.config.BLOWOUT_PROB_SEVERE_THRESHOLD:
-            # Severe risk: scale factor from 0.75 to 0.85 based on prob
-            factor = 0.85 - (prob - 0.40) * 0.25
-            factor = max(0.70, factor)
+            factor = max(0.70, 0.85 - (prob - 0.40) * 0.25)
             risk_level = BlowoutRisk.HIGH
         elif prob >= self.config.BLOWOUT_PROB_MODERATE_THRESHOLD:
-            # Moderate risk: scale from 0.88 to 0.92
             factor = 0.92 - (prob - 0.25) * 0.27
             risk_level = BlowoutRisk.MODERATE
         elif prob >= self.config.BLOWOUT_PROB_SLIGHT_THRESHOLD:
-            # Slight risk: scale from 0.95 to 0.97
             factor = 0.97 - (prob - 0.15) * 0.20
             risk_level = BlowoutRisk.SLIGHT
         else:
-            # Minimal risk
             factor = 1.0
             risk_level = BlowoutRisk.NONE
-        
         return float(factor), risk_level, prob
 
 
@@ -260,12 +194,11 @@ class PlayerFatigueProfiler:
     """
     [FIXED v15.1] Correctly caches nested dictionaries to prevent KeyError.
     """
-    
     def __init__(self, config: Config = CONFIG):
         self.config = config
         self._profile_cache: Dict[int, Dict[str, Any]] = {}
         self._load_cache()
-    
+
     def _load_cache(self):
         """Load cached fatigue profiles from disk."""
         try:
@@ -276,7 +209,7 @@ class PlayerFatigueProfiler:
                     self._profile_cache = {int(k): v for k, v in raw_cache.items()}
         except (json.JSONDecodeError, IOError):
             self._profile_cache = {}
-    
+
     def _save_cache(self):
         """Save fatigue profiles to disk."""
         try:
@@ -284,26 +217,29 @@ class PlayerFatigueProfiler:
                 json.dump(self._profile_cache, f)
         except IOError as e:
             logger.warning(f"Failed to save fatigue cache: {e}")
-    
+
     def calculate_fatigue_profile(self, df: pd.DataFrame, stat_col: str, player_id: int) -> Dict[str, float]:
-        """Get fatigue profile, checking cache first."""
-        # Check cache: [player_id][stat_col] -> {b2b_factor: 0.95, ...}
+        """
+        Get fatigue profile, ensuring nested [player][stat] structure is preserved.
+        """
+        # 1. Check nested cache: [player_id][stat_col]
         if player_id in self._profile_cache:
             if stat_col in self._profile_cache[player_id]:
                 return self._profile_cache[player_id][stat_col]
         
-        # Calculate fresh
+        # 2. Calculate fresh
         profile = self._compute_fatigue_splits(df, stat_col)
         
-        # Save to cache structure
+        # 3. Initialize player level if missing
         if player_id not in self._profile_cache:
             self._profile_cache[player_id] = {}
         
+        # 4. Save to cache structure
         self._profile_cache[player_id][stat_col] = profile
         self._save_cache()
         
         return profile
-    
+
     def _compute_fatigue_splits(self, df: pd.DataFrame, stat_col: str) -> Dict[str, float]:
         """Compute fatigue splits from game log data."""
         if len(df) < 5 or stat_col not in df.columns or 'GAME_DATE' not in df.columns:
@@ -330,20 +266,17 @@ class PlayerFatigueProfiler:
         else:
             b2b_factor = self.config.FATIGUE_DEFAULT_PENALTY
             
-        # Rest Factors
-        rest_2_games = df[df['days_rest'] == 2]
+        # Rest Factors (simplified for robustness)
         rest_3plus_games = df[df['days_rest'] >= 3]
-        
-        rest_2_factor = min(1.05, rest_2_games[stat_col].mean() / baseline) if len(rest_2_games) >= 3 else 1.0
         rest_3_factor = min(1.08, rest_3plus_games[stat_col].mean() / baseline) if len(rest_3plus_games) >= 3 else self.config.REST_BONUS_3_PLUS
         
         return {
             'b2b_factor': round(b2b_factor, 3),
-            'rest_2_factor': round(rest_2_factor, 3),
+            'rest_2_factor': 1.0, 
             'rest_3plus_factor': round(rest_3_factor, 3),
             'b2b_games': b2b_count
         }
-    
+
     def _default_profile(self) -> Dict[str, float]:
         return {
             'b2b_factor': self.config.FATIGUE_DEFAULT_PENALTY,
@@ -351,299 +284,21 @@ class PlayerFatigueProfiler:
             'rest_3plus_factor': self.config.REST_BONUS_3_PLUS,
             'b2b_games': 0
         }
-    
+
     def get_rest_factor(self, days_rest: int, df: pd.DataFrame, stat_col: str, player_id: int) -> Tuple[float, Dict[str, float]]:
-        profile = self.calculate_fatigue_profile(df, stat_col, player_id)
-        if days_rest <= 0: return profile['b2b_factor'], profile
-        elif days_rest == 1: return 1.0, profile
-        elif days_rest == 2: return profile['rest_2_factor'], profile
-        else: return profile['rest_3plus_factor'], profile
-    """
-    [FIXED v15.1] Correctly caches nested dictionaries to prevent KeyError.
-    """
-    
-    def __init__(self, config: Config = CONFIG):
-        self.config = config
-        self._profile_cache: Dict[int, Dict[str, Any]] = {}
-        self._load_cache()
-    
-    def _load_cache(self):
-        """Load cached fatigue profiles from disk."""
-        try:
-            if FATIGUE_PROFILE_CACHE_FILE.exists():
-                with open(FATIGUE_PROFILE_CACHE_FILE, 'r') as f:
-                    raw_cache = json.load(f)
-                    # Convert string keys back to int for player IDs
-                    self._profile_cache = {int(k): v for k, v in raw_cache.items()}
-        except (json.JSONDecodeError, IOError):
-            self._profile_cache = {}
-    
-    def _save_cache(self):
-        """Save fatigue profiles to disk."""
-        try:
-            with open(FATIGUE_PROFILE_CACHE_FILE, 'w') as f:
-                json.dump(self._profile_cache, f)
-        except IOError as e:
-            logger.warning(f"Failed to save fatigue cache: {e}")
-    
-    def calculate_fatigue_profile(self, df: pd.DataFrame, stat_col: str, player_id: int) -> Dict[str, float]:
-        """Get fatigue profile, checking cache first."""
-        # Check cache: [player_id][stat_col] -> {b2b_factor: 0.95, ...}
-        if player_id in self._profile_cache:
-            if stat_col in self._profile_cache[player_id]:
-                return self._profile_cache[player_id][stat_col]
-        
-        # Calculate fresh
-        profile = self._compute_fatigue_splits(df, stat_col)
-        
-        # Save to cache structure
-        if player_id not in self._profile_cache:
-            self._profile_cache[player_id] = {}
-        
-        self._profile_cache[player_id][stat_col] = profile
-        self._save_cache()
-        
-        return profile
-    
-    def _compute_fatigue_splits(self, df: pd.DataFrame, stat_col: str) -> Dict[str, float]:
-        """Compute fatigue splits from game log data."""
-        if len(df) < 5 or stat_col not in df.columns or 'GAME_DATE' not in df.columns:
-            return self._default_profile()
-        
-        df = df.copy()
-        df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
-        df = df.sort_values('GAME_DATE', ascending=True)
-        df['days_rest'] = df['GAME_DATE'].diff().dt.days.fillna(2)
-        
-        b2b_games = df[df['days_rest'] <= 1]
-        non_b2b = df[df['days_rest'] > 1]
-        
-        baseline = df[stat_col].mean() if len(non_b2b) == 0 else non_b2b[stat_col].mean()
-        if baseline == 0 or pd.isna(baseline): return self._default_profile()
-        
-        # B2B Factor
-        b2b_count = len(b2b_games)
-        if b2b_count >= self.config.FATIGUE_MIN_B2B_GAMES:
-            b2b_avg = b2b_games[stat_col].mean()
-            raw_delta = (b2b_avg / baseline) - 1
-            dampened_delta = max(-0.20, min(0.10, raw_delta * self.config.FATIGUE_DAMPEN_FACTOR))
-            b2b_factor = 1.0 + dampened_delta
-        else:
-            b2b_factor = self.config.FATIGUE_DEFAULT_PENALTY
-            
-        # Rest Factors
-        rest_2_games = df[df['days_rest'] == 2]
-        rest_3plus_games = df[df['days_rest'] >= 3]
-        
-        rest_2_factor = min(1.05, rest_2_games[stat_col].mean() / baseline) if len(rest_2_games) >= 3 else 1.0
-        rest_3_factor = min(1.08, rest_3plus_games[stat_col].mean() / baseline) if len(rest_3plus_games) >= 3 else self.config.REST_BONUS_3_PLUS
-        
-        return {
-            'b2b_factor': round(b2b_factor, 3),
-            'rest_2_factor': round(rest_2_factor, 3),
-            'rest_3plus_factor': round(rest_3_factor, 3),
-            'b2b_games': b2b_count
-        }
-    
-    def _default_profile(self) -> Dict[str, float]:
-        return {
-            'b2b_factor': self.config.FATIGUE_DEFAULT_PENALTY,
-            'rest_2_factor': 1.0,
-            'rest_3plus_factor': self.config.REST_BONUS_3_PLUS,
-            'b2b_games': 0
-        }
-    
-    def get_rest_factor(self, days_rest: int, df: pd.DataFrame, stat_col: str, player_id: int) -> Tuple[float, Dict[str, float]]:
-        profile = self.calculate_fatigue_profile(df, stat_col, player_id)
-        if days_rest <= 0: return profile['b2b_factor'], profile
-        elif days_rest == 1: return 1.0, profile
-        elif days_rest == 2: return profile['rest_2_factor'], profile
-        else: return profile['rest_3plus_factor'], profile
-    """
-    Calculates player-specific fatigue response instead of using static multipliers.
-    
-    Instead of applying a blanket 5% B2B penalty to everyone, this profiles each
-    player's historical performance on back-to-backs vs normal rest.
-    
-    Example outcomes:
-    - LeBron: -12% on B2B → apply 0.88 multiplier
-    - Anthony Edwards: +2% on B2B → apply 1.0 (no penalty)
-    - Nikola Jokic: -3% on B2B → apply 0.97 (minimal penalty)
-    """
-    
-    def __init__(self, config: Config = CONFIG):
-        self.config = config
-        self._profile_cache: Dict[int, Dict[str, float]] = {}
-        self._load_cache()
-    
-    def _load_cache(self):
-        """Load cached fatigue profiles from disk."""
-        try:
-            if FATIGUE_PROFILE_CACHE_FILE.exists():
-                with open(FATIGUE_PROFILE_CACHE_FILE, 'r') as f:
-                    # Keys are stored as strings in JSON, convert back to int
-                    raw_cache = json.load(f)
-                    self._profile_cache = {int(k): v for k, v in raw_cache.items()}
-        except (json.JSONDecodeError, IOError):
-            self._profile_cache = {}
-    
-    def _save_cache(self):
-        """Save fatigue profiles to disk."""
-        try:
-            with open(FATIGUE_PROFILE_CACHE_FILE, 'w') as f:
-                json.dump(self._profile_cache, f)
-        except IOError as e:
-            logger.warning(f"Failed to save fatigue cache: {e}")
-    
-    def calculate_fatigue_profile(
-        self,
-        df: pd.DataFrame,
-        stat_col: str,
-        player_id: int
-    ) -> Dict[str, float]:
-        """
-        Calculate player's personal fatigue response from their game logs.
-        
-        Args:
-            df: Player's game log DataFrame (must have GAME_DATE column)
-            stat_col: The stat column to analyze (e.g., 'PTS')
-            player_id: Player ID for caching
-            
-        Returns:
-            Dict with fatigue metrics
-        """
-        cache_key = f"{player_id}_{stat_col}"
-        
-        # Check cache first (use string key for nested lookup)
-        if player_id in self._profile_cache:
-            cached = self._profile_cache[player_id]
-            if stat_col in cached:
-                return cached
-        
-        profile = self._compute_fatigue_splits(df, stat_col)
-        
-        # Cache the result
-        if player_id not in self._profile_cache:
-            self._profile_cache[player_id] = {}
-        self._profile_cache[player_id][stat_col] = profile['b2b_factor']
-        self._profile_cache[player_id]['rest_2_factor'] = profile['rest_2_factor']
-        self._profile_cache[player_id]['rest_3plus_factor'] = profile['rest_3plus_factor']
-        self._profile_cache[player_id]['b2b_games'] = profile['b2b_games']
-        self._save_cache()
-        
-        return profile
-    
-    def _compute_fatigue_splits(
-        self,
-        df: pd.DataFrame,
-        stat_col: str
-    ) -> Dict[str, float]:
-        """Compute fatigue splits from game log data."""
-        if len(df) < 5 or stat_col not in df.columns:
-            return self._default_profile()
-        
-        # Ensure we have date info
-        if 'GAME_DATE' not in df.columns:
-            return self._default_profile()
-        
-        df = df.copy()
-        df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
-        df = df.sort_values('GAME_DATE', ascending=True)
-        
-        # Calculate days rest between games
-        df['days_rest'] = df['GAME_DATE'].diff().dt.days.fillna(2)
-        
-        # Categorize rest
-        b2b_games = df[df['days_rest'] <= 1]
-        rest_2_games = df[df['days_rest'] == 2]
-        rest_3plus_games = df[df['days_rest'] >= 3]
-        normal_games = df[df['days_rest'] == 2]  # 1 day rest = normal
-        
-        # Calculate baseline (non-B2B average)
-        non_b2b = df[df['days_rest'] > 1]
-        if len(non_b2b) == 0:
-            baseline = df[stat_col].mean()
-        else:
-            baseline = non_b2b[stat_col].mean()
-        
-        if baseline == 0 or pd.isna(baseline):
-            return self._default_profile()
-        
-        # Calculate B2B factor
-        b2b_count = len(b2b_games)
-        if b2b_count >= self.config.FATIGUE_MIN_B2B_GAMES:
-            b2b_avg = b2b_games[stat_col].mean()
-            raw_delta = (b2b_avg / baseline) - 1  # e.g., -0.15 for 15% drop
-            # Dampen extreme values
-            dampened_delta = raw_delta * self.config.FATIGUE_DAMPEN_FACTOR
-            # Cap at reasonable bounds
-            dampened_delta = max(-0.20, min(0.10, dampened_delta))
-            b2b_factor = 1.0 + dampened_delta
-        else:
-            b2b_factor = self.config.FATIGUE_DEFAULT_PENALTY
-        
-        # Calculate extended rest factors
-        if len(rest_2_games) >= 3:
-            rest_2_avg = rest_2_games[stat_col].mean()
-            rest_2_factor = min(1.05, rest_2_avg / baseline)
-        else:
-            rest_2_factor = 1.0
-        
-        if len(rest_3plus_games) >= 3:
-            rest_3_avg = rest_3plus_games[stat_col].mean()
-            rest_3_factor = min(1.08, rest_3_avg / baseline)
-        else:
-            rest_3_factor = self.config.REST_BONUS_3_PLUS
-        
-        return {
-            'b2b_factor': round(b2b_factor, 3),
-            'rest_2_factor': round(rest_2_factor, 3),
-            'rest_3plus_factor': round(rest_3_factor, 3),
-            'b2b_games': b2b_count,
-            'total_games': len(df),
-            'baseline_avg': round(baseline, 2),
-            'b2b_avg': round(b2b_games[stat_col].mean(), 2) if b2b_count > 0 else None
-        }
-    
-    def _default_profile(self) -> Dict[str, float]:
-        """Return default fatigue profile when insufficient data."""
-        return {
-            'b2b_factor': self.config.FATIGUE_DEFAULT_PENALTY,
-            'rest_2_factor': 1.0,
-            'rest_3plus_factor': self.config.REST_BONUS_3_PLUS,
-            'b2b_games': 0,
-            'total_games': 0,
-            'baseline_avg': None,
-            'b2b_avg': None
-        }
-    
-    def get_rest_factor(
-        self,
-        days_rest: int,
-        df: pd.DataFrame,
-        stat_col: str,
-        player_id: int
-    ) -> Tuple[float, Dict[str, float]]:
-        """
-        Get player-specific rest factor based on their fatigue profile.
-        
-        Returns:
-            Tuple of (rest_factor, profile_dict)
-        """
+        """Public API to get the specific factor for today's rest."""
         profile = self.calculate_fatigue_profile(df, stat_col, player_id)
         
         if days_rest <= 0:
-            # B2B
             return profile['b2b_factor'], profile
         elif days_rest == 1:
-            # Normal rest
             return 1.0, profile
         elif days_rest == 2:
             return profile['rest_2_factor'], profile
         else:
             return profile['rest_3plus_factor'], profile
-
-
+        
+        
 # =============================================================================
 # DATA STRUCTURES
 # =============================================================================
