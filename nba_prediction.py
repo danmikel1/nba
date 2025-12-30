@@ -3185,20 +3185,66 @@ class Tracker:
         if not self.file.exists():
             self._save([])
 
+    # --- FIX 1: Compatibility Alias ---
+    def log_bet(self, bet_data: Dict):
+        """Alias for save_bet to prevent 'AttributeError'."""
+        self.save_bet(bet_data)
+
+    # --- FIX 2: Force Date & ID on New Bets ---
+    def save_bet(self, bet_data: Dict):
+        import time
+        from datetime import datetime
+        
+        bets = self.get_bets()
+        
+        # 1. Generate ID if missing
+        if 'id' not in bet_data:
+            bet_data['id'] = int(time.time() * 1000)
+            
+        # 2. Generate DATE if missing (Format: YYYY-MM-DD, no timestamp)
+        if 'date' not in bet_data or not bet_data['date']:
+            bet_data['date'] = datetime.now().strftime("%Y-%m-%d")
+            
+        bets.append(bet_data)
+        self._save(bets)
+
     def get_bets(self) -> list: 
+        """Loads bets and auto-fixes any legacy data missing dates/IDs."""
         try:
             if self.file.exists():
                 with open(self.file, 'r') as f:
                     content = f.read()
-                    return json.loads(content) if content else []
+                    data = json.loads(content) if content else []
+                
+                # Auto-Heal: Fix old bets that might be missing dates
+                if data:
+                    modified = False
+                    import time
+                    from datetime import datetime
+                    
+                    for i, bet in enumerate(data):
+                        # Fix ID
+                        if 'id' not in bet:
+                            bet['id'] = int((time.time() + i) * 1000)
+                            modified = True
+                        
+                        # Fix Date (Default to today if completely missing)
+                        if 'date' not in bet or not bet['date']:
+                            bet['date'] = datetime.now().strftime("%Y-%m-%d")
+                            modified = True
+                        
+                        # Fix Date Format (Strip timestamp if present in legacy data)
+                        if ' ' in str(bet['date']):
+                            bet['date'] = str(bet['date']).split(' ')[0]
+                            modified = True
+                            
+                    if modified:
+                        self._save(data)
+                        
+                return data
             return []
         except Exception:
             return []
-
-    def save_bet(self, bet_data: Dict):
-        bets = self.get_bets()
-        bets.append(bet_data)
-        self._save(bets)
 
     def _save(self, bets: list):
         try:
@@ -3208,101 +3254,63 @@ class Tracker:
             logging.error(f"Failed to save bets: {e}")
 
     def get_player_history(self, player_name: str) -> List[Dict]:
-        """
-        Retrieve all past bets for a specific player.
-        FIX: Uses get_bets() to safely load data from disk.
-        """
         all_bets = self.get_bets()
-        # Filter bets for this player
         return [bet for bet in all_bets if bet.get('player_name') == player_name]
 
     def update_result(self, bet_id: int, new_status: str, closing_line: float = None, actual_value: float = None):
-        """Update bet result with actual value tracking for ML score box analysis."""
         current_bets = self.get_bets()
         for bet in current_bets:
             if bet.get('id') == bet_id: 
                 bet['result'] = new_status
                 
-                # Store actual value and calculate margin
                 if actual_value is not None:
                     bet['actual_value'] = actual_value
                     line = bet.get('line', 0)
                     side = bet.get('side', 'OVER')
                     
-                    # Calculate margin (positive = favorable for bet side)
                     if side == 'OVER':
-                        # For OVER: margin = actual - line (positive = hit)
                         bet['margin'] = actual_value - line
                     else:
-                        # For UNDER: margin = line - actual (positive = hit)
                         bet['margin'] = line - actual_value
                     
-                    # Categorize result quality
                     bet['result_quality'] = self._categorize_result(new_status, bet['margin'])
                 
                 if closing_line is not None:
                     bet['closing_line'] = closing_line
-                    # Calculate CLV (positive = got better line than close)
                     opening_line = bet.get('line', 0)
                     side = bet.get('side', 'OVER')
                     if side == 'OVER':
-                        # For OVER, lower closing line = CLV positive
                         bet['clv'] = closing_line - opening_line
                     else:
-                        # For UNDER, higher closing line = CLV positive
                         bet['clv'] = opening_line - closing_line
                 break
         self._save(current_bets)
     
     def _categorize_result(self, result: str, margin: float) -> str:
-        """
-        Categorize result quality based on margin.
-        Helps ML differentiate bad beats from bad reads.
-        
-        Args:
-            result: Win, Loss, or Push
-            margin: Positive = favorable for bet side
-        """
         abs_margin = abs(margin)
         
         if result == 'Push' or abs_margin < 0.5:
             return ResultQuality.PUSH.value
         elif result == 'Win':
-            if abs_margin <= 1.5:
-                return ResultQuality.SWEAT_WIN.value
-            elif abs_margin <= 3.5:
-                return ResultQuality.CLOSE_WIN.value
-            elif abs_margin <= 7.5:
-                return ResultQuality.SOLID_WIN.value
-            else:
-                return ResultQuality.BLOWOUT_WIN.value
+            if abs_margin <= 1.5: return ResultQuality.SWEAT_WIN.value
+            elif abs_margin <= 3.5: return ResultQuality.CLOSE_WIN.value
+            elif abs_margin <= 7.5: return ResultQuality.SOLID_WIN.value
+            else: return ResultQuality.BLOWOUT_WIN.value
         elif result == 'Loss':
-            if abs_margin <= 1.5:
-                return ResultQuality.BAD_BEAT.value
-            elif abs_margin <= 3.5:
-                return ResultQuality.CLOSE_LOSS.value
-            elif abs_margin <= 7.5:
-                return ResultQuality.CLEAR_LOSS.value
-            else:
-                return ResultQuality.BAD_READ.value
+            if abs_margin <= 1.5: return ResultQuality.BAD_BEAT.value
+            elif abs_margin <= 3.5: return ResultQuality.CLOSE_LOSS.value
+            elif abs_margin <= 7.5: return ResultQuality.CLEAR_LOSS.value
+            else: return ResultQuality.BAD_READ.value
         else:
             return ResultQuality.PENDING.value
 
     def delete_bet(self, bet_id: int):
-        current_bets = self. get_bets()
+        current_bets = self.get_bets()
         current_bets = [b for b in current_bets if b.get('id') != bet_id]
         self._save(current_bets)
 
     def clear_history(self):
         self._save([])
-
-    def _save(self, data:  list):
-        try:
-            with open(self.file, 'w') as f:
-                json.dump(data, f, indent=4)
-        except IOError as e: 
-            logger.error(f"Failed to save bet tracker: {e}")
-            st.error("Failed to save bet data")
 
     def get_stats(self) -> dict:
         bets = self.get_bets()
@@ -3319,30 +3327,25 @@ class Tracker:
             elif bet.get('result') == 'Loss':
                 total_profit -= bet.get('stake', 0)
         
-        # CLV Stats
         bets_with_clv = [b for b in bets if b.get('clv') is not None]
         clv_count = len(bets_with_clv)
         avg_clv = sum(b['clv'] for b in bets_with_clv) / clv_count if clv_count > 0 else 0
         positive_clv = len([b for b in bets_with_clv if b['clv'] > 0])
         clv_positive_rate = positive_clv / clv_count if clv_count > 0 else 0
         
-        # Score Box Stats (Result Quality Breakdown)
         bets_with_margin = [b for b in bets if b.get('margin') is not None]
         margin_count = len(bets_with_margin)
         avg_margin = sum(b['margin'] for b in bets_with_margin) / margin_count if margin_count > 0 else 0
         
-        # Count by result quality
         quality_counts = {}
         for rq in ResultQuality:
             quality_counts[rq.value] = len([b for b in bets if b.get('result_quality') == rq.value])
         
-        # Bad beat rate (losses by <= 1.5)
         bad_beats = quality_counts.get(ResultQuality.BAD_BEAT.value, 0)
         bad_reads = quality_counts.get(ResultQuality.BAD_READ.value, 0)
         bad_beat_rate = bad_beats / losses if losses > 0 else 0
         bad_read_rate = bad_reads / losses if losses > 0 else 0
         
-        # Close win rate (wins by <= 1.5)
         sweat_wins = quality_counts.get(ResultQuality.SWEAT_WIN.value, 0)
         solid_wins = quality_counts.get(ResultQuality.SOLID_WIN.value, 0) + quality_counts.get(ResultQuality.BLOWOUT_WIN.value, 0)
         sweat_win_rate = sweat_wins / wins if wins > 0 else 0
@@ -3351,7 +3354,6 @@ class Tracker:
             'wins': wins, 'losses': losses, 'pushes': pushes, 'pending': pending,
             'total_decided': total_decided, 'win_rate': win_rate, 'total_profit': total_profit,
             'clv_count': clv_count, 'avg_clv': avg_clv, 'clv_positive_rate': clv_positive_rate,
-            # Score Box Stats
             'margin_count': margin_count, 'avg_margin': avg_margin,
             'quality_counts': quality_counts,
             'bad_beat_rate': bad_beat_rate, 'bad_read_rate': bad_read_rate,
@@ -3369,12 +3371,8 @@ class Tracker:
         df = pd.DataFrame(training_bets)
         df['target'] = (df['result'] == 'Win').astype(int)
         
-        # Add margin-based targets for regression/nuanced classification
         if 'margin' in df.columns:
-            # Continuous target: margin (can be used for regression)
             df['target_margin'] = df['margin'].fillna(0)
-            
-            # Quality-based target: 0=bad_read, 1=clear_loss, 2=close_loss, 3=bad_beat, 4=push, 5=sweat_win, 6=close_win, 7=solid_win, 8=blowout_win
             quality_order = {
                 ResultQuality.BAD_READ.value: 0,
                 ResultQuality.CLEAR_LOSS.value: 1,
@@ -3392,65 +3390,43 @@ class Tracker:
         return df
 
     def export_bets_to_training_csv(self, output_file: str = "ml_training_data.csv") -> Tuple[int, str]:
-        """
-        Export completed bets (with actual scores) to ML training CSV.
-        Only exports bets that haven't been exported yet.
-        
-        Returns:
-            Tuple of (num_exported, output_path)
-        """
         import csv
-        
         bets = self.get_bets()
         output_path = DATA_DIR / output_file
         
-        # Define all feature columns
         fieldnames = [
-            # Identifiers
             'date', 'player', 'opponent', 'market', 'position',
-            # Bet info
             'line', 'predicted_side', 'predicted_prob', 'predicted_ev', 'projected_value',
-            # Outcomes
             'result', 'hit', 'actual_value', 'margin', 'result_quality',
-            # Core features
             'feat_ema', 'feat_std', 'feat_sma_5', 'feat_sma_10', 'feat_trend',
             'feat_avg_minutes', 'feat_mins_trend',
-            # Hit rates
             'feat_hit_l5', 'feat_hit_l10', 'feat_hit_l15', 'feat_hit_season',
-            # Matchup multipliers
             'feat_pace_mult', 'feat_def_mult', 'feat_position_mult',
             'feat_base_matchup_mult', 'feat_combined_matchup_mult',
-            # Context factors
             'feat_split_factor', 'feat_rest_factor', 'feat_blowout_factor', 'feat_usage_mult',
-            # Game context
             'feat_spread', 'feat_is_home', 'feat_is_b2b', 'feat_days_rest',
             'feat_game_total', 'feat_opp_drtg_season', 'feat_opp_drtg_l5',
-            # Meta
-            'feat_games_played', 'closing_line', 'clv'
+            'feat_games_played', 'closing_line', 'clv',
+            'feat_blowout_prob', 'feat_personal_fatigue_factor', 'feat_b2b_games_in_sample', 'feat_dynamic_std_mult', 'feat_coef_variation'
         ]
         
-        # Check if file exists to determine if we need headers
         file_exists = output_path.exists()
-        
         exported_count = 0
         bets_modified = False
         
         with open(output_path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-            
-            # Write header only if new file
             if not file_exists:
                 writer.writeheader()
             
             for bet in bets:
-                # Only export completed bets with actual values that haven't been exported
                 if (bet.get('result') in ['Win', 'Loss'] and 
                     bet.get('actual_value') is not None and 
                     not bet.get('exported_to_csv', False)):
                     
-                    # Build the row
                     row = {
-                        'date': bet['date'].split(' ')[0],
+                        # FIX 3: Ensure Clean Date format
+                        'date': str(bet.get('date', '2024-01-01')).split(' ')[0],
                         'player': bet.get('player', ''),
                         'opponent': bet.get('opponent', ''),
                         'market': bet.get('market', ''),
@@ -3464,8 +3440,7 @@ class Tracker:
                         'hit': 1 if bet.get('result') == 'Win' else 0,
                         'actual_value': bet.get('actual_value', 0),
                         'margin': bet.get('margin', 0),
-                        'result_quality': bet.get('result_quality', ''),
-                        # Features
+                        'result_quality': bet.get('result_quality', 'legacy'),
                         'feat_ema': bet.get('feat_ema', 0),
                         'feat_std': bet.get('feat_std', 0),
                         'feat_sma_5': bet.get('feat_sma_5', 0),
@@ -3495,7 +3470,12 @@ class Tracker:
                         'feat_opp_drtg_l5': bet.get('feat_opp_drtg_l5', 0),
                         'feat_games_played': bet.get('feat_games_played', 0),
                         'closing_line': bet.get('closing_line', 0),
-                        'clv': bet.get('clv', 0)
+                        'clv': bet.get('clv', 0),
+                        'feat_blowout_prob': bet.get('blowout_prob', 0),
+                        'feat_personal_fatigue_factor': bet.get('personal_fatigue_factor', 1),
+                        'feat_b2b_games_in_sample': bet.get('b2b_games_in_sample', 0),
+                        'feat_dynamic_std_mult': bet.get('dynamic_std_mult', 1),
+                        'feat_coef_variation': bet.get('coef_variation', 0)
                     }
                     
                     writer.writerow(row)
@@ -3503,14 +3483,12 @@ class Tracker:
                     bets_modified = True
                     exported_count += 1
         
-        # Save the exported flags
         if bets_modified:
             self._save(bets)
         
         return exported_count, str(output_path)
 
     def get_exportable_count(self) -> int:
-        """Count bets ready to export (completed with actual values, not yet exported)."""
         bets = self.get_bets()
         return len([
             b for b in bets 
@@ -3521,7 +3499,7 @@ class Tracker:
 
     def get_feature_stats(self) -> dict:
         bets = self.get_bets()
-        total_with_features = len([b for b in bets if b. get('feat_ema') is not None])
+        total_with_features = len([b for b in bets if b.get('feat_ema') is not None])
         decided_with_features = len([
             b for b in bets
             if b.get('result') in ['Win', 'Loss'] and b.get('feat_ema') is not None
@@ -3530,7 +3508,7 @@ class Tracker:
         return {
             'total_with_features': total_with_features,
             'decided_with_features': decided_with_features,
-            'pending_with_features':  total_with_features - decided_with_features,
+            'pending_with_features': total_with_features - decided_with_features,
             'exportable_to_csv': exportable
         }
 
