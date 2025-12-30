@@ -2105,10 +2105,10 @@ class DecisionPolicy:
     Makes final bet recommendations. 
     """
     
-    def __init__(self, config:  Config = CONFIG):
+    def __init__(self, config: Config = CONFIG):
         self.config = config
     
-    def calculate_ev(self, prob:  float, odds: float) -> float:
+    def calculate_ev(self, prob: float, odds: float) -> float:
         """Calculate expected value."""
         return (prob * (odds - 1)) - (1 - prob)
     
@@ -2132,14 +2132,17 @@ class DecisionPolicy:
         
         stake_pct = stake_map.get(grade, 0.0)
         return stake_pct * bankroll, stake_pct
+
+    # --- HELPER ALIAS FOR COMPATIBILITY ---
+    def calculate_stake(self, ev: float, prob: float, bankroll: float, grade: BetGrade) -> Tuple[float, float]:
+        """Wrapper to allow calling calculate_flat_stake with more args."""
+        return self.calculate_flat_stake(grade, bankroll)
     
     def assign_grade(self, ev: float, win_prob: float) -> BetGrade: 
         """
         Assign letter grade based on EV and Probability.
         """
         # Logic for "S-Tier" / "A+" bets (High EV + High Prob)
-        # We map this to BetGrade.A since the Enum doesn't have A+, 
-        # but it ensures these get the maximum stake.
         if ev > 0.10 and win_prob > 0.60:
             return BetGrade.A
         elif ev > 0.05:
@@ -2153,198 +2156,103 @@ class DecisionPolicy:
         else: 
             return BetGrade.F
     
-    def assess_rollover_quality(
+    def make_decision(
         self, 
-        features: FeatureVector,
-        projection:  Projection,
-        simulation:  SimulationResult,
-        line: float,
-        best_side: str,
-        best_prob: float
-    ) -> Tuple[bool, float, List[str], List[str]]: 
-        """Assess suitability for rollover/parlay."""
-        reasons_good = []
-        reasons_bad = []
-        score = 0
-        max_score = 5
-        
-        # Probability check
-        if best_prob >= self.config.ROLLOVER_MIN_PROB: 
-            score += 1.5
-            reasons_good.append(f"High probability ({best_prob:.0%})")
-        elif best_prob >= 0.55:
-            score += 0.5
-            reasons_bad.append(f"Moderate probability ({best_prob:.0%})")
-        else:
-            reasons_bad.append(f"Low probability ({best_prob:.0%})")
-        
-        # Consistency check
-        std_ratio = features.std / projection. final_projection if projection.final_projection > 0 else 1
-        if std_ratio <= self.config.ROLLOVER_MAX_STD_RATIO:
-            score += 1
-            reasons_good.append(f"Consistent performer (±{std_ratio:.0%} variance)")
-        else:
-            reasons_bad.append(f"High variance (±{std_ratio:.0%})")
-        
-        # Hit rate check
-        if features.hit_rate_l10 >= self.config.ROLLOVER_MIN_HIT_RATE: 
-            score += 1
-            reasons_good.append(f"Strong L10 hit rate ({features.hit_rate_l10:.0%})")
-        elif features.hit_rate_l10 >= 0.50:
-            score += 0.5
-            reasons_bad.append(f"Average L10 hit rate ({features.hit_rate_l10:.0%})")
-        else:
-            reasons_bad.append(f"Poor L10 hit rate ({features.hit_rate_l10:.0%})")
+        projection: Projection, 
+        features: FeatureVector, 
+        simulation: SimulationResult, 
+        line: float, 
+        odds: float = 1.91, 
+        bankroll: float = 10000
+    ) -> BetDecision:
+        """
+        Determines bet side, stake, and grade based on EV and ML validation.
+        FIXED: Removed 'confidence_score' to fix TypeError.
+        """
+        # 1. Use Simulation Probabilities (The "Smart" Source)
+        prob_over = simulation.over_prob
+        prob_under = simulation.under_prob
 
-        # Sample size check
-        if features.games_played >= self.config.ROLLOVER_MIN_GAMES:
-            score += 0.5
-            reasons_good.append(f"Good sample size ({features.games_played} games)")
+        # 2. Calculate EV using actual odds
+        decimal_odds = odds
+
+        ev_over = self.calculate_ev(prob_over, decimal_odds)
+        ev_under = self.calculate_ev(prob_under, decimal_odds)
+
+        # 3. Determine Recommended Side
+        if ev_over > ev_under:
+            side = "OVER"
+            ev = ev_over
+            prob = prob_over
         else:
-            reasons_bad.append(f"Small sample ({features.games_played} games)")
-        
-        # Edge buffer check
-        if best_side == "OVER":
-            buffer = (projection.final_projection - line) / line if line > 0 else 0
-        else:
-            buffer = (line - projection.final_projection) / line if line > 0 else 0
-        
-        if buffer >= 0.10:
-            score += 1
-            reasons_good.append(f"Large edge ({buffer:.0%} buffer)")
-        elif buffer >= 0.05:
-            score += 0.5
-            reasons_good.append(f"Decent edge ({buffer:.0%} buffer)")
-        else:
-            reasons_bad.append(f"Thin edge ({buffer:.0%} buffer)")
-        
-        # Trend alignment
-        if features.trend > 0.05 and best_side == "OVER":
-            score += 0.25
-            reasons_good.append("📈 Trending up")
-        elif features.trend < -0.05 and best_side == "UNDER":
-            score += 0.25
-            reasons_good.append("📉 Trending down")
-        
-        # Blowout risk penalty
-        if features. blowout_factor < 0.90:
-            score -= 0.5
-            reasons_bad.append("🔴 High blowout risk")
-        elif features. blowout_factor < 0.95:
-            score -= 0.25
-            reasons_bad.append("🟠 Moderate blowout risk")
-        
-        score = max(0, score)
-        score_pct = score / max_score
-        suitable = score_pct >= 0.55
-        
-        return suitable, score, reasons_good, reasons_bad
-    
+            side = "UNDER"
+            ev = ev_under
+            prob = prob_under
+
+        # 4. Assign Grade (A, B, C, D, F)
+        grade = self.assign_grade(ev, prob)
+
+        # 5. Calculate Stake
+        stake, fraction = self.calculate_flat_stake(grade, bankroll)
+
+        # 6. Generate Warnings
+        confidence_warning = self._generate_confidence_warning(features, prob, projection, side)
+
+        return BetDecision(
+            recommended_side=side,
+            # confidence_score removed (caused the crash)
+            probability=prob,
+            expected_value=ev,
+            kelly_stake=stake,
+            kelly_fraction=fraction,
+            grade=grade,
+            confidence_warning=confidence_warning,
+            rollover_suitable=(grade in [BetGrade.A, BetGrade.B] and prob > 0.58),
+            reasons_good=[], 
+            reasons_bad=[],
+            rollover_score=0.0
+        )
+
     def _generate_confidence_warning(
         self, 
         features: FeatureVector, 
-        probability: float
+        probability: float, 
+        projection: Projection = None,
+        side: str = "OVER"
     ) -> Optional[str]:
         """
-        Generate warning message for low-confidence predictions.
-        Helps user understand when to be cautious.
+        Generate warning message for low-confidence or conflicting predictions.
         """
         warnings = []
         
-        # Low sample size warning
+        # 1. Sample Size Warning
         if features.games_played < 10:
-            warnings.append(f"⚠️ Low sample ({features.games_played} games)")
-        elif features.games_played < 15:
-            warnings.append(f"📊 Limited sample ({features.games_played} games)")
+            warnings.append(f"⚠️ Low sample ({features.games_played} gms)")
         
-        # High volatility warning (CV > 0.35 means std is >35% of mean)
-        if features.coef_variation > 0.40:
-            warnings.append(f"📈 High volatility (CV: {features.coef_variation:.0%})")
-        elif features.coef_variation > 0.30:
-            warnings.append(f"📊 Moderate volatility (CV: {features.coef_variation:.0%})")
+        # 2. Volatility Warning
+        if features.coef_variation > 0.35:
+            warnings.append(f"⚠️ High Volatility (CV:{features.coef_variation:.0%})")
+        elif features.coef_variation > 0.25:
+            warnings.append(f"📊 Mod Volatility (CV:{features.coef_variation:.0%})")
         
-        # Edge case: probability very close to 50% (coin flip)
-        if 0.48 <= probability <= 0.52:
-            warnings.append("🎲 Near coin-flip probability")
-        
-        # Conflicting signals: weighted hit rate differs significantly from season
-        if abs(features.hit_rate_weighted - features.hit_rate_season) > 0.20:
-            if features.hit_rate_weighted > features.hit_rate_season:
-                warnings.append("📈 Recent form better than season avg")
-            else:
-                warnings.append("📉 Recent form worse than season avg")
-        
-        return " | ".join(warnings) if warnings else None
-    
-    def make_decision(
-        self,
-        features: FeatureVector,
-        projection: Projection,
-        simulation:  SimulationResult,
-        line: float,
-        odds: float,
-        bankroll: float
-    ) -> BetDecision:
-        """Make final bet decision. ML influence is already baked into projection."""
-        
-        # Get simulation probabilities (already reflects ML nudge via projection)
-        over_prob = simulation.over_prob
-        under_prob = simulation.under_prob
-        
-        # Calculate EVs
-        ev_over = self.calculate_ev(over_prob, odds)
-        ev_under = self.calculate_ev(under_prob, odds)
-        
-        # Determine best side
-        if ev_over > ev_under:
-            best_side = "OVER"
-            best_ev = ev_over
-            best_prob = over_prob
-        else:
-            best_side = "UNDER"
-            best_ev = ev_under
-            best_prob = under_prob
-        
-        # Assign grade first (needed for stake calculation)
-        # [FIXED] Now passing both EV and Probability
-        grade = self.assign_grade(best_ev, best_prob)
-        
-        # Calculate flat stake based on grade
-        stake, stake_pct = self.calculate_flat_stake(grade, bankroll)
-        
-        # Assess rollover suitability
-        suitable, score, reasons_good, reasons_bad = self.assess_rollover_quality(
-            features, projection, simulation, line, best_side, best_prob
-        )
-        
-        # Generate confidence warning if applicable
-        confidence_warning = self._generate_confidence_warning(features, best_prob)
-        
-        # Add ML disagreement warning if simulation and ML have opposite opinions
-        if projection.ml_prob is not None:
-            ml_favors_over = projection.ml_prob > 0.5
-            sim_favors_over = over_prob > under_prob
+        # 3. ML vs Sim Logic
+        if projection and projection.ml_prob is not None:
+            ml_prob = projection.ml_prob # Probability of WINNING the bet
+            sim_prob = probability       # Probability of WINNING the bet
             
-            if sim_favors_over != ml_favors_over:
-                ml_warning = f"⚠️ ML-Sim tension (ML: {projection.ml_prob:.0%}, Sim: {over_prob:.0%} OVER)"
-                if confidence_warning:
-                    confidence_warning = f"{confidence_warning} | {ml_warning}"
-                else:
-                    confidence_warning = ml_warning
-        
-        return BetDecision(
-            recommended_side=best_side,
-            probability=best_prob,
-            expected_value=best_ev,
-            grade=grade,
-            kelly_stake=stake,
-            kelly_fraction=stake_pct,
-            rollover_suitable=suitable,
-            rollover_score=score,
-            reasons_good=reasons_good,
-            reasons_bad=reasons_bad,
-            confidence_warning=confidence_warning
-        )
+            # Scenario A: Civil War (Opposite Sides)
+            # ML thinks we lose (< 45%), Sim thinks we win (> 50%)
+            if ml_prob < 0.45:
+                opp_side = "UNDER" if side == "OVER" else "OVER"
+                warnings.append(f"⚠️ CONFLICT: Sim likes {side}, ML leans {opp_side}")
+                
+            # Scenario B: Confidence Gap (Same Side, Different Confidence)
+            elif abs(sim_prob - ml_prob) > 0.15:
+                warnings.append(
+                    f"ℹ️ GAP: Sim {sim_prob:.0%} vs ML {ml_prob:.0%} (Both Like {side})"
+                )
+
+        return " | ".join(warnings) if warnings else None
 
 
 # =============================================================================
