@@ -17,6 +17,9 @@ import logging
 from enum import Enum
 import warnings
 import joblib
+from xgboost import XGBClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, precision_score
 
 warnings.filterwarnings('ignore')
 
@@ -1600,37 +1603,62 @@ class ProjectionResult:
 
 class ModelEngine:
     """
-    Generates base projections using weighted averages of features.
-    Now includes [Strategy 3] Bad Beat Fade.
+    Generates projections using weighted averages + [Strategy 3] Bad Beat Fade.
+    Now includes REAL ML integration (loads nba_model.pkl).
     """
     def __init__(self, config: Config = CONFIG, tracker: 'Tracker' = None):
         self.config = config
-        self.tracker = tracker  # Store tracker reference
+        self.tracker = tracker
+        self.ml_model = None
+        self._load_ml_model()
+
+    def _load_ml_model(self):
+        """Try to load the trained XGBoost model."""
+        model_path = DATA_DIR / "nba_model.pkl"
+        if model_path.exists():
+            try:
+                self.ml_model = joblib.load(model_path)
+                # logger.info("🤖 ML Model loaded successfully.")
+            except Exception as e:
+                logger.error(f"Failed to load ML model: {e}")
+
+    def get_ml_prediction(self, features: FeatureVector) -> Optional[float]:
+        """Get win probability from the ML model."""
+        if self.ml_model is None:
+            return None
+        
+        try:
+            # Convert feature vector to the exact array format the model expects
+            # We must ensure this matches the training order exactly.
+            # Using the same method from FeatureVector ensures consistency.
+            X = features.to_ml_array().reshape(1, -1)
+            
+            # Predict probability of class 1 (Win)
+            prob = self.ml_model.predict_proba(X)[0][1]
+            return float(prob)
+        except Exception as e:
+            logger.warning(f"ML Prediction failed: {e}")
+            return None
 
     def apply_bad_beat_penalty(self, player_name: str, current_projection: float) -> float:
-        """
-        [STRATEGY 3] Check for recent 'Bad Beats' and apply frustration penalty.
-        """
+        """[STRATEGY 3] Check for recent 'Bad Beats' and apply frustration penalty."""
         if self.tracker is None:
             return current_projection
 
-        # 1. Get recent bet history for this player
         history = self.tracker.get_player_history(player_name)
         if not history:
             return current_projection
 
-        # 2. Count "Bad Beats" (losses < 1.5 pts) in last 5 bets
+        # Count "Bad Beats" (losses < 1.5 pts) in last 5 bets
         recent_bets = history[-5:]
         bad_beat_count = 0
         
         for bet in recent_bets:
-            # Check if result_quality exists and is a "close loss" type
             quality = bet.get('result_quality', '')
             if quality in ['bad_beat', 'close_loss', 'bad_read']:
                 bad_beat_count += 1
         
-        # 3. Apply Penalty if repeated failure
-        # If they burned us 2+ times recently, fade them by 4-6%
+        # If they burned us 2+ times recently, fade them
         if bad_beat_count >= 2:
             penalty = 0.96 if bad_beat_count == 2 else 0.94
             logger.info(f"📉 FADING {player_name}: {bad_beat_count} recent losses. Penalty: {penalty}")
@@ -1639,9 +1667,7 @@ class ModelEngine:
         return current_projection
 
     def generate_projection(self, features: FeatureVector) -> ProjectionResult:
-        """
-        Generate weighted projection from feature vector.
-        """
+        """Generate weighted projection and integrate ML insights."""
         # 1. Base Weighted Average
         w_ema = 0.35
         w_sma10 = 0.25
@@ -1676,17 +1702,17 @@ class ModelEngine:
             if temp_proj > 0:
                 bad_beat_factor = adjusted_proj / temp_proj
 
-        # 5. Generate Context String
-        # Create a human-readable summary of why the projection is what it is
+        # 5. Get ML Prediction
+        ml_prob = self.get_ml_prediction(features)
+
+        # 6. Generate Context String
         context_parts = []
         if features.combined_matchup_mult > 1.05: context_parts.append("✅ Great Matchup")
         elif features.combined_matchup_mult < 0.95: context_parts.append("❌ Tough Defense")
-        
         if features.rest_factor < 1.0: context_parts.append("⚠️ Fatigue Risk")
-        elif features.rest_factor > 1.0: context_parts.append("🔋 Well Rested")
-        
         if features.blowout_prob > 0.25: context_parts.append("💨 Blowout Risk")
         if bad_beat_factor < 1.0: context_parts.append("📉 Bad Beat Fade")
+        if ml_prob and ml_prob > 0.60: context_parts.append("🤖 ML Likes Over")
         
         context_str = " | ".join(context_parts) if context_parts else "Standard projection based on recent form."
 
@@ -1702,7 +1728,7 @@ class ModelEngine:
                 'recency_bias': features.def_mult,
                 'bad_beat_fade': bad_beat_factor
             },
-            ml_prob=None,  # Placeholder for future ML model integration
+            ml_prob=ml_prob,  # <--- Now passing the real probability
             context=context_str
         )
 
@@ -2568,7 +2594,8 @@ class Backtester:
                 hit = (decision.recommended_side == "OVER" and actual_value > line) or \
                       (decision.recommended_side == "UNDER" and actual_value <= line)
                 
-                # Extract features for ML training (exclude non-serializable data_quality)
+                # Extract features for ML training
+                # MUST MATCH FeatureVector.to_ml_array() EXACTLY in content and order
                 feature_dict = {
                     'ema': features.ema,
                     'std': features.std,
@@ -2581,28 +2608,29 @@ class Backtester:
                     'hit_rate_l10': features.hit_rate_l10,
                     'hit_rate_l15': features.hit_rate_l15,
                     'hit_rate_season': features.hit_rate_season,
-                    'hit_rate_weighted': features.hit_rate_weighted,
-                    'coef_variation': features.coef_variation,
                     'pace_mult': features.pace_mult,
                     'def_mult': features.def_mult,
                     'position_mult': features.position_mult,
                     'base_matchup_mult': features.base_matchup_mult,
                     'combined_matchup_mult': features.combined_matchup_mult,
                     'split_factor': features.split_factor,
-                    'rest_factor': features.rest_factor, 
-                    'personal_fatigue_factor': features.personal_fatigue_factor,
+                    'rest_factor': features.rest_factor,
                     'blowout_factor': features.blowout_factor,
                     'usage_mult': features.usage_mult,
-                    'games_played': features.games_played,
                     'is_home': int(features.is_home),
                     'is_b2b': int(features.is_b2b),
                     'spread': features.spread,
+                    'games_played': features.games_played,
                     'days_rest': features.days_rest,
                     'game_total': features.game_total,
                     'opponent_drtg_season': features.opponent_drtg_season,
                     'opponent_drtg_l5': features.opponent_drtg_l5,
-                    # Data quality score
-                    'data_quality_score': features.data_quality.score,
+                    # V15 NEW FEATURES
+                    'blowout_prob': features.blowout_prob,
+                    'personal_fatigue_factor': features.personal_fatigue_factor,
+                    'b2b_games_in_sample': features.b2b_games_in_sample,
+                    'dynamic_std_mult': features.dynamic_std_mult,
+                    'coef_variation': features.coef_variation
                 }
                 
                 results.append(BacktestResult(
@@ -2749,7 +2777,7 @@ def get_top_active_players(limit: int = 50) -> List[Dict]:
 
 
 def generate_ml_training_data(
-    output_file: str = "ml_training_data_v1.csv",
+    output_file: str = "ml_training_data.csv",
     num_players: int = 50,
     markets: List[str] = None,
     test_days: int = 60,  # More data for training
@@ -2874,7 +2902,7 @@ def generate_ml_data_streamlit():
             ['PTS', 'REB', 'AST', 'PRA', 'PA', 'PR', '3PM', 'STL', 'BLK'],
             default=['PTS', 'REB', 'AST', 'PRA']
         )
-        output_file = st.text_input("Output Filename", "ml_training_data_v1.csv")
+        output_file = st.text_input("Output Filename", "ml_training_data.csv")
     
     if st.button("🚀 Generate Dataset", type="primary"):
         progress_bar = st.progress(0)
@@ -2903,7 +2931,7 @@ def generate_ml_data_streamlit():
             col3.metric("Unique Players", df['player'].nunique())
             
             # Preview
-            st.dataframe(df.head(20), use_container_width=True)
+            st.dataframe(df.head(20), width="stretch")
             
             # Download button
             csv = df.to_csv(index=False)
@@ -2959,22 +2987,21 @@ class PredictionOrchestrator:
     
     def _ensure_team_data_loaded(self):
         """
-        Lazy load team data.
-        [STRATEGY 2 UPDATE]: Fetches Last 10 Games data to capture recent defensive form.
+        Lazy load team data with L10 Recency Fix.
         """
         if self._team_stats is None:
             try:
                 # 1. Attempt to fetch Last 10 Games data (Recency Bias)
-                # We bypass the data_loader generic call to enforce 'LastNGames=10'
                 from nba_api.stats.endpoints import leaguedashteamstats
                 
                 stats_l10 = leaguedashteamstats.LeagueDashTeamStats(
-                    last_n_games=10,  # <--- The Strategic Fix: Only look at recent form
+                    last_n_games=10,
+                    measure_type_detailed_defense='Base', # Standard stats
+                    measure_type='Advanced',              # <--- FIX: Request Advanced stats to get PACE
                     per_mode_detailed='PerGame',
                     season=self.config.CURRENT_SEASON
                 ).get_data_frames()[0]
                 
-                # Set the index to TEAM_ID so FeatureEngineer can look it up
                 if not stats_l10.empty:
                     stats_l10.set_index('TEAM_ID', inplace=True)
                     self._team_stats = stats_l10
@@ -2984,11 +3011,12 @@ class PredictionOrchestrator:
                     raise ValueError("Empty L10 data")
 
             except Exception as e:
-                # Fallback to season-long data if API fails or early season
-                print(f"⚠️ Recency fetch failed ({e}), falling back to full season data.")
+                # Fallback to season-long data if API fails
+                # print(f"⚠️ Recency fetch failed ({e}), falling back to full season data.")
+                # Use standard data loader fallback
                 self._team_stats, self._avg_pace, self._avg_def = self.data_loader.fetch_team_stats()
 
-            # Load position defense (standard cache)
+            # Load position defense
             self._position_defense = self.data_loader.fetch_position_defense()
     
     def run_analysis(
@@ -3363,7 +3391,7 @@ class Tracker:
         
         return df
 
-    def export_bets_to_training_csv(self, output_file: str = "ml_training_data_pts.csv") -> Tuple[int, str]:
+    def export_bets_to_training_csv(self, output_file: str = "ml_training_data.csv") -> Tuple[int, str]:
         """
         Export completed bets (with actual scores) to ML training CSV.
         Only exports bets that haven't been exported yet.
@@ -3865,13 +3893,13 @@ def render_recommendation_card(result: AnalysisResult, bankroll: float):
         # ML Brain indicator with LOVE/LIKE/NEUTRAL/FADE label
         ml_pct = projection.ml_prob
         if ml_pct > 0.60:
-            ml_label = "🤖 LOVE"
+            ml_label = "Robot LOVE"
         elif ml_pct > 0.55:
-            ml_label = "🤖 LIKE"
+            ml_label = "Robot LIKE"
         elif ml_pct < 0.45:
-            ml_label = "🤖 FADE"
+            ml_label = "Robot FADE"
         else:
-            ml_label = "🤖 Neutral"
+            ml_label = "Robot Neutral"
         ml_delta = f"{(ml_pct - 0.5) * 100:+.0f}pp"
         c4.metric(ml_label, f"{ml_pct:.0%}", ml_delta)
     else:
@@ -3888,7 +3916,7 @@ def render_recommendation_card(result: AnalysisResult, bankroll: float):
     st.caption(f"📊 Proj: {projection.final_projection:.1f} | 90% CI: [{simulation.ci_10:.1f}-{simulation.ci_90:.1f}] | CV: {features.coef_variation:.0%} | Sim Width: {features.dynamic_std_mult:.2f}x")
     
     # V15 Intelligent Model Insights (compact expander)
-    with st.expander("🧠 V15 Intelligence", expanded=False):
+    with st.expander("V15 Intelligence", expanded=False):
         col1, col2, col3 = st.columns(3)
         
         # Blowout Risk Model
@@ -4083,7 +4111,7 @@ def render_backtest_tab(orchestrator: PredictionOrchestrator):
                         'Actual': f"{data['actual']:.0%}",
                         'N': data['count'],
                     })
-                st.dataframe(pd.DataFrame(cal_data), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(cal_data), hide_index=True, width="stretch")
             
             if summary.grade_performance:
                 st.markdown("**By Grade:**")
@@ -4095,9 +4123,9 @@ def render_backtest_tab(orchestrator: PredictionOrchestrator):
                         'Win%': f"{data['win_rate']:.0%}",
                         'ROI': f"{data['roi']:+.1%}"
                     })
-                st.dataframe(pd.DataFrame(grade_data), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(grade_data), hide_index=True, width="stretch")
             
-            st.dataframe(summary.results_df, hide_index=True, use_container_width=True)
+            st.dataframe(summary.results_df, hide_index=True, width="stretch")
             
             csv = summary.results_df.to_csv(index=False)
             st.download_button("📥 Download CSV", csv, f"backtest_{bt_player.replace(' ', '_')}.csv", "text/csv")
@@ -4419,7 +4447,7 @@ def render_ml_data_tab(tracker: Tracker):
             summary_cols = ['player', 'market', 'line', 'side', 'result', 'margin', 'result_quality', 'feat_prob', 'feat_ev']
             display_cols = [c for c in summary_cols if c in training_df.columns]
             if display_cols:
-                st.dataframe(training_df[display_cols].tail(20), hide_index=True, use_container_width=True)
+                st.dataframe(training_df[display_cols].tail(20), hide_index=True,width="stretch")
             else:
                 st.info("No summary columns available")
         
@@ -4431,14 +4459,14 @@ def render_ml_data_tab(tracker: Tracker):
                 id_cols = ['player', 'market', 'result']
                 show_cols = [c for c in id_cols if c in training_df.columns] + feat_cols
                 st.caption(f"Showing {len(feat_cols)} feature columns")
-                st.dataframe(training_df[show_cols].tail(20), hide_index=True, use_container_width=True)
+                st.dataframe(training_df[show_cols].tail(20), hide_index=True, width="stretch")
             else:
                 st.info("No feature columns found")
         
         with view_tab3:
             # Full raw data with column count
             st.caption(f"All {len(training_df.columns)} columns × {len(training_df)} rows")
-            st.dataframe(training_df.tail(30), hide_index=True, use_container_width=True)
+            st.dataframe(training_df.tail(30), hide_index=True, width="stretch")
         
         # Download buttons
         st.markdown("---")
@@ -4470,6 +4498,71 @@ def render_ml_data_tab(tracker: Tracker):
         c4.metric("Win Rate", "N/A")
         st.info("Track bets to collect training data. Log bets with the 📝 Track button after analysis.")
 
+
+def render_train_model_tab():
+    """Streamlit UI for Training the V15 Model."""
+    st.markdown("###Train V15 Model")
+    st.info("This will use 'ml_training_data.csv' to retrain the brain (nba_model.pkl).")
+    
+    # Check if data exists
+    data_path = DATA_DIR / "ml_training_data.csv"
+    
+    if not data_path.exists():
+        st.warning("Training data not found. Go to 'Generate Dataset' tab first.")
+        return
+
+    if st.button("🏋️ Start Training", type="primary"):
+        status = st.status("Training in progress...", expanded=True)
+        try:
+            # 1. Load Data
+            status.write("Loading dataset...")
+            df = pd.read_csv(data_path)
+            
+            # Filter for feature columns (must start with 'feat_')
+            feature_cols = [c for c in df.columns if c.startswith('feat_')]
+            target_col = 'hit'
+            
+            if len(feature_cols) != 33:
+                status.update(label="❌ Error", state="error")
+                st.error(f"Shape Mismatch! Found {len(feature_cols)} features, expected 33. Regenerate your dataset.")
+                return
+
+            # 2. Prepare Data
+            status.write(f"Processing {len(df)} samples with {len(feature_cols)} features...")
+            X = df[feature_cols]
+            y = df[target_col]
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            
+            # 3. Train Model
+            status.write("Feeding the XGBoost brain...")
+            model = XGBClassifier(
+                n_estimators=500, learning_rate=0.05, max_depth=4,
+                subsample=0.8, colsample_bytree=0.8, eval_metric='logloss'
+            )
+            model.fit(X_train, y_train)
+            
+            # 4. Evaluate
+            preds = model.predict(X_test)
+            acc = accuracy_score(y_test, preds)
+            prec = precision_score(y_test, preds)
+            
+            # 5. Save
+            status.write("💾 Saving nba_model.pkl...")
+            joblib.dump(model, DATA_DIR / "nba_model.pkl")
+            
+            status.update(label="✅ Training Complete!", state="complete")
+            
+            # Show Results
+            st.success("Brain Updated Successfully!")
+            c1, c2 = st.columns(2)
+            c1.metric("Precision (Win%)", f"{prec:.1%}")
+            c2.metric("Accuracy", f"{acc:.1%}")
+            
+            st.balloons()
+            
+        except Exception as e:
+            status.update(label="❌ Training Failed", state="error")
+            st.error(f"Error: {str(e)}")
 
 # =============================================================================
 # MAIN APPLICATION
@@ -4741,7 +4834,7 @@ def main():
                     c3.metric(f"Hit%", f"{h2h_hit_rate:.0%}")
                     
                     display_cols = ['GAME_DATE', 'WL', 'MIN', result.market]
-                    st.dataframe(h2h_df[display_cols].head(8), hide_index=True, use_container_width=True)
+                    st.dataframe(h2h_df[display_cols].head(8), hide_index=True, width="stretch")
                 else:
                     st.info(f"No games vs {opp_code}")
             else: 
@@ -4783,7 +4876,7 @@ def main():
                     })
             
             if data:
-                st.dataframe(pd.DataFrame(data), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(data), hide_index=True, width="stretch")
             else:
                 st.info("Not enough data")
         else:
@@ -4941,15 +5034,19 @@ def main():
     with tab7:
         render_parlay_tab(parlay_tracker, bankroll)
     
-    # Tab 8: ML Data
+    # Tab 8: ML Data (UPDATED)
     with tab8:
-        ml_subtab1, ml_subtab2 = st.tabs(["📊 Training Data", "🤖 Generate Dataset"])
+        # We now have 3 sub-tabs
+        ml_subtab1, ml_subtab2, ml_subtab3 = st.tabs(["Training Data", "Generate Dataset", "Train Brain"])
         
         with ml_subtab1:
             render_ml_data_tab(tracker)
         
         with ml_subtab2:
             generate_ml_data_streamlit()
+            
+        with ml_subtab3:
+            render_train_model_tab()
 
 
 # =============================================================================
