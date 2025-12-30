@@ -63,7 +63,7 @@ class Config:
     """Immutable configuration constants."""
     CURRENT_SEASON: str = "2025-26"
     PREV_SEASON: str = "2024-25"
-    API_DELAY: float = 0.6
+    API_DELAY: float = 1.0
     API_MAX_RETRIES:  int = 3
     DEFAULT_PACE: float = 100.0
     DEFAULT_DEF_RATING: float = 115.0
@@ -643,18 +643,35 @@ class DataLoader:
         self._team_stats_cache_time: float = 0
     
     def _api_call_with_retry(self, func, description: str = "API call"):
-        """Execute API call with retry logic."""
+        """Execute API call with smart retry logic and 'Penalty Box' for timeouts."""
+        import random
         last_exception = None
-        for attempt in range(self.config.API_MAX_RETRIES):
+        
+        # Increase retries slightly for bulk operations
+        max_retries = self.config.API_MAX_RETRIES + 2 
+        
+        for attempt in range(max_retries):
             try:
-                delay = self.config. API_DELAY * (attempt + 1)
-                time.sleep(delay)
+                # Add base delay + small jitter to look less robotic
+                time.sleep(self.config.API_DELAY + random.uniform(0.1, 0.5))
                 return func()
             except Exception as e: 
                 last_exception = e
-                logger.warning(f"{description} attempt {attempt + 1}/{self.config.API_MAX_RETRIES} failed: {e}")
+                error_str = str(e).lower()
+                
+                # CHECK FOR TIMEOUTS / RATE LIMITS
+                if "timed out" in error_str or "timeout" in error_str or "429" in error_str:
+                    # THE PENALTY BOX: Wait significantly longer (45s, 90s, 135s...)
+                    wait_time = 45 * (attempt + 1)
+                    logger.warning(f"⚠️ API Cooldown Triggered ({description}). Waiting {wait_time}s to clear soft ban...")
+                    time.sleep(wait_time)
+                else:
+                    # Standard error (e.g. JSON decode), short wait
+                    delay = self.config.API_DELAY * (attempt + 1)
+                    logger.warning(f"{description} attempt {attempt + 1} failed: {e}. Retrying in {delay:.1f}s...")
+                    time.sleep(delay)
         
-        raise DataLoaderError(f"{description} failed after {self.config.API_MAX_RETRIES} attempts:  {last_exception}")
+        raise DataLoaderError(f"{description} failed after {max_retries} attempts: {last_exception}")
     
     def get_player_and_team(self, player_name: str, opponent_name: str) -> Tuple[Dict, Dict]:
         """
@@ -2378,9 +2395,25 @@ class Backtester:
         
         # Fetch all available data
         df = self.data_loader.fetch_multi_season_logs(player_id)
-        if len(df) < self.config.BACKTEST_MIN_GAMES + test_days:
-            logger.warning(f"Insufficient data for backtest: {len(df)} games")
+        # NEW FLEXIBLE LOGIC (Harvests all valid data)
+        min_required = self.config.BACKTEST_MIN_GAMES
+        
+        # If they don't even have enough for features (e.g. < 10 games), skip them.
+        if len(df) <= min_required:
             return None
+            
+        # Calculate how many games we can actually test
+        available_test_games = len(df) - min_required
+        
+        # We want 'test_days' amount, but we will settle for what they have
+        actual_test_days = min(test_days, available_test_games)
+        
+        if actual_test_days <= 0:
+            return None
+            
+        # Adjust test start index dynamically
+        total_games = len(df)
+        test_start_idx = total_games - actual_test_days
         
         # Get player position
         player_position = self.data_loader.get_player_position(player_id)
@@ -2893,8 +2926,8 @@ def generate_ml_data_streamlit():
     
     col1, col2 = st.columns(2)
     with col1:
-        num_players = st.slider("Number of Players", 10, 100, 50, 10)
-        test_days = st.slider("Games per Player", 20, 100, 60, 10)
+        num_players = st.slider("Number of Players", 10, 600, 50, 10)
+        test_days = st.slider("Games per Player", 20, 80, 60, 10)
     
     with col2:
         markets = st.multiselect(
@@ -3835,7 +3868,10 @@ def render_data_quality_card(result: AnalysisResult):
 
 
 def render_recommendation_card(result: AnalysisResult, bankroll: float):
-    """Render clean, mobile-friendly recommendation card with V15 insights."""
+    """
+    Render clean, mobile-friendly recommendation card.
+    FIXED: explicit labels to prevent 'Over/Under' confusion.
+    """
     decision = result.decision
     projection = result.projection
     features = result.features
@@ -3845,120 +3881,143 @@ def render_recommendation_card(result: AnalysisResult, bankroll: float):
     grade_colors = {'A': 'green', 'B': 'green', 'C': 'orange', 'D': 'red', 'F': 'red'}
     grade_color = grade_colors.get(decision.grade.value, 'gray')
     
-    # V15: Blowout warning based on probability
-    blowout_warn = ""
-    if features.blowout_prob >= 0.35:
-        blowout_warn = " 🔴"  # High risk
-    elif features.blowout_prob >= 0.25:
-        blowout_warn = " ⚠️"  # Moderate risk  
-    elif features.blowout_prob >= 0.15:
-        blowout_warn = " ⚡"  # Slight risk
+    # --- 1. HEADER & CONFLICT LOGIC ---
     
-    # Data quality warning icon
-    dq = features.data_quality
-    dq_warn = "" if dq.score >= 75 else (" 📡" if dq.score >= 50 else " 📡⚠️")
+    # Detect Conflict: Sim recommends a side, but ML predicts a Loss (<50%)
+    is_conflict = projection.ml_prob is not None and projection.ml_prob < 0.50
     
-    # Header with recommendation
-    st.markdown(f"### {decision.recommended_side} {result.line}{blowout_warn}{dq_warn} — :{grade_color}[Grade {decision.grade.value}]")
+    # Check blowout risk for the lightning bolt icon
+    blowout_warn = " ⚡" if features.blowout_prob >= 0.25 else ""
     
-    # Key metrics in columns (add ML if available)
+    if is_conflict:
+        # CONFLICT MODE: Big Warning Banner
+        opposing_side = "UNDER" if decision.recommended_side == "OVER" else "OVER"
+        st.error(f"⚠️ **CONFLICT:** Sim wants {decision.recommended_side}, but ML leans {opposing_side}")
+        # Orange question mark header to signify doubt
+        st.markdown(f"### ❓ {decision.recommended_side} {result.line} — :{grade_color}[Grade {decision.grade.value}]")
+    else:
+        # NORMAL MODE: Standard Green/Clean Header
+        st.markdown(f"### {decision.recommended_side} {result.line}{blowout_warn} — :{grade_color}[Grade {decision.grade.value}]")
+    
+    # --- 2. KEY METRICS ---
+    
     if projection.ml_prob is not None:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Win Prob", f"{decision.probability:.0%}")
         c2.metric("EV", f"{decision.expected_value:+.1%}")
         c3.metric("Stake", f"₱{decision.kelly_stake:.0f}", f"{decision.kelly_fraction:.1%}")
         
-        # ML Brain indicator with LOVE/LIKE/NEUTRAL/FADE label
+        # --- FIXED: DYNAMIC LABELING ---
         ml_pct = projection.ml_prob
-        if ml_pct > 0.60:
-            ml_label = "Robot LOVE"
-        elif ml_pct > 0.55:
-            ml_label = "Robot LIKE"
+        side = decision.recommended_side
+        
+        if ml_pct > 0.55:
+            # High prob = ML Agrees with Sim
+            ml_label = f"ML Likes {side}"
+            ml_color = "normal" # Metric handles green automatically for positive delta
         elif ml_pct < 0.45:
-            ml_label = "Robot FADE"
+             # Low prob = ML Disagrees (Likes the other side)
+            opp_side = "UNDER" if side == "OVER" else "OVER"
+            ml_label = f"ML Likes {opp_side}"
+            # Invert the delta display so it makes sense (shows how much it hates the pick)
+            ml_pct = 1.0 - ml_pct 
         else:
-            ml_label = "Robot Neutral"
-        ml_delta = f"{(ml_pct - 0.5) * 100:+.0f}pp"
-        c4.metric(ml_label, f"{ml_pct:.0%}", ml_delta)
+            ml_label = "ML Neutral"
+
+        ml_delta = f"{(projection.ml_prob - 0.5) * 100:+.0f}pp"
+        c4.metric(ml_label, f"{projection.ml_prob:.0%}", ml_delta)
+        
     else:
+        # Fallback if no ML model loaded
         c1, c2, c3 = st.columns(3)
         c1.metric("Win Prob", f"{decision.probability:.0%}")
         c2.metric("EV", f"{decision.expected_value:+.1%}")
         c3.metric("Stake", f"₱{decision.kelly_stake:.0f}", f"{decision.kelly_fraction:.1%}")
     
-    # Show context (includes matchup, B2B, blowout risk, ML confidence)
+    # Context Text
     if projection.context:
         st.caption(projection.context)
     
-    # Compact info line with V15 dynamic std multiplier
-    st.caption(f"📊 Proj: {projection.final_projection:.1f} | 90% CI: [{simulation.ci_10:.1f}-{simulation.ci_90:.1f}] | CV: {features.coef_variation:.0%} | Sim Width: {features.dynamic_std_mult:.2f}x")
+    # --- 3. V15 SIGNAL DECODER (THE DASHBOARD) ---
     
-    # V15 Intelligent Model Insights (compact expander)
-    with st.expander("V15 Intelligence", expanded=False):
-        col1, col2, col3 = st.columns(3)
+    with st.expander("🧠 ML Signal Decoder", expanded=False):
+        # ROW 1: RISK FACTORS (The "Killers")
+        st.caption("🛡️ **Risk Profile**")
+        r1, r2, r3 = st.columns(3)
         
-        # Blowout Risk Model
-        with col1:
-            prob_pct = features.blowout_prob * 100
-            if prob_pct >= 35:
-                color = "🔴"
-                label = "HIGH"
-            elif prob_pct >= 25:
-                color = "🟠"
-                label = "MOD"
-            elif prob_pct >= 15:
-                color = "🟡"
-                label = "SLIGHT"
-            else:
-                color = "🟢"
-                label = "LOW"
-            st.metric(f"{color} Blowout Risk", f"{prob_pct:.0f}%", label)
+        with r1: # Blowout
+            prob = features.blowout_prob * 100
+            if prob >= 35: 
+                label, color = "HIGH", "red"
+            elif prob >= 20: 
+                label, color = "MOD", "orange"
+            else: 
+                label, color = "LOW", "green"
+            st.markdown(f"**Blowout Risk:** :{color}[{label}] ({prob:.0f}%)")
+            
+        with r2: # Fatigue
+            fatigue = features.personal_fatigue_factor
+            if fatigue < 0.95: 
+                val, col = "Fatigued", "red"
+            elif fatigue > 1.02: 
+                val, col = "Rested", "green"
+            else: 
+                val, col = "Normal", "gray"
+            st.markdown(f"**Fatigue:** :{col}[{val}] ({(fatigue-1)*100:+.0f}%)")
+            
+        with r3: # Volatility (CV)
+            cv = features.coef_variation * 100
+            if cv < 20: 
+                val, col = "Steady", "green"
+            elif cv > 35: 
+                val, col = "Chaos", "red"
+            else: 
+                val, col = "Normal", "gray"
+            st.markdown(f"**Variance:** :{col}[{val}] ({cv:.0f}%)")
+
+        st.divider()
+
+        # ROW 2: PERFORMANCE DRIVERS (The "Boosters")
+        st.caption("🚀 **Edge Drivers**")
+        d1, d2, d3 = st.columns(3)
         
-        # Fatigue Profile
-        with col2:
-            fatigue_pct = (1 - features.personal_fatigue_factor) * 100
-            b2b_count = features.b2b_games_in_sample
-            if fatigue_pct > 5:
-                color = "🔴"
-                label = f"-{fatigue_pct:.0f}% B2B"
-            elif fatigue_pct > 0:
-                color = "🟡"
-                label = f"-{fatigue_pct:.0f}% B2B"
-            elif fatigue_pct < -2:
-                color = "🟢"
-                label = f"+{-fatigue_pct:.0f}% B2B"
-            else:
-                color = "⚪"
-                label = "Neutral"
-            st.metric(f"{color} Fatigue Profile", label, f"({b2b_count} B2B games)")
-        
-        # Volatility Profile
-        with col3:
-            cv_pct = features.coef_variation * 100
-            std_mult = features.dynamic_std_mult
-            if cv_pct < 20:
-                color = "🟢"
-                label = "Consistent"
-            elif cv_pct < 30:
-                color = "🟡"
-                label = "Average"
-            else:
-                color = "🔴"
-                label = "Volatile"
-            st.metric(f"{color} Volatility", f"{cv_pct:.0f}% CV", f"Sim: {std_mult:.2f}x width")
+        with d1: # Matchup
+            mult = features.combined_matchup_mult
+            delta = (mult - 1.0) * 100
+            if mult >= 1.05: 
+                st.metric("Matchup", "Great", f"{delta:+.1f}%")
+            elif mult <= 0.95: 
+                st.metric("Matchup", "Tough", f"{delta:+.1f}%")
+            else: 
+                st.metric("Matchup", "Neutral", f"{delta:+.1f}%")
+            
+        with d2: # Form
+            trend = features.trend * 100
+            if trend >= 10: 
+                st.metric("Form", "Heating Up", f"{trend:+.1f}%")
+            elif trend <= -10: 
+                st.metric("Form", "Cold", f"{trend:+.1f}%")
+            else: 
+                st.metric("Form", "Stable", f"{trend:+.1f}%")
+            
+        with d3: # Game Context
+            total = features.game_total
+            if total >= 235: 
+                st.metric("Game Env", "Shootout", f"{total:.0f}")
+            elif total <= 215: 
+                st.metric("Game Env", "Grind", f"{total:.0f}")
+            else: 
+                st.metric("Game Env", "Standard", f"{total:.0f}")
+
+    # --- 4. FOOTER & ALERTS ---
     
-    # Data quality card
     render_data_quality_card(result)
     
-    # Confidence warning
     if decision.confidence_warning:
-        st.warning(f"⚠️ {decision.confidence_warning}", icon=None)
+        st.warning(f"⚠️ {decision.confidence_warning}")
     
-    # Compact rollover badge
     if decision.rollover_suitable:
         st.success(f"🎲 **Parlay OK** — Score: {decision.rollover_score:.1f}/5")
-    else:
-        st.info(f"🎲 Not for parlays — Score: {decision.rollover_score:.1f}/5")
 
 
 def render_distribution_chart(result: AnalysisResult):
