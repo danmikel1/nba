@@ -3126,12 +3126,10 @@ class Tracker:
         if not self.file.exists():
             self._save([])
 
-    # --- FIX 1: Compatibility Alias ---
     def log_bet(self, bet_data: Dict):
         """Alias for save_bet to prevent 'AttributeError'."""
         self.save_bet(bet_data)
 
-    # --- FIX 2: Force Date & ID on New Bets ---
     def save_bet(self, bet_data: Dict):
         import time
         from datetime import datetime
@@ -3169,12 +3167,12 @@ class Tracker:
                             bet['id'] = int((time.time() + i) * 1000)
                             modified = True
                         
-                        # Fix Date (Default to today if completely missing)
+                        # Fix Date
                         if 'date' not in bet or not bet['date']:
                             bet['date'] = datetime.now().strftime("%Y-%m-%d")
                             modified = True
                         
-                        # Fix Date Format (Strip timestamp if present in legacy data)
+                        # Fix Date Format
                         if ' ' in str(bet['date']):
                             bet['date'] = str(bet['date']).split(' ')[0]
                             modified = True
@@ -3188,9 +3186,22 @@ class Tracker:
             return []
 
     def _save(self, bets: list):
+        # --- FIX: Custom Encoder for NumPy Types ---
+        def numpy_converter(obj):
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return str(obj)
+
         try:
             with open(self.file, 'w') as f:
-                json.dump(bets, f, indent=2)
+                # Use default=numpy_converter to handle the non-serializable types
+                json.dump(bets, f, indent=2, default=numpy_converter)
         except Exception as e:
             logging.error(f"Failed to save bets: {e}")
 
@@ -3366,7 +3377,6 @@ class Tracker:
                     not bet.get('exported_to_csv', False)):
                     
                     row = {
-                        # FIX 3: Ensure Clean Date format
                         'date': str(bet.get('date', '2024-01-01')).split(' ')[0],
                         'player': bet.get('player', ''),
                         'opponent': bet.get('opponent', ''),
