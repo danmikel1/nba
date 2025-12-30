@@ -4501,7 +4501,7 @@ def render_ml_data_tab(tracker: Tracker):
 
 def render_train_model_tab():
     """Streamlit UI for Training the V15 Model."""
-    st.markdown("###Train V15 Model")
+    st.markdown("Train V15 Model")
     st.info("This will use 'ml_training_data.csv' to retrain the brain (nba_model.pkl).")
     
     # Check if data exists
