@@ -3140,22 +3140,26 @@ class Tracker:
         if 'id' not in bet_data:
             bet_data['id'] = int(time.time() * 1000)
             
-        # 2. Generate DATE if missing (Format: YYYY-MM-DD, no timestamp)
+        # 2. Generate DATE if missing (Format: YYYY-MM-DD)
         if 'date' not in bet_data or not bet_data['date']:
             bet_data['date'] = datetime.now().strftime("%Y-%m-%d")
+            
+        # 3. FIX: Ensure Result defaults to 'Pending' (Fixes the "1 vs 5" bug)
+        if 'result' not in bet_data:
+            bet_data['result'] = 'Pending'
             
         bets.append(bet_data)
         self._save(bets)
 
     def get_bets(self) -> list: 
-        """Loads bets and auto-fixes any legacy data missing dates/IDs."""
+        """Loads bets and auto-fixes any legacy data."""
         try:
             if self.file.exists():
                 with open(self.file, 'r') as f:
                     content = f.read()
                     data = json.loads(content) if content else []
                 
-                # Auto-Heal: Fix old bets that might be missing dates
+                # Auto-Heal Logic
                 if data:
                     modified = False
                     import time
@@ -3166,15 +3170,13 @@ class Tracker:
                         if 'id' not in bet:
                             bet['id'] = int((time.time() + i) * 1000)
                             modified = True
-                        
                         # Fix Date
                         if 'date' not in bet or not bet['date']:
                             bet['date'] = datetime.now().strftime("%Y-%m-%d")
                             modified = True
-                        
-                        # Fix Date Format
-                        if ' ' in str(bet['date']):
-                            bet['date'] = str(bet['date']).split(' ')[0]
+                        # Fix Missing Result (The logic bug)
+                        if 'result' not in bet:
+                            bet['result'] = 'Pending'
                             modified = True
                             
                     if modified:
@@ -3186,7 +3188,7 @@ class Tracker:
             return []
 
     def _save(self, bets: list):
-        # --- FIX: Custom Encoder for NumPy Types ---
+        # --- FIX: Custom Encoder for NumPy Types (Fixes JSON Error) ---
         def numpy_converter(obj):
             if isinstance(obj, np.integer):
                 return int(obj)
@@ -3200,7 +3202,6 @@ class Tracker:
 
         try:
             with open(self.file, 'w') as f:
-                # Use default=numpy_converter to handle the non-serializable types
                 json.dump(bets, f, indent=2, default=numpy_converter)
         except Exception as e:
             logging.error(f"Failed to save bets: {e}")
@@ -3266,10 +3267,12 @@ class Tracker:
 
     def get_stats(self) -> dict:
         bets = self.get_bets()
+        # FIX: Count None/Missing as 'Pending'
         wins = len([b for b in bets if b.get('result') == 'Win'])
         losses = len([b for b in bets if b.get('result') == 'Loss'])
         pushes = len([b for b in bets if b.get('result') == 'Push'])
-        pending = len([b for b in bets if b.get('result') == 'Pending'])
+        pending = len([b for b in bets if b.get('result', 'Pending') == 'Pending'])
+        
         total_decided = wins + losses
         win_rate = wins / total_decided if total_decided > 0 else 0
         total_profit = 0
@@ -4519,6 +4522,82 @@ def render_train_model_tab():
             status.update(label="❌ Training Failed", state="error")
             st.error(f"Error: {str(e)}")
 
+def render_guide_tab():
+    """Renders the comprehensive user guide."""
+    st.markdown("### 📘 User Guide & Strategy Primer")
+    st.caption(f"App Version: {CONFIG.CURRENT_SEASON} | {CURRENT_VERSION}")
+
+    # --- SECTION 1: CORE WORKFLOW ---
+    with st.expander("🚀 Quick Start: The Core Workflow", expanded=True):
+        st.markdown("""
+        1. **Analyze:** Go to **Analyze Tab**, pick a player/market, and hit "Run Analysis".
+        2. **Adjust:** Use the **Usage Slider** in the sidebar if there are injuries (see rules below).
+        3. **Decide:** Look for **Grade A** bets where both the **Sim** (Math) and **ML** (Robot) agree.
+        4. **Track:** Click **"💾 Track"** to save the bet to your history.
+        5. **Resolve:** Go to **Bets Tab** the next day, mark it Win/Loss, and enter the actual score.
+        6. **Train:** Once you have 100+ bets, go to **ML Tab** to retrain the brain.
+        """)
+
+    # --- SECTION 2: THE USAGE SLIDER ---
+    with st.expander("⚙️ The Usage Slider (Crucial)", expanded=True):
+        st.info("The model knows averages, not news. You must tell it about injuries.")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### 📉 NEGATIVE ADJ (Injuries)")
+            st.markdown("""
+            * **-5% (Standard D2D):** Player is probable but has a minor ailment.
+            * **-10% (GTD):** High risk of playing "decoy" or limited burst.
+            * **-15% (Minutes Limit):** Strict cap (e.g., returning from 2-week absence).
+            * **-20% (Rust):** First game back from major injury (>1 month).
+            """)
+        
+        with c2:
+            st.markdown("#### 📈 POSITIVE ADJ (Opportunity)")
+            st.markdown("""
+            * **+15% (Backup ➡️ Starter):** Backup PG/Center promoted to starter.
+            * **+10% (Star Teammate OUT):** "Vacuum Effect" (e.g., Luka out, Kyrie +10%).
+            * **+5% (Starter OUT):** "Trickle Down" to other starters.
+            * **+5% (Must Win):** Playoff push or rivalry game (tighter rotation).
+            """)
+
+    # --- SECTION 3: INTERPRETING SIGNALS ---
+    with st.expander("🧠 Robot vs. Math (Sim vs. ML)"):
+        st.markdown("""
+        **The Simulation (The Math):**
+        * Runs 10,000 games using normal distributions, mixtures, and blowouts.
+        * **Strength:** Great at finding "fair value" based on averages.
+        * **Weakness:** Doesn't "learn" from specific losing patterns.
+
+        **The ML Model (The Robot):**
+        * An XGBoost Brain trained on YOUR past bets.
+        * **Strength:** Detects traps (e.g., "Sim loves Over, but every time CV > 30% we lose").
+        * **Weakness:** Needs data (100+ bets) to get smart.
+
+        **⚠️ CONFLICT WARNING:**
+        If you see **"⚠️ CONFLICT: Sim likes OVER, ML leans UNDER"**, it means the Math found an edge, but the Robot recognizes a losing pattern. **SKIP THE BET.**
+        """)
+
+    # --- SECTION 4: GRADING SYSTEM ---
+    with st.expander("🏆 The Grading System"):
+        st.markdown("""
+        * **Grade A (5u):** EV > 5% **AND** Win Prob > 60%. (The "Slam Dunk").
+        * **Grade B (3u):** EV > 2%. Solid value, standard play.
+        * **Grade C (1u):** EV > 0%. Thin edge, only bet if you love the spot.
+        * **Grade D/F (Pass):** Negative EV. The House has the edge. Do not bet.
+        """)
+
+    # --- SECTION 5: ML TRAINING LOOP ---
+    with st.expander("🤖 How to Train the Brain"):
+        st.markdown("""
+        The app gets smarter the more you use it.
+        1. **Log Everything:** Track every bet, even the losses.
+        2. **Update Results:** In **Bets Tab**, be honest. Mark "Bad Beats" vs "Bad Reads".
+        3. **Generate Data:** Go to **ML Tab** -> **Generate Dataset**. This converts your history into training rows.
+        4. **Train:** Click **Start Training**.
+        5. **Result:** The "Robot" will now give better advice on the Analyze tab based on your actual history.
+        """)
+
 # =============================================================================
 # MAIN APPLICATION
 # =============================================================================
@@ -4574,10 +4653,10 @@ def main():
         st.caption(f"{CURRENT_VERSION}")
     
     # Main tabs - simplified names for mobile
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-        "📊 Analyze", "📈 Backtest", "👁️ Watch", "⚔️ H2H", "⚖️ Splits", "📝 Bets", "🎲 Parlays", "🤖 ML"
+
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        "Analyze", "Backtest", "Watchlist", "H2H", "Splits", "Bets", "Parlays", "ML", "Guide"
     ])
-    
     
     # Tab 1: Analyzer
     with tab1:
@@ -4607,10 +4686,10 @@ def main():
             odds_in = st.number_input("💲 Odds", 1.01, 10.00, 1.85, 0.01)
         
         # Advanced options in expander
-        with st.expander("⚙️ Advanced Options", expanded=False):
+        with st.expander("Advanced Options", expanded=False):
             c1, c2, c3, c4 = st.columns(4)
             with c1:
-                is_home = st.checkbox("🏠 Home", True)
+                is_home = st.checkbox("Home", True)
             with c2:
                 days_rest = st.selectbox("Rest", [0, 1, 2, 3], index=1,
                                          format_func=lambda x: "B2B" if x == 0 else f"{x}d")
@@ -4626,7 +4705,7 @@ def main():
         if not is_valid: 
             st.error(error_msg)
         
-        if st.button("🔍 Run Analysis", type="primary", disabled=not player_in or not is_valid):
+        if st.button("Run Analysis", type="primary", disabled=not player_in or not is_valid):
             with st.spinner(f"Analyzing {player_in} vs {opp_in}..."):
                 result = orchestrator.run_analysis(
                     player_name=player_in,
@@ -4715,7 +4794,7 @@ def main():
                 
             with col_parlay: 
                 if result.decision.rollover_suitable:
-                    if st.button("🎲 Parlay", use_container_width=True):
+                    if st.button("Parlay", use_container_width=True):
                         leg = {
                             'player': result.player_name,
                             'opponent': result.opponent_name,
@@ -4740,11 +4819,11 @@ def main():
                             st.toast("Added!", icon="🎲")
                             st.rerun()
                 else: 
-                    st.button("🎲 Parlay", disabled=True, use_container_width=True,
+                    st.button("Parlay", disabled=True, use_container_width=True,
                              help="Not suitable for parlay")
             
             # Details in expander to reduce clutter
-            with st.expander("📊 Details & Chart", expanded=False):
+            with st.expander("Details & Chart", expanded=False):
                 render_blowout_info(result)
                 
                 # Hit rates
@@ -4771,7 +4850,7 @@ def main():
     with tab4:
         result = st.session_state.analysis_result
         if result and result.success:
-            st.markdown(f"### ⚔️ {result.player_name} vs {result.opponent_name}")
+            st.markdown(f"{result.player_name} vs {result.opponent_name}")
             with st.spinner("Loading..."):
                 full_history = orchestrator.data_loader.fetch_multi_season_logs(result.player_id)
             
@@ -4805,19 +4884,19 @@ def main():
             market = result.market
             line = result.line
             
-            st.markdown(f"### ⚖️ {result.player_name} Splits")
+            st.markdown(f"{result.player_name} Splits")
             
             splits = {
-                "📊 L15": df.tail(15),
-                "🏠 Home": df[df['IS_HOME'] == True].tail(15),
-                "✈️ Away": df[df['IS_HOME'] == False].tail(15),
-                "✅ W": df[df['WL'] == 'W'].tail(15),
-                "❌ L": df[df['WL'] == 'L'].tail(15),
+                "L15": df.tail(15),
+                "Home": df[df['IS_HOME'] == True].tail(15),
+                "Away": df[df['IS_HOME'] == False].tail(15),
+                "W": df[df['WL'] == 'W'].tail(15),
+                "L": df[df['WL'] == 'L'].tail(15),
             }
             
             if 'DAYS_REST' in df.columns:
-                splits["😴 Rest"] = df[df['DAYS_REST'] >= 3].tail(15)
-                splits["🏃 B2B"] = df[df['DAYS_REST'] <= 1].tail(15)
+                splits["Rest"] = df[df['DAYS_REST'] >= 3].tail(15)
+                splits[" B2B"] = df[df['DAYS_REST'] <= 1].tail(15)
             
             data = []
             for k, v in splits.items():
@@ -4839,7 +4918,7 @@ def main():
     
     # Tab 6: Bets
     with tab6:
-        st.markdown("### 📝 Bet Tracker")
+        st.markdown("Bet Tracker")
         
         stats = tracker.get_stats()
         
@@ -4852,7 +4931,7 @@ def main():
             
             # Score Box Summary (if we have margin data)
             if stats.get('margin_count', 0) > 0:
-                with st.expander("📊 Score Box Analysis", expanded=False):
+                with st.expander("Score Box Analysis", expanded=False):
                     sb1, sb2, sb3, sb4 = st.columns(4)
                     sb1.metric("Avg Margin", f"{stats['avg_margin']:+.1f}", 
                               help="Average margin on decided bets (+ = favorable)")
@@ -5002,6 +5081,9 @@ def main():
             
         with ml_subtab3:
             render_train_model_tab()
+
+    with tab9:
+        render_guide_tab()
 
 
 # =============================================================================
