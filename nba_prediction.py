@@ -2,7 +2,7 @@ from pyexpat import features
 import streamlit as st
 import pandas as pd
 import numpy as np
-from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo
+from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, leaguedashplayerstats, leaguegamelog
 from nba_api.stats.static import players, teams
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, asdict
@@ -127,6 +127,35 @@ class Config:
     CV_MIN_STD_MULT: float = 0.70  # Minimum std multiplier for very consistent players
     CV_MAX_STD_MULT: float = 1.50  # Maximum std multiplier for volatile players
     CV_BASELINE: float = 0.25  # "Average" CV baseline for scaling
+    
+    # Low-Count Stats Configuration (3PM, STL, BLK)
+    # These stats behave differently - they're discrete, low-frequency events
+    LOW_COUNT_STATS: tuple = ('3PM', 'FG3M', 'STL', 'BLK', 'TOV')  # Treat these as Poisson
+    LOW_COUNT_MAX_MULTIPLIER: float = 2.0  # Cap upside at 2x the mean (tighter than before)
+    # Realistic MEAN caps (no player averages more than these)
+    LOW_COUNT_MEAN_CAPS: dict = field(default_factory=lambda: {
+        '3PM': 6.0,   # Steph Curry averages ~5-6, cap at 6
+        'FG3M': 6.0,
+        'STL': 3.0,   # Elite defenders average 2-2.5, cap at 3
+        'BLK': 4.0,   # Elite blockers average 2-3, cap at 4
+        'TOV': 5.0    # High usage players average 3-4
+    })
+    # Realistic OUTPUT caps (single-game maximums)
+    LOW_COUNT_ABSOLUTE_CAPS: dict = field(default_factory=lambda: {
+        '3PM': 10,    # 10+ threes is historic (Klay had 14 once)
+        'FG3M': 10,
+        'STL': 5,     # 5+ steals is extremely rare
+        'BLK': 6,     # 6+ blocks is very rare
+        'TOV': 8      # Cap turnovers
+    })
+    # Low-count margin thresholds for result quality (tighter than high-count)
+    LOW_COUNT_MARGIN_SWEAT: float = 0.5   # Won/Lost by 0.5 (1 stat)
+    LOW_COUNT_MARGIN_CLOSE: float = 1.5   # Won/Lost by 1-1.5 (1-2 stats)
+    LOW_COUNT_MARGIN_SOLID: float = 2.5   # Won/Lost by 2-2.5 (2-3 stats)
+    # High-count margin thresholds (existing behavior, now explicit)
+    HIGH_COUNT_MARGIN_SWEAT: float = 1.5
+    HIGH_COUNT_MARGIN_CLOSE: float = 3.5
+    HIGH_COUNT_MARGIN_SOLID: float = 7.5
 
 
 CONFIG = Config()
@@ -425,6 +454,7 @@ class FeatureVector:
     spread: float
     days_rest: int  # Days since last game (0=B2B, 1=normal, 2+=well-rested)
     game_total: float  # Vegas O/U total for the game
+    market: str  # The stat market being analyzed (PTS, REB, 3PM, STL, etc.)
     
     # Opponent recent form
     opponent_drtg_season: float  # Opponent defensive rating (season)
@@ -643,12 +673,13 @@ class DataLoader:
         self._team_stats_cache_time: float = 0
     
     def _api_call_with_retry(self, func, description: str = "API call"):
-        """Execute API call with smart retry logic and 'Penalty Box' for timeouts."""
+        """Execute API call with retry logic. Exponential backoff for rate limits."""
         import random
         last_exception = None
+        cooldown_count = 0
+        MAX_COOLDOWNS = 5  # More patient - 5 cooldowns before failing
         
-        # Increase retries slightly for bulk operations
-        max_retries = self.config.API_MAX_RETRIES + 2 
+        max_retries = self.config.API_MAX_RETRIES + 4  # More retries total
         
         for attempt in range(max_retries):
             try:
@@ -660,10 +691,14 @@ class DataLoader:
                 error_str = str(e).lower()
                 
                 # CHECK FOR TIMEOUTS / RATE LIMITS
-                if "timed out" in error_str or "timeout" in error_str or "429" in error_str:
-                    # THE PENALTY BOX: Wait significantly longer (45s, 90s, 135s...)
-                    wait_time = 45 * (attempt + 1)
-                    logger.warning(f"⚠️ API Cooldown Triggered ({description}). Waiting {wait_time}s to clear soft ban...")
+                if "timed out" in error_str or "timeout" in error_str or "429" in error_str or "read timeout" in error_str:
+                    cooldown_count += 1
+                    if cooldown_count >= MAX_COOLDOWNS:
+                        logger.error(f"🛑 {MAX_COOLDOWNS} consecutive timeouts. API is blocked. Failing fast.")
+                        raise DataLoaderError(f"{description} failed: API rate limited after {cooldown_count} timeouts")
+                    # Exponential backoff: 30s, 60s, 90s, 120s
+                    wait_time = 30 * cooldown_count
+                    logger.warning(f"⚠️ API Cooldown {cooldown_count}/{MAX_COOLDOWNS}. Waiting {wait_time}s...")
                     time.sleep(wait_time)
                 else:
                     # Standard error (e.g. JSON decode), short wait
@@ -844,52 +879,60 @@ class DataLoader:
             logger.error(f"Failed to fetch team stats: {e}")
             return pd.DataFrame(), _self.config.DEFAULT_PACE, _self.config.DEFAULT_DEF_RATING
     
-    def fetch_opponent_stats(self) -> pd.DataFrame:
+    def fetch_opponent_stats(self, season: str = None) -> pd.DataFrame:
         """Fetch opponent (defensive) stats for position defense calculation."""
+        if season is None:
+            season = self.config.CURRENT_SEASON
         try:
             def api_call():
                 return leaguedashteamstats.LeagueDashTeamStats(
-                    season=self.config.CURRENT_SEASON,
+                    season=season,
                     measure_type_detailed_defense='Opponent',
                     per_mode_detailed='PerGame'
                 ).get_data_frames()[0]
             
-            return self._api_call_with_retry(api_call, "Fetch opponent stats")
+            return self._api_call_with_retry(api_call, f"Fetch opponent stats ({season})")
         except Exception as e:
-            logger.error(f"Failed to fetch opponent stats: {e}")
+            logger.error(f"Failed to fetch opponent stats for {season}: {e}")
             return pd.DataFrame()
     
-    def fetch_position_defense(self) -> Dict[str, Dict[str, float]]:
+    def fetch_position_defense(self, season: str = None) -> Dict[str, Dict[str, float]]:
         """
         Calculate position-based defense multipliers from real data.
-        Uses caching to avoid repeated API calls.
+        Uses per-season caching to avoid repeated API calls.
         """
+        if season is None:
+            season = self.config.CURRENT_SEASON
+        
+        # Season-specific cache file
+        cache_file = DATA_DIR / f"position_defense_cache_{season.replace('-', '_')}.json"
+        
         # Check file cache
         try:
-            if POSITION_DEF_CACHE_FILE. exists():
-                with open(POSITION_DEF_CACHE_FILE, 'r') as f:
+            if cache_file.exists():
+                with open(cache_file, 'r') as f:
                     cache = json.load(f)
-                    if time.time() - cache. get('timestamp', 0) < self. config.CACHE_TTL_POSITION_DEF: 
-                        logger.info("Using cached position defense data")
-                        return cache. get('data', {})
+                    if time.time() - cache.get('timestamp', 0) < self.config.CACHE_TTL_POSITION_DEF:
+                        logger.info(f"Using cached position defense data for {season}")
+                        return cache.get('data', {})
         except (json.JSONDecodeError, IOError):
             pass
         
-        logger.info("Fetching real position defense data from NBA API...")
+        logger.info(f"Fetching position defense data for {season} from NBA API...")
         
-        opp_stats = self.fetch_opponent_stats()
+        opp_stats = self.fetch_opponent_stats(season=season)
         if opp_stats is None or len(opp_stats) == 0:
             return self._get_neutral_position_multipliers()
         
         team_position_mult = self._calculate_position_multipliers(opp_stats)
         
-        # Save to cache
+        # Save to season-specific cache
         try:
-            cache = {'timestamp': time.time(), 'data': team_position_mult}
-            with open(POSITION_DEF_CACHE_FILE, 'w') as f:
-                json. dump(cache, f, indent=2)
+            cache = {'timestamp': time.time(), 'season': season, 'data': team_position_mult}
+            with open(cache_file, 'w') as f:
+                json.dump(cache, f, indent=2)
         except IOError as e:
-            logger.error(f"Failed to save position defense cache: {e}")
+            logger.error(f"Failed to save position defense cache for {season}: {e}")
         
         return team_position_mult
     
@@ -1568,6 +1611,7 @@ class FeatureEngineer:
             spread=spread,
             days_rest=days_rest,
             game_total=game_total,
+            market=market,  # Added for low-count stat handling
             opponent_drtg_season=opponent_drtg_season,
             opponent_drtg_l5=opp_drtg_l5,
             ema=stats['ema'],
@@ -1718,12 +1762,23 @@ class ModelEngine:
             adjusted_proj = self.apply_bad_beat_penalty(features.player_name, adjusted_proj)
             if temp_proj > 0:
                 bad_beat_factor = adjusted_proj / temp_proj
+        
+        # 5. [LOW-COUNT STAT CAP] Cap projection for discrete stats like STL, BLK, 3PM
+        # This prevents unrealistic projections like "6.3 steals"
+        low_count_capped = False
+        market = getattr(features, 'market', None)
+        if market and market in CONFIG.LOW_COUNT_STATS:
+            mean_cap = CONFIG.LOW_COUNT_MEAN_CAPS.get(market, 5.0)
+            if adjusted_proj > mean_cap:
+                adjusted_proj = mean_cap
+                low_count_capped = True
 
-        # 5. Get ML Prediction
+        # 6. Get ML Prediction
         ml_prob = self.get_ml_prediction(features)
 
-        # 6. Generate Context String
+        # 7. Generate Context String
         context_parts = []
+        if low_count_capped: context_parts.append(f"🎯 Capped ({market} max)")
         if features.combined_matchup_mult > 1.05: context_parts.append("✅ Great Matchup")
         elif features.combined_matchup_mult < 0.95: context_parts.append("❌ Tough Defense")
         if features.rest_factor < 1.0: context_parts.append("⚠️ Fatigue Risk")
@@ -1789,15 +1844,9 @@ class SimulationEngine:
         if simulations is None: 
             simulations = self.config.MONTE_CARLO_SIMS
         
-        low_count_stats = ['STL', 'BLK', '3PM', 'FG3M']
-        
-        if market in low_count_stats: 
-            # Use Poisson for low-count stats
-            # For Poisson, adjust lambda based on features if available
-            adjusted_mean = mean
-            if features is not None:
-                adjusted_mean = self._apply_feature_adjustments_to_mean(mean, line, features)
-            sims = np.random.poisson(max(0.1, adjusted_mean), simulations).astype(float)
+        if market in self.config.LOW_COUNT_STATS: 
+            # Use Poisson for low-count stats with strict upside caps
+            sims = self._generate_low_count_samples(mean, line, market, features, simulations)
         else:
             if use_mixture and features is not None:
                 # SMART simulation with feature-aware mixture
@@ -2053,6 +2102,73 @@ class SimulationEngine:
         
         return sims
     
+    def _generate_low_count_samples(
+        self,
+        mean: float,
+        line: float,
+        market: str,
+        features: 'FeatureVector',
+        n_samples: int
+    ) -> np.ndarray:
+        """
+        Generate samples for low-count stats (3PM, STL, BLK) using Poisson distribution.
+        
+        Key differences from high-count stats:
+        1. Uses Poisson distribution (discrete, non-negative)
+        2. Caps the MEAN itself to realistic ranges (no one averages 6+ steals)
+        3. Applies strict output caps to prevent impossible single-game values
+        4. Adjusts lambda based on features while respecting stat reality
+        """
+        # CRITICAL: Cap the mean to realistic ranges FIRST
+        # This prevents projections like "6.3 steals" which are impossible
+        mean_cap = self.config.LOW_COUNT_MEAN_CAPS.get(market, 5.0)
+        capped_mean = min(mean, mean_cap)
+        
+        # Start with the capped mean (lambda for Poisson)
+        adjusted_lambda = max(0.1, capped_mean)
+        
+        # Apply feature adjustments if available (more conservative for low-count)
+        if features is not None:
+            # Trend adjustment (halved for low-count to prevent overreaction)
+            if abs(features.trend) > 0.05:
+                trend_adj = features.trend * capped_mean * 0.01  # Only 1% vs 2% for high-count
+                adjusted_lambda += max(-0.2, min(0.2, trend_adj))
+            
+            # Matchup adjustment (capped more tightly)
+            matchup_effect = (features.combined_matchup_mult - 1.0) * capped_mean * 0.3
+            adjusted_lambda += max(-0.3, min(0.3, matchup_effect))
+            
+            # Blowout penalty (low-count stats suffer more from reduced minutes)
+            if features.blowout_prob >= 0.30:
+                adjusted_lambda *= 0.80
+            elif features.blowout_prob >= 0.20:
+                adjusted_lambda *= 0.90
+            
+            # B2B/fatigue penalty
+            if features.is_b2b:
+                adjusted_lambda *= 0.92
+        
+        # Ensure lambda is positive and doesn't exceed the cap
+        adjusted_lambda = max(0.1, min(adjusted_lambda, mean_cap))
+        
+        # Generate Poisson samples
+        sims = np.random.poisson(adjusted_lambda, n_samples).astype(float)
+        
+        # Apply output caps (single-game maximums)
+        # Cap 1: Relative to capped mean (prevent 2x+ blowups)
+        relative_cap = capped_mean * self.config.LOW_COUNT_MAX_MULTIPLIER
+        
+        # Cap 2: Absolute cap based on stat type (real-world single-game limits)
+        absolute_cap = self.config.LOW_COUNT_ABSOLUTE_CAPS.get(market, 8)
+        
+        # Use the more restrictive cap
+        final_cap = min(relative_cap, absolute_cap)
+        
+        # Apply cap
+        sims = np.minimum(sims, final_cap)
+        
+        return sims
+    
     def _generate_mixture_samples(
         self, 
         mean: float, 
@@ -2168,6 +2284,7 @@ class DecisionPolicy:
         """
         Determines bet side, stake, and grade based on EV and ML validation.
         FIXED: Removed 'confidence_score' to fix TypeError.
+        FIXED: Now properly calculates rollover_score.
         """
         # 1. Use Simulation Probabilities (The "Smart" Source)
         prob_over = simulation.over_prob
@@ -2197,21 +2314,110 @@ class DecisionPolicy:
 
         # 6. Generate Warnings
         confidence_warning = self._generate_confidence_warning(features, prob, projection, side)
+        
+        # 7. Calculate Rollover/Parlay Score (0-5 scale)
+        rollover_score = self._calculate_rollover_score(features, prob, ev, grade)
+        
+        # 8. Determine Rollover Suitability
+        rollover_suitable = rollover_score >= 3.0
 
         return BetDecision(
             recommended_side=side,
-            # confidence_score removed (caused the crash)
             probability=prob,
             expected_value=ev,
             kelly_stake=stake,
             kelly_fraction=fraction,
             grade=grade,
             confidence_warning=confidence_warning,
-            rollover_suitable=(grade in [BetGrade.A, BetGrade.B] and prob > 0.58),
+            rollover_suitable=rollover_suitable,
             reasons_good=[], 
             reasons_bad=[],
-            rollover_score=0.0
+            rollover_score=rollover_score
         )
+    
+    def _calculate_rollover_score(
+        self,
+        features: FeatureVector,
+        probability: float,
+        ev: float,
+        grade: BetGrade
+    ) -> float:
+        """
+        Calculate parlay/rollover suitability score (0-5 scale).
+        
+        Higher scores = better for parlays. Considers:
+        1. Win probability (higher = better)
+        2. Player consistency (lower CV = better)
+        3. Sample size (more games = more reliable)
+        4. Hit rate history (consistent hitter = better)
+        5. Blowout risk (lower = better for parlays)
+        """
+        score = 0.0
+        
+        # --- Component 1: Probability (0-1.5 points) ---
+        # Sweet spot is 60-70%, above 70% is great
+        if probability >= 0.70:
+            score += 1.5
+        elif probability >= 0.65:
+            score += 1.25
+        elif probability >= 0.60:
+            score += 1.0
+        elif probability >= 0.55:
+            score += 0.5
+        # Below 55% gets 0
+        
+        # --- Component 2: Consistency/CV (0-1.0 points) ---
+        # Lower CV = more predictable = better for parlays
+        cv = features.coef_variation
+        if cv <= 0.15:
+            score += 1.0  # Very consistent
+        elif cv <= 0.20:
+            score += 0.75
+        elif cv <= 0.25:
+            score += 0.5
+        elif cv <= 0.30:
+            score += 0.25
+        # Above 30% CV = too volatile for parlays
+        
+        # --- Component 3: Sample Size (0-0.75 points) ---
+        games = features.games_played
+        if games >= 20:
+            score += 0.75
+        elif games >= 15:
+            score += 0.5
+        elif games >= 10:
+            score += 0.25
+        # Below 10 games = insufficient data
+        
+        # --- Component 4: Hit Rate History (0-1.0 points) ---
+        # Use weighted hit rate (recency-weighted)
+        hit_rate = features.hit_rate_weighted
+        if hit_rate >= 0.70:
+            score += 1.0
+        elif hit_rate >= 0.60:
+            score += 0.75
+        elif hit_rate >= 0.50:
+            score += 0.5
+        elif hit_rate >= 0.40:
+            score += 0.25
+        
+        # --- Component 5: Blowout Risk Penalty (0 to -0.75 points) ---
+        # High blowout risk = dangerous for parlays
+        if features.blowout_prob >= 0.35:
+            score -= 0.75
+        elif features.blowout_prob >= 0.25:
+            score -= 0.5
+        elif features.blowout_prob >= 0.15:
+            score -= 0.25
+        
+        # --- Bonus: Grade A gets a boost ---
+        if grade == BetGrade.A:
+            score += 0.5
+        elif grade == BetGrade.B:
+            score += 0.25
+        
+        # Clamp to 0-5 range
+        return max(0.0, min(5.0, score))
 
     def _generate_confidence_warning(
         self, 
@@ -2290,19 +2496,24 @@ class Backtester:
         test_days: int = 30,
         line_offset: float = 0.0,  # Test at actual average ± offset
         fixed_spread: float = 0.0,
-        progress_callback=None
+        progress_callback=None,
+        preloaded_df: pd.DataFrame = None  # Optional: use pre-loaded game logs
     ) -> Optional[BacktestSummary]:
         """
         Run walk-forward backtest.
         
+        If preloaded_df is provided, uses that instead of fetching from API.
         For each day in the test period:
         1. Use only data available up to that day
         2. Generate prediction
         3. Compare to actual result
         """
         
-        # Fetch all available data
-        df = self.data_loader.fetch_multi_season_logs(player_id)
+        # Fetch all available data (or use preloaded)
+        if preloaded_df is not None and len(preloaded_df) > 0:
+            df = preloaded_df.copy()
+        else:
+            df = self.data_loader.fetch_multi_season_logs(player_id)
         # NEW FLEXIBLE LOGIC (Harvests all valid data)
         min_required = self.config.BACKTEST_MIN_GAMES
         
@@ -2327,15 +2538,19 @@ class Backtester:
         player_position = self.data_loader.get_player_position(player_id)
         
         # Get team stats (use current - this is a simplification)
-        team_stats, avg_pace, avg_def = self.data_loader. fetch_team_stats()
-        position_defense = self.data_loader. fetch_position_defense()
+        team_stats, avg_pace, avg_def = self.data_loader.fetch_team_stats()
+        
+        # Pre-load position defense for both seasons to avoid repeated API calls
+        position_defense_cache = {
+            self.config.CURRENT_SEASON: self.data_loader.fetch_position_defense(self.config.CURRENT_SEASON),
+            self.config.PREV_SEASON: self.data_loader.fetch_position_defense(self.config.PREV_SEASON)
+        }
         
         # Sort by date
         df = df.sort_values('GAME_DATE').reset_index(drop=True)
         
-        # Determine test period
-        total_games = len(df)
-        test_start_idx = max(self.config.BACKTEST_MIN_GAMES, total_games - test_days)
+        # NOTE: test_start_idx already calculated above using actual_test_days
+        # (flexible logic that uses available games even if less than desired)
         
         results = []
         
@@ -2381,6 +2596,24 @@ class Backtester:
             else:
                 days_rest = 3  # First game of dataset, assume well-rested
                 is_b2b = False
+            
+            # Determine which season this game belongs to for position defense
+            try:
+                game_date = pd.to_datetime(target_game['GAME_DATE'])
+                # NBA season runs Oct-Jun. If month >= 10 (Oct), it's the new season year.
+                # e.g., Oct 2024 = "2024-25" season, Jan 2025 = still "2024-25"
+                if game_date.month >= 10:
+                    game_season = f"{game_date.year}-{str(game_date.year + 1)[-2:]}"
+                else:
+                    game_season = f"{game_date.year - 1}-{str(game_date.year)[-2:]}"
+                
+                # Use cached position defense for this season
+                position_defense = position_defense_cache.get(
+                    game_season, 
+                    position_defense_cache.get(self.config.CURRENT_SEASON, {})
+                )
+            except Exception:
+                position_defense = position_defense_cache.get(self.config.CURRENT_SEASON, {})
             
             # Find opponent ID (if possible)
             all_teams = teams. get_teams()
@@ -2683,68 +2916,285 @@ class Backtester:
 # ML DATA GENERATOR
 # =============================================================================
 
-def get_top_active_players(limit: int = 50) -> List[Dict]:
+# G-League team IDs start at this threshold (NBA teams are 1610612737-1610612766)
+GLEAGUE_TEAM_ID_THRESHOLD = 1610612900
+
+# NBA Division to Team mapping (team abbreviations)
+NBA_DIVISIONS = {
+    'Atlantic': ['BOS', 'BKN', 'NYK', 'PHI', 'TOR'],
+    'Central': ['CHI', 'CLE', 'DET', 'IND', 'MIL'],
+    'Southeast': ['ATL', 'CHA', 'MIA', 'ORL', 'WAS'],
+    'Northwest': ['DEN', 'MIN', 'OKC', 'POR', 'UTA'],
+    'Pacific': ['GSW', 'LAC', 'LAL', 'PHX', 'SAC'],
+    'Southwest': ['DAL', 'HOU', 'MEM', 'NOP', 'SAS']
+}
+
+def get_top_active_players(limit: int = 50, min_games: int = 10) -> List[Dict]:
     """
     Get top active NBA players by games played this season.
-    Returns list of player dicts with 'id' and 'full_name'.
+    
+    OPTIMIZED: Uses leaguedashplayerstats endpoint for a single API call
+    instead of fetching individual game logs (100x faster).
+    
+    Excludes G-League players by checking team ID.
+    Returns list of player dicts with 'id', 'full_name', 'team', and 'division'.
     """
-    all_players = players.get_active_players()
+    logger.info(f"Fetching top {limit} active players (min {min_games} GP, excluding G-League)...")
     
-    # Sort by most recognizable (those with most data typically)
-    # We'll verify by checking game logs
-    player_game_counts = []
-    data_loader = DataLoader()
+    try:
+        # Single API call to get ALL active players with their stats
+        time.sleep(CONFIG.API_DELAY)
+        stats = leaguedashplayerstats.LeagueDashPlayerStats(
+            season=CONFIG.CURRENT_SEASON,
+            per_mode_detailed='PerGame',
+            timeout=60
+        )
+        df = stats.get_data_frames()[0]
+        
+        if df is None or len(df) == 0:
+            logger.warning("leaguedashplayerstats returned no data")
+            return []
+        
+        logger.info(f"  ✓ Fetched {len(df)} players from NBA API in 1 request")
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch player stats: {e}")
+        return []
     
-    logger.info(f"Scanning for top {limit} active players...")
+    # Build mappings
+    all_teams = teams.get_teams()
+    team_id_to_abbrev = {t['id']: t['abbreviation'] for t in all_teams}
     
-    for p in all_players[:200]:  # Check first 200 active players
-        try:
-            df = data_loader.fetch_game_logs(p['id'])
-            if len(df) >= 10:  # Minimum games threshold
-                player_game_counts.append({
-                    'id': p['id'],
-                    'full_name': p['full_name'],
-                    'games': len(df)
-                })
-        except Exception:
+    abbrev_to_division = {}
+    for division, team_abbrevs in NBA_DIVISIONS.items():
+        for abbrev in team_abbrevs:
+            abbrev_to_division[abbrev] = division
+    
+    # Filter and process
+    player_list = []
+    division_counts = {div: 0 for div in NBA_DIVISIONS.keys()}
+    
+    for _, row in df.iterrows():
+        player_id = row['PLAYER_ID']
+        player_name = row['PLAYER_NAME']
+        team_id = row['TEAM_ID']
+        games_played = row['GP']
+        
+        # Skip players with too few games
+        if games_played < min_games:
             continue
         
-        if len(player_game_counts) >= limit * 2:  # Get more than needed to filter
-            break
+        # Skip G-League players
+        if team_id > GLEAGUE_TEAM_ID_THRESHOLD:
+            continue
+        
+        # Get team abbreviation and division
+        team_abbrev = team_id_to_abbrev.get(team_id)
+        if not team_abbrev:
+            continue
+        
+        division = abbrev_to_division.get(team_abbrev)
+        if not division:
+            continue  # Not an NBA team we recognize
+        
+        player_list.append({
+            'id': player_id,
+            'full_name': player_name,
+            'games': games_played,
+            'team': team_abbrev,
+            'division': division
+        })
+        division_counts[division] += 1
     
-    # Sort by games played and return top N
-    player_game_counts.sort(key=lambda x: x['games'], reverse=True)
-    return player_game_counts[:limit]
+    # Log division breakdown
+    for division in NBA_DIVISIONS.keys():
+        logger.info(f"  ✓ {division}: {division_counts[division]} players")
+    
+    # Sort by games played (descending) and return top N
+    player_list.sort(key=lambda x: x['games'], reverse=True)
+    total_found = len(player_list)
+    logger.info(f"Found {total_found} NBA players, returning top {min(limit, total_found)}")
+    
+    return player_list[:limit]
+
+
+class BulkGameLogLoader:
+    """
+    Downloads ALL player game logs for the entire league in 2 API calls.
+    Enables offline backtesting without per-player API calls.
+    """
+    
+    def __init__(self, config: Config = CONFIG):
+        self.config = config
+        self._cache: Dict[int, pd.DataFrame] = {}  # player_id -> game_logs
+        self._loaded = False
+    
+    def load_all_game_logs(self, progress_callback=None) -> bool:
+        """
+        Fetch all game logs for current + previous season in 2 API calls.
+        Returns True if successful, False otherwise.
+        """
+        if self._loaded:
+            return True
+        
+        all_logs = []
+        seasons = [self.config.CURRENT_SEASON, self.config.PREV_SEASON]
+        
+        for i, season in enumerate(seasons):
+            try:
+                logger.info(f"📥 Fetching ALL game logs for {season} (API call {i+1}/2)...")
+                time.sleep(self.config.API_DELAY * 2)  # Extra delay for large request
+                
+                logs = leaguegamelog.LeagueGameLog(
+                    season=season,
+                    player_or_team_abbreviation='P',  # P = Players
+                    timeout=120  # Large request needs more time
+                )
+                df = logs.get_data_frames()[0]
+                
+                if df is not None and len(df) > 0:
+                    df['SEASON'] = season
+                    all_logs.append(df)
+                    logger.info(f"  ✓ {season}: {len(df):,} game log entries")
+                else:
+                    logger.warning(f"  ✗ {season}: No data returned")
+                    
+                if progress_callback:
+                    progress_callback((i + 1) / len(seasons) * 0.3)  # 30% for loading
+                    
+            except Exception as e:
+                logger.error(f"  ✗ Failed to fetch {season} logs: {e}")
+                # If current season fails, we can still use previous season
+                if season == self.config.CURRENT_SEASON:
+                    return False
+        
+        if not all_logs:
+            logger.error("No game logs fetched from either season")
+            return False
+        
+        # Combine all seasons
+        combined = pd.concat(all_logs, ignore_index=True)
+        logger.info(f"📊 Total: {len(combined):,} game log entries across {len(all_logs)} seasons")
+        
+        # Parse and organize by player
+        self._organize_by_player(combined)
+        self._loaded = True
+        
+        return True
+    
+    def _organize_by_player(self, df: pd.DataFrame):
+        """Organize the bulk data by player ID for fast lookup."""
+        # Convert column names to match playergamelog format
+        # leaguegamelog returns slightly different column names
+        column_map = {
+            'PLAYER_ID': 'PLAYER_ID',
+            'PLAYER_NAME': 'PLAYER_NAME',
+            'TEAM_ID': 'TEAM_ID',
+            'TEAM_ABBREVIATION': 'TEAM_ABBREVIATION',
+            'TEAM_NAME': 'TEAM_NAME',
+            'GAME_ID': 'GAME_ID',
+            'GAME_DATE': 'GAME_DATE',
+            'MATCHUP': 'MATCHUP',
+            'WL': 'WL',
+            'MIN': 'MIN',
+            'FGM': 'FGM',
+            'FGA': 'FGA',
+            'FG_PCT': 'FG_PCT',
+            'FG3M': 'FG3M',
+            'FG3A': 'FG3A',
+            'FG3_PCT': 'FG3_PCT',
+            'FTM': 'FTM',
+            'FTA': 'FTA',
+            'FT_PCT': 'FT_PCT',
+            'OREB': 'OREB',
+            'DREB': 'DREB',
+            'REB': 'REB',
+            'AST': 'AST',
+            'STL': 'STL',
+            'BLK': 'BLK',
+            'TOV': 'TOV',
+            'PF': 'PF',
+            'PTS': 'PTS',
+            'PLUS_MINUS': 'PLUS_MINUS'
+        }
+        
+        # Only keep columns that exist
+        existing_cols = [c for c in column_map.keys() if c in df.columns]
+        df = df[existing_cols].copy()
+        
+        # Add derived columns
+        if 'PTS' in df.columns and 'REB' in df.columns and 'AST' in df.columns:
+            df['PRA'] = df['PTS'] + df['REB'] + df['AST']
+        if 'PTS' in df.columns and 'REB' in df.columns:
+            df['PR'] = df['PTS'] + df['REB']
+        if 'PTS' in df.columns and 'AST' in df.columns:
+            df['PA'] = df['PTS'] + df['AST']
+        if 'REB' in df.columns and 'AST' in df.columns:
+            df['RA'] = df['REB'] + df['AST']
+        if 'FG3M' in df.columns:
+            df['3PM'] = df['FG3M']
+        
+        # Parse MIN to float
+        if 'MIN' in df.columns:
+            df['MIN_FLOAT'] = pd.to_numeric(df['MIN'], errors='coerce').fillna(0)
+        
+        # Derive IS_HOME from MATCHUP column
+        # "MIL vs. CHI" = home game (contains "vs.")
+        # "MIL @ CHI" = away game (contains "@")
+        if 'MATCHUP' in df.columns:
+            df['IS_HOME'] = df['MATCHUP'].str.contains('vs.', case=False, na=False)
+        else:
+            df['IS_HOME'] = True  # Default to home if no matchup info
+        
+        # Sort by date (most recent first)
+        df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
+        df = df.sort_values('GAME_DATE', ascending=False)
+        
+        # Group by player
+        for player_id, player_df in df.groupby('PLAYER_ID'):
+            self._cache[player_id] = player_df.reset_index(drop=True)
+        
+        logger.info(f"  ✓ Organized data for {len(self._cache):,} unique players")
+    
+    def get_player_logs(self, player_id: int) -> pd.DataFrame:
+        """Get game logs for a specific player from cache."""
+        if not self._loaded:
+            return pd.DataFrame()
+        return self._cache.get(player_id, pd.DataFrame())
+    
+    def has_player(self, player_id: int) -> bool:
+        """Check if we have data for a player."""
+        return player_id in self._cache
+    
+    @property
+    def player_count(self) -> int:
+        """Number of players in cache."""
+        return len(self._cache)
+    
+    @property
+    def is_loaded(self) -> bool:
+        return self._loaded
 
 
 def generate_ml_training_data(
     output_file: str = "ml_training_data.csv",
     num_players: int = 50,
     markets: List[str] = None,
-    test_days: int = 60,  # More data for training
+    test_days: int = 60,
     lookback: int = 15,
     progress_callback=None
 ) -> pd.DataFrame:
     """
     Generate ML training dataset by running backtests on multiple players.
     
-    Args:
-        output_file: Output CSV filename
-        num_players: Number of top players to include
-        markets: List of markets to backtest (default: PTS, REB, AST, PRA)
-        test_days: Number of games to backtest per player
-        lookback: Lookback window for features
-        progress_callback: Optional callback for progress updates
-    
-    Returns:
-        Combined DataFrame with all backtest results
+    OPTIMIZED: Uses bulk data loading (2 API calls total) instead of per-player calls.
     """
     if markets is None:
         markets = ['PTS', 'REB', 'AST', 'PRA']
     
     logger.info(f"Starting ML data generation for {num_players} players...")
+    logger.info(f"Markets: {markets}")
     
-    # Initialize components
     config = CONFIG
     data_loader = DataLoader(config)
     feature_engineer = FeatureEngineer(config)
@@ -2752,32 +3202,60 @@ def generate_ml_training_data(
     simulation_engine = SimulationEngine(config)
     decision_policy = DecisionPolicy(config)
     
-    backtester = Backtester(
-        data_loader=data_loader,
-        feature_engineer=feature_engineer,
-        model_engine=model_engine,
-        simulation_engine=simulation_engine,
-        decision_policy=decision_policy,
-        config=config
-    )
+    backtester = Backtester(data_loader, feature_engineer, model_engine, simulation_engine, decision_policy, config)
     
-    # Get top players
+    # =========================================================================
+    # STEP 1: Bulk load ALL game logs (2 API calls instead of 500+)
+    # =========================================================================
+    bulk_loader = BulkGameLogLoader(config)
+    
+    if progress_callback:
+        progress_callback(0.05)  # 5%
+    
+    if not bulk_loader.load_all_game_logs(progress_callback):
+        logger.error("🛑 Failed to bulk load game logs. Aborting.")
+        return pd.DataFrame()
+    
+    logger.info(f"✅ Bulk data loaded: {bulk_loader.player_count:,} players available offline")
+    
+    if progress_callback:
+        progress_callback(0.35)  # 35% done with loading
+    
+    # =========================================================================
+    # STEP 2: Get top players (1 API call)
+    # =========================================================================
     logger.info("Fetching top active players...")
     top_players = get_top_active_players(num_players)
-    logger.info(f"Found {len(top_players)} players with sufficient data")
     
+    if progress_callback:
+        progress_callback(0.40)  # 40%
+    
+    # =========================================================================
+    # STEP 3: Run backtests using LOCAL data (no more API calls!)
+    # =========================================================================
     all_results = []
     total_tasks = len(top_players) * len(markets)
     completed = 0
+    skipped_no_data = 0
+    
+    logger.info(f"🎯 Starting offline backtests for {len(top_players)} players x {len(markets)} markets = {total_tasks} tasks")
     
     for player in top_players:
         player_id = player['id']
         player_name = player['full_name']
         
+        # Get pre-loaded data for this player
+        player_df = bulk_loader.get_player_logs(player_id)
+        
+        if len(player_df) < 15:  # Need minimum data
+            skipped_no_data += 1
+            completed += len(markets)
+            if progress_callback:
+                progress_callback(0.40 + 0.55 * (completed / total_tasks))
+            continue
+        
         for market in markets:
             try:
-                logger.info(f"Backtesting {player_name} - {market}...")
-                
                 summary = backtester.run_backtest(
                     player_id=player_id,
                     player_name=player_name,
@@ -2785,41 +3263,30 @@ def generate_ml_training_data(
                     lookback=lookback,
                     test_days=test_days,
                     line_offset=0.0,
-                    fixed_spread=0.0
+                    fixed_spread=0.0,
+                    preloaded_df=player_df  # USE LOCAL DATA
                 )
                 
                 if summary is not None and len(summary.results_df) > 0:
-                    # Add player_id column
                     summary.results_df['player_id'] = player_id
                     all_results.append(summary.results_df)
-                    logger.info(f"  ✓ {len(summary.results_df)} predictions added")
-                else:
-                    logger.warning(f"  ✗ No results for {player_name} - {market}")
-                    
+            
             except Exception as e:
-                logger.error(f"  ✗ Error for {player_name} - {market}: {e}")
-                continue
+                logger.warning(f"  ✗ {player_name} - {market}: {e}")
             
             completed += 1
             if progress_callback:
-                progress_callback(completed / total_tasks)
+                progress_callback(0.40 + 0.55 * (completed / total_tasks))
     
+    logger.info(f"Skipped {skipped_no_data} players with insufficient data")
+
     if not all_results:
-        logger.error("No backtest results generated!")
         return pd.DataFrame()
     
-    # Combine all results
     combined_df = pd.concat(all_results, ignore_index=True)
-    
-    # Save to CSV
     output_path = DATA_DIR / output_file
     combined_df.to_csv(output_path, index=False)
-    
     logger.info(f"✓ ML training data saved to {output_path}")
-    logger.info(f"  Total samples: {len(combined_df)}")
-    logger.info(f"  Columns: {list(combined_df.columns)}")
-    logger.info(f"  Win rate: {combined_df['hit'].mean():.1%}")
-    
     return combined_df
 
 
@@ -2828,8 +3295,10 @@ def generate_ml_data_streamlit():
     st.markdown("### 🤖 Generate ML Training Data")
     
     st.info("""
-    This will backtest the top NBA players across multiple markets to create 
-    a training dataset for machine learning models.
+    **OPTIMIZED**: Downloads ALL game logs in just 2 API calls, then runs backtests offline.
+    - Step 1: Bulk download (2 API calls) - ~30 seconds
+    - Step 2: Get player list (1 API call) - ~2 seconds  
+    - Step 3: Offline backtesting - depends on # players/markets
     """)
     
     col1, col2 = st.columns(2)
@@ -3220,13 +3689,15 @@ class Tracker:
                     bet['actual_value'] = actual_value
                     line = bet.get('line', 0)
                     side = bet.get('side', 'OVER')
+                    market = bet.get('market', 'PTS')  # Get market for result categorization
                     
                     if side == 'OVER':
                         bet['margin'] = actual_value - line
                     else:
                         bet['margin'] = line - actual_value
                     
-                    bet['result_quality'] = self._categorize_result(new_status, bet['margin'])
+                    # Pass market to use appropriate thresholds (low-count vs high-count)
+                    bet['result_quality'] = self._categorize_result(new_status, bet['margin'], market)
                 
                 if closing_line is not None:
                     bet['closing_line'] = closing_line
@@ -3239,20 +3710,39 @@ class Tracker:
                 break
         self._save(current_bets)
     
-    def _categorize_result(self, result: str, margin: float) -> str:
+    def _categorize_result(self, result: str, margin: float, market: str = None) -> str:
+        """
+        Categorize result quality with different thresholds for low-count vs high-count stats.
+        
+        Low-count stats (3PM, STL, BLK): Tighter margins because 1 stat = significant swing
+        High-count stats (PTS, PRA): Wider margins because variance is expected
+        """
         abs_margin = abs(margin)
+        
+        # Determine if this is a low-count stat
+        is_low_count = market in CONFIG.LOW_COUNT_STATS if market else False
+        
+        # Set thresholds based on stat type
+        if is_low_count:
+            sweat_threshold = CONFIG.LOW_COUNT_MARGIN_SWEAT    # 0.5
+            close_threshold = CONFIG.LOW_COUNT_MARGIN_CLOSE    # 1.5
+            solid_threshold = CONFIG.LOW_COUNT_MARGIN_SOLID    # 2.5
+        else:
+            sweat_threshold = CONFIG.HIGH_COUNT_MARGIN_SWEAT   # 1.5
+            close_threshold = CONFIG.HIGH_COUNT_MARGIN_CLOSE   # 3.5
+            solid_threshold = CONFIG.HIGH_COUNT_MARGIN_SOLID   # 7.5
         
         if result == 'Push' or abs_margin < 0.5:
             return ResultQuality.PUSH.value
         elif result == 'Win':
-            if abs_margin <= 1.5: return ResultQuality.SWEAT_WIN.value
-            elif abs_margin <= 3.5: return ResultQuality.CLOSE_WIN.value
-            elif abs_margin <= 7.5: return ResultQuality.SOLID_WIN.value
+            if abs_margin <= sweat_threshold: return ResultQuality.SWEAT_WIN.value
+            elif abs_margin <= close_threshold: return ResultQuality.CLOSE_WIN.value
+            elif abs_margin <= solid_threshold: return ResultQuality.SOLID_WIN.value
             else: return ResultQuality.BLOWOUT_WIN.value
         elif result == 'Loss':
-            if abs_margin <= 1.5: return ResultQuality.BAD_BEAT.value
-            elif abs_margin <= 3.5: return ResultQuality.CLOSE_LOSS.value
-            elif abs_margin <= 7.5: return ResultQuality.CLEAR_LOSS.value
+            if abs_margin <= sweat_threshold: return ResultQuality.BAD_BEAT.value
+            elif abs_margin <= close_threshold: return ResultQuality.CLOSE_LOSS.value
+            elif abs_margin <= solid_threshold: return ResultQuality.CLEAR_LOSS.value
             else: return ResultQuality.BAD_READ.value
         else:
             return ResultQuality.PENDING.value
