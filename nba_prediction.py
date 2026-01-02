@@ -455,6 +455,7 @@ class FeatureVector:
     days_rest: int  # Days since last game (0=B2B, 1=normal, 2+=well-rested)
     game_total: float  # Vegas O/U total for the game
     market: str  # The stat market being analyzed (PTS, REB, 3PM, STL, etc.)
+    line: float  # Vegas betting line for the stat market
     
     # Opponent recent form
     opponent_drtg_season: float  # Opponent defensive rating (season)
@@ -1612,6 +1613,7 @@ class FeatureEngineer:
             days_rest=days_rest,
             game_total=game_total,
             market=market,  # Added for low-count stat handling
+            line=line,  # Added for Vegas line sanity checks
             opponent_drtg_season=opponent_drtg_season,
             opponent_drtg_l5=opp_drtg_l5,
             ema=stats['ema'],
@@ -1771,6 +1773,21 @@ class ModelEngine:
             mean_cap = CONFIG.LOW_COUNT_MEAN_CAPS.get(market, 5.0)
             if adjusted_proj > mean_cap:
                 adjusted_proj = mean_cap
+                low_count_capped = True
+        
+        # 5b. [LOW-COUNT VEGAS SANITY CHECK] For low-count stats, projection should not
+        # be absurdly far from the Vegas line. If line is 1.5 and we project 6.0,
+        # that's a 4x difference which indicates model failure, not genius insight.
+        # Cap low-count projections to max 2.5x the Vegas line (e.g., line 1.5 -> max 3.75)
+        line_value = features.line
+        if market and market in CONFIG.LOW_COUNT_STATS and line_value and line_value > 0:
+            max_reasonable = line_value * 2.5  # Max 2.5x Vegas line for low-count
+            min_reasonable = line_value * 0.4  # Min 40% of Vegas line for low-count
+            if adjusted_proj > max_reasonable:
+                adjusted_proj = max_reasonable
+                low_count_capped = True
+            elif adjusted_proj < min_reasonable and line_value >= 1.0:
+                adjusted_proj = min_reasonable
                 low_count_capped = True
 
         # 6. Get ML Prediction
@@ -3281,12 +3298,18 @@ def generate_ml_training_data(
     logger.info(f"Skipped {skipped_no_data} players with insufficient data")
 
     if not all_results:
+        if progress_callback:
+            progress_callback(1.0)  # Complete the progress bar
         return pd.DataFrame()
     
     combined_df = pd.concat(all_results, ignore_index=True)
     output_path = DATA_DIR / output_file
     combined_df.to_csv(output_path, index=False)
     logger.info(f"✓ ML training data saved to {output_path}")
+    
+    if progress_callback:
+        progress_callback(1.0)  # Complete the progress bar
+    
     return combined_df
 
 
