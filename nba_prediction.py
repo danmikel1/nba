@@ -132,6 +132,11 @@ class Config:
     # These stats behave differently - they're discrete, low-frequency events
     LOW_COUNT_STATS: tuple = ('3PM', 'FG3M', 'STL', 'BLK', 'TOV')  # Treat these as Poisson
     LOW_COUNT_MAX_MULTIPLIER: float = 2.0  # Cap upside at 2x the mean (tighter than before)
+    # When a player's average is below this threshold for ANY stat, treat as low-count
+    LOW_AVERAGE_THRESHOLD: float = 3.0  # Derik Queen averaging 0.5 AST = treat as low-count
+    # Maximum probability cap - no prediction should be more confident than this
+    MAX_PROBABILITY_CAP: float = 0.85  # 85% max - prevents 99-100% hallucinations
+    MIN_PROBABILITY_FLOOR: float = 0.15  # 15% min - even bad bets have some chance
     # Realistic MEAN caps (no player averages more than these)
     LOW_COUNT_MEAN_CAPS: dict = field(default_factory=lambda: {
         '3PM': 6.0,   # Steph Curry averages ~5-6, cap at 6
@@ -1861,7 +1866,14 @@ class SimulationEngine:
         if simulations is None: 
             simulations = self.config.MONTE_CARLO_SIMS
         
-        if market in self.config.LOW_COUNT_STATS: 
+        # Determine if this should be treated as low-count:
+        # 1. Explicitly low-count stat (3PM, STL, BLK, TOV)
+        # 2. Any stat where the player's average is below threshold (e.g., role player AST)
+        is_low_count_stat = market in self.config.LOW_COUNT_STATS
+        is_low_average = mean < self.config.LOW_AVERAGE_THRESHOLD
+        use_low_count_simulation = is_low_count_stat or is_low_average
+        
+        if use_low_count_simulation: 
             # Use Poisson for low-count stats with strict upside caps
             sims = self._generate_low_count_samples(mean, line, market, features, simulations)
         else:
@@ -1881,6 +1893,16 @@ class SimulationEngine:
         
         over_rate = (sims > line).mean()
         under_rate = (sims <= line).mean()
+        
+        # =================================================================
+        # CRITICAL: Cap probabilities to prevent 99-100% hallucinations
+        # No bet in sports is ever truly 99%+ - there's always variance
+        # =================================================================
+        max_prob = self.config.MAX_PROBABILITY_CAP
+        min_prob = self.config.MIN_PROBABILITY_FLOOR
+        
+        over_rate = float(np.clip(over_rate, min_prob, max_prob))
+        under_rate = float(np.clip(under_rate, min_prob, max_prob))
         
         return SimulationResult(
             over_prob=over_rate,
@@ -2066,7 +2088,11 @@ class SimulationEngine:
         # Use the pre-calculated dynamic_std_mult from FeatureVector
         # This replaces the old static CV thresholds
         # =================================================================
-        base_std = max(0.1, std)
+        # CRITICAL: Minimum std floor based on mean to prevent over-confidence
+        # For a player averaging 20 PTS, std should be at least 3-4
+        # For a player averaging 2 AST, std should be at least 1
+        min_std_floor = max(0.5, mean * 0.15)  # At least 15% of the mean
+        base_std = max(min_std_floor, std)
         
         # Use the player's personal volatility multiplier (0.7 to 1.5)
         # This was calculated in FeatureEngineer based on their CV
@@ -2168,8 +2194,19 @@ class SimulationEngine:
         # Ensure lambda is positive and doesn't exceed the cap
         adjusted_lambda = max(0.1, min(adjusted_lambda, mean_cap))
         
-        # Generate Poisson samples
-        sims = np.random.poisson(adjusted_lambda, n_samples).astype(float)
+        # =================================================================
+        # CRITICAL FIX: Add uncertainty to Poisson to prevent hallucinations
+        # Pure Poisson with lambda=0.5 vs line=2.0 gives ~91% UNDER
+        # But in reality, role players have high game-to-game variance
+        # =================================================================
+        # Add lambda uncertainty: lambda varies game-to-game
+        # This models that a player averaging 0.5 AST might have λ=0.3 or λ=1.0 on any given night
+        lambda_uncertainty = max(0.3, adjusted_lambda * 0.5)  # 50% uncertainty, min 0.3
+        varied_lambdas = np.random.normal(adjusted_lambda, lambda_uncertainty, n_samples)
+        varied_lambdas = np.maximum(0.1, varied_lambdas)  # Keep positive
+        
+        # Generate Poisson samples with varied lambdas
+        sims = np.array([np.random.poisson(lam) for lam in varied_lambdas]).astype(float)
         
         # Apply output caps (single-game maximums)
         # Cap 1: Relative to capped mean (prevent 2x+ blowups)
