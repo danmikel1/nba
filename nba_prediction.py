@@ -3341,6 +3341,33 @@ def generate_ml_training_data(
     
     combined_df = pd.concat(all_results, ignore_index=True)
     output_path = DATA_DIR / output_file
+    
+    # Read-Merge-Write: Append to existing data and deduplicate
+    # This prevents "double-dipping" when manual bets overlap with generated data
+    if output_path.exists():
+        try:
+            existing_df = pd.read_csv(output_path)
+            logger.info(f"Found existing data: {len(existing_df)} rows")
+            
+            # Merge: new data goes AFTER existing, so 'keep=last' prefers new/manual entries
+            combined_df = pd.concat([existing_df, combined_df], ignore_index=True)
+            
+            # Deduplicate: A player only plays one game per market per day
+            # keep='last' ensures manual tracked bets (with actual results) overwrite generated versions
+            before_dedup = len(combined_df)
+            combined_df = combined_df.drop_duplicates(
+                subset=['date', 'player', 'market'], 
+                keep='last'
+            )
+            duplicates_removed = before_dedup - len(combined_df)
+            
+            if duplicates_removed > 0:
+                logger.info(f"Removed {duplicates_removed} duplicate entries (date/player/market)")
+            
+            logger.info(f"Merged total: {len(combined_df)} rows")
+        except Exception as e:
+            logger.warning(f"Could not read existing data, overwriting: {e}")
+    
     combined_df.to_csv(output_path, index=False)
     logger.info(f"✓ ML training data saved to {output_path}")
     
