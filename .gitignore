@@ -1,0 +1,28 @@
+# Python cache and virtualenv
+__pycache__/
+*.pyc
+venv/
+
+# Streamlit/VS Code state
+.streamlit/
+.vscode/
+
+# App runtime outputs
+bet_tracker.json
+parlay_tracker.json
+watchlist.json
+fatigue_profiles.json
+
+# Position defense caches (seasonal)
+position_defense_cache*.json
+
+# Model artifacts
+nba_model.pkl
+*.pkl
+
+# Generated datasets
+ml_training_data.csv
+*.csv
+
+# Logs
+*.log
