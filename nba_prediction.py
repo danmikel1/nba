@@ -1,4 +1,3 @@
-from pyexpat import features
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -53,7 +52,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging. getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 CURRENT_VERSION = 'v15.0'
 
@@ -135,7 +134,7 @@ class Config:
     # When a player's average is below this threshold for ANY stat, treat as low-count
     LOW_AVERAGE_THRESHOLD: float = 3.0  # Derik Queen averaging 0.5 AST = treat as low-count
     # Maximum probability cap - no prediction should be more confident than this
-    MAX_PROBABILITY_CAP: float = 0.85  # 85% max - prevents 99-100% hallucinations
+    MAX_PROBABILITY_CAP: float = 0.75  # 75% max - prevents 99-100% hallucinations
     MIN_PROBABILITY_FLOOR: float = 0.15  # 15% min - even bad bets have some chance
     # Realistic MEAN caps (no player averages more than these)
     LOW_COUNT_MEAN_CAPS: dict = field(default_factory=lambda: {
@@ -505,6 +504,11 @@ class FeatureVector:
     b2b_games_in_sample: int = 0  # Number of B2B games used for fatigue calc
     dynamic_std_mult: float = 1.0  # CV-based std multiplier for simulation
     
+    # V16 Market & Role Context
+    odds_decimal: float = 1.91  # Market efficiency signal (default -110)
+    usg_season: float = 0.0     # Season usage baseline (USG%)
+    clv: float = 0.0            # Closing Line Value (closing_line - line)
+    
     # Data quality tracking
     data_quality: DataQuality = field(default_factory=DataQuality)
     
@@ -526,7 +530,9 @@ class FeatureVector:
             self.opponent_drtg_l5,
             # V15 features
             self.blowout_prob, self.personal_fatigue_factor, 
-            float(self.b2b_games_in_sample), self.dynamic_std_mult, self.coef_variation
+            float(self.b2b_games_in_sample), self.dynamic_std_mult, self.coef_variation,
+            # V16 market & role context
+            self.odds_decimal, self.usg_season, self.clv
         ]
         return np.array(numeric_features)
 
@@ -593,6 +599,10 @@ class AnalysisResult:
     # Raw data for UI
     game_logs: Optional[pd.DataFrame] = None
     hit_rates: Optional[Dict[str, float]] = None
+    
+    # Injury-aware usage boost info
+    injured_teammates: List[str] = field(default_factory=list)  # e.g., ["Tyrese Maxey (28.1%)"]
+    injury_usage_boost: float = 1.0  # e.g., 1.10 = +10% boost
 
 
 @dataclass
@@ -608,6 +618,10 @@ class BacktestResult:
     actual_value: float
     hit:  bool
     grade: str
+    # Additional context for ML training
+    opponent: str = ''  # Opponent team abbreviation
+    position: str = ''  # Player position
+    is_home: bool = True  # Was player at home
     # ML training features
     features: Dict[str, Any] = field(default_factory=dict)
 
@@ -655,6 +669,23 @@ def validate_inputs(line: float, odds:  float) -> Tuple[bool, str]:
     if odds > 100: 
         return False, "Odds seem unrealistic (>100)"
     return True, ""
+
+
+def american_to_decimal(odds: float) -> float:
+    """Convert odds to decimal format for ML features.
+    Handles both American (-110, +150) and already-decimal (1.91, 2.50) formats.
+    """
+    if odds == 0:
+        return 1.91  # Default -110
+    elif odds >= 1.0 and odds < 50:
+        # Already in decimal format (e.g., 1.91, 2.50)
+        return odds
+    elif odds > 0:
+        # American positive (+150)
+        return (odds / 100) + 1
+    else:
+        # American negative (-110)
+        return (100 / abs(odds)) + 1
 
 
 # =============================================================================
@@ -833,11 +864,11 @@ class DataLoader:
                 df['MIN_FLOAT'] = pd.to_numeric(df['MIN'], errors='coerce').fillna(0)
             
             # Per-minute stats
-                target_stats = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FG3M']
-                for stat in target_stats:
-                    if stat in df.columns:
-                        df[f'{stat}_PER_MIN'] = df[stat] / df['MIN_FLOAT']
-                        df[f'{stat}_PER_MIN'] = df[f'{stat}_PER_MIN'].fillna(0.0)
+            target_stats = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FG3M']
+            for stat in target_stats:
+                if stat in df.columns:
+                    df[f'{stat}_PER_MIN'] = df[stat] / df['MIN_FLOAT']
+                    df[f'{stat}_PER_MIN'] = df[f'{stat}_PER_MIN'].fillna(0.0)
             return df
             
         except DataLoaderError: 
@@ -1006,78 +1037,217 @@ class DataLoader:
 
 class InjuryManager:
     """
-    [NEW] Handles fetching injury data to drive dynamic usage adjustments.
+    [UPGRADED] Injury-Aware Usage Redistribution Engine.
+    
+    When a high-usage teammate is OUT, automatically boosts the analyzed player's
+    projected usage based on the missing player's usage share.
+    
+    Logic:
+    1. Fetch team's top 5 usage players from NBA API
+    2. Check injury report for who's OUT/DOUBTFUL
+    3. Redistribute ~60% of missing player's usage to remaining starters
+    4. Return multiplier for the analyzed player
+    
+    Example:
+    - Tyrese Maxey (USG 28%) is OUT
+    - Kyle Lowry gets ~10% usage boost (28% * 0.6 / 3 teammates)
+    - Returns usage_mult = 1.10
     """
     def __init__(self, rapid_api_key: str = None):
         self.rapid_api_key = rapid_api_key
-        # Cache to store injury reports for 1 hour to save API calls
-        self._cache: Dict[str, Any] = {}
+        # Cache for injury reports (1 hour TTL)
+        self._injury_cache: Dict[str, Any] = {}
+        # Cache for team usage data (24 hour TTL - doesn't change often)
+        self._usage_cache: Dict[str, Any] = {}
 
+    def get_injury_usage_boost(self, player_name: str, team_id: int) -> Tuple[float, List[str]]:
+        """
+        Calculate usage boost for a player based on injured teammates.
+        
+        Returns:
+            Tuple of (usage_multiplier, list_of_injured_high_usage_players)
+        """
+        try:
+            # 1. Get team's top usage players
+            team_usage = self._get_team_usage_leaders(team_id)
+            if not team_usage:
+                return 1.0, []
+            
+            # 2. Get injury report for team
+            injured_players = self._fetch_team_injuries(team_id)
+            if not injured_players:
+                return 1.0, []
+            
+            # 3. Find injured high-usage players (not the analyzed player)
+            injured_high_usage = []
+            missing_usage_total = 0.0
+            
+            for inj in injured_players:
+                inj_name = inj.get('name', '').lower()
+                inj_status = inj.get('status', '').upper()
+                
+                # Skip if this is the player we're analyzing
+                if player_name.lower() in inj_name or inj_name in player_name.lower():
+                    continue
+                
+                # Check if injured player is a high-usage player
+                for usage_player in team_usage:
+                    if usage_player['name'].lower() in inj_name or inj_name in usage_player['name'].lower():
+                        if inj_status in ['OUT', 'INACTIVE']:
+                            missing_usage_total += usage_player['usg_pct']
+                            injured_high_usage.append(f"{usage_player['name']} ({usage_player['usg_pct']:.1%})")
+                        elif inj_status == 'DOUBTFUL':
+                            # 50% weight for doubtful players
+                            missing_usage_total += usage_player['usg_pct'] * 0.5
+                            injured_high_usage.append(f"{usage_player['name']} ({usage_player['usg_pct']:.1%}) [GTD]")
+                        break
+            
+            if missing_usage_total == 0:
+                return 1.0, []
+            
+            # 4. Calculate usage boost
+            # Redistribute 60% of missing usage, split among ~3 remaining starters
+            redistributed = missing_usage_total * 0.60
+            boost_per_player = redistributed / 3.0  # Assume 3 other starters benefit
+            
+            # Convert to multiplier (e.g., 0.10 boost = 1.10 multiplier)
+            # Cap at 1.30 (30% max boost) to prevent explosions
+            usage_mult = min(1.30, 1.0 + boost_per_player)
+            
+            return usage_mult, injured_high_usage
+            
+        except Exception as e:
+            logger.warning(f"Injury usage boost calculation failed: {e}")
+            return 1.0, []
+
+    def _get_team_usage_leaders(self, team_id: int) -> List[Dict]:
+        """
+        Fetch top 5 usage players for a team from NBA API.
+        Cached for 24 hours since usage doesn't change game-to-game.
+        """
+        cache_key = f"usage_{team_id}"
+        
+        # Check cache (24 hour TTL)
+        if cache_key in self._usage_cache:
+            cached = self._usage_cache[cache_key]
+            if (datetime.now() - cached['time']).seconds < 86400:
+                return cached['data']
+        
+        try:
+            from nba_api.stats.endpoints import leaguedashplayerstats
+            import time
+            
+            # Get all players' usage stats for current season
+            time.sleep(0.6)  # Rate limit
+            stats = leaguedashplayerstats.LeagueDashPlayerStats(
+                season='2025-26',
+                per_mode_detailed='PerGame',
+                measure_type_detailed_defense='Base'
+            ).get_data_frames()[0]
+            
+            # Filter to just this team
+            team_players = stats[stats['TEAM_ID'] == team_id].copy()
+            
+            if len(team_players) == 0:
+                return []
+            
+            # Sort by usage, get top 5
+            team_players = team_players.nlargest(5, 'USG_PCT')
+            
+            leaders = []
+            for _, row in team_players.iterrows():
+                leaders.append({
+                    'name': row['PLAYER_NAME'],
+                    'player_id': row['PLAYER_ID'],
+                    'usg_pct': row['USG_PCT'] / 100.0,  # Convert to decimal
+                    'min': row['MIN']
+                })
+            
+            self._usage_cache[cache_key] = {'time': datetime.now(), 'data': leaders}
+            return leaders
+            
+        except Exception as e:
+            logger.warning(f"Failed to fetch team usage leaders: {e}")
+            return []
+
+    def _fetch_team_injuries(self, team_id: int) -> List[Dict]:
+        """
+        Fetch injury list for a team.
+        Uses NBA API CommonTeamRoster for free injury data.
+        """
+        cache_key = f"injuries_{team_id}"
+        
+        # Check cache (1 hour TTL)
+        if cache_key in self._injury_cache:
+            cached = self._injury_cache[cache_key]
+            if (datetime.now() - cached['time']).seconds < 3600:
+                return cached['data']
+
+        data = []
+        
+        try:
+            from nba_api.stats.endpoints import commonteamroster
+            import time
+            
+            time.sleep(0.6)  # Rate limit
+            roster = commonteamroster.CommonTeamRoster(team_id=team_id).get_data_frames()[0]
+            
+            # Check for HOW_ACQUIRED column which sometimes has injury info
+            # Also check PLAYER_STATUS if available
+            for _, player in roster.iterrows():
+                status = 'ACTIVE'
+                
+                # Check various status columns
+                if 'PLAYER_STATUS' in roster.columns:
+                    ps = str(player.get('PLAYER_STATUS', '')).upper()
+                    if 'OUT' in ps or 'INJ' in ps:
+                        status = 'OUT'
+                    elif 'DOUBT' in ps or 'GTD' in ps:
+                        status = 'DOUBTFUL'
+                
+                # Also check HOW_ACQUIRED for "Injured" designation
+                if 'HOW_ACQUIRED' in roster.columns:
+                    ha = str(player.get('HOW_ACQUIRED', '')).upper()
+                    if 'INJ' in ha:
+                        status = 'OUT'
+                
+                if status != 'ACTIVE':
+                    data.append({
+                        'name': player.get('PLAYER', ''),
+                        'status': status
+                    })
+                    
+        except Exception as e:
+            logger.debug(f"Roster fetch failed: {e}")
+            
+        # Also try to get today's injury report if available
+        try:
+            # Attempt to scrape or use alternative source
+            # For now, rely on roster data above
+            pass
+        except Exception:
+            pass
+
+        self._injury_cache[cache_key] = {'time': datetime.now(), 'data': data}
+        return data
+    
+    # Keep legacy method for backward compatibility
     def get_injury_impact(self, player_id: int, team_id: int) -> float:
-        """
-        Calculates usage multiplier based on missing teammates.
-        """
-        # 1. Fetch Data
+        """Legacy method - returns simple boost based on injured count."""
         team_injuries = self._fetch_team_injuries(team_id)
         if not team_injuries:
             return 1.0
-
-        # 2. Calculate Impact
+        
         usage_bump = 0.0
-        # Simple heuristic: +5% usage for every "OUT" rotation player
         for p in team_injuries:
             status = p.get('status', '').upper()
-            # Ensure we aren't counting the player themselves
-            # (Requires name matching, skipping for now to keep it simple/fast)
-            
             if status in ['OUT', 'INACTIVE']:
                 usage_bump += 0.05
             elif status == 'DOUBTFUL':
                 usage_bump += 0.02
         
-        # Cap the auto-boost at +25% to prevent explosions
         return min(1.25, 1.0 + usage_bump)
 
-    def _fetch_team_injuries(self, team_id: int) -> List[Dict]:
-        """Fetch injury list. Defaults to NBA_API (Free) if no RapidKey provided."""
-        cache_key = f"injuries_{team_id}"
-        # Check cache (1 hour TTL)
-        if cache_key in self._cache:
-             if (datetime.now() - self._cache[cache_key]['time']).seconds < 3600:
-                 return self._cache[cache_key]['data']
-
-        data = []
-        
-        # A. Try RapidAPI (Tank01) if key is provided
-        if self.rapid_api_key:
-            try:
-                # Placeholder for Tank01 logic
-                pass 
-            except Exception as e:
-                logger.warning(f"RapidAPI failed: {e}")
-
-        # B. Fallback to Native NBA_API (CommonTeamRoster) - Completely Free
-        if not data:
-            try:
-                from nba_api.stats.endpoints import commonteamroster
-                # commonteamroster requires team_id
-                roster = commonteamroster.CommonTeamRoster(team_id=team_id).get_data_frames()[0]
-                
-                if 'STATUS' in roster.columns:
-                    # Filter for INACTIVE players
-                    inactive = roster[roster['STATUS'] == 'INACTIVE']
-                    for _, player in inactive.iterrows():
-                        data.append({
-                            'name': player['PLAYER'],
-                            'status': 'OUT', 
-                            'role': 'ROTATION'
-                        })
-            except Exception:
-                # Fail silently to avoid breaking the app during internet hiccups
-                pass
-
-        self._cache[cache_key] = {'time': datetime.now(), 'data': data}
-        return data
 
 class FeatureEngineer: 
     """
@@ -1096,12 +1266,50 @@ class FeatureEngineer:
         # Initialize V15 intelligent models
         self.blowout_predictor = BlowoutPredictor(config)
         self.fatigue_profiler = PlayerFatigueProfiler(config)
-        self.injury_manager = InjuryManager() # [NEW] Dynamic Injury API
+        self.injury_manager = InjuryManager() # [UPGRADED] Smart Injury-Aware Usage
+    
+    def get_injury_usage_boost(self, player_name: str, team_id: int) -> Tuple[float, List[str]]:
+        """
+        [NEW] Get usage boost from injured high-usage teammates.
+        Returns (multiplier, list_of_injured_stars)
+        """
+        return self.injury_manager.get_injury_usage_boost(player_name, team_id)
+    
+    def get_season_usage_pct(self, player_id: int) -> float:
+        """
+        [V16] Fetch season USG% for role context.
+        Returns 0.0 if unavailable (caches for performance).
+        """
+        cache_key = f"usg_season_{player_id}_{CONFIG.CURRENT_SEASON}"
+        if hasattr(self, '_usg_cache') and cache_key in self._usg_cache:
+            return self._usg_cache[cache_key]
+        
+        if not hasattr(self, '_usg_cache'):
+            self._usg_cache = {}
+        
+        try:
+            # Fetch season stats for player
+            stats = leaguedashplayerstats.LeagueDashPlayerStats(
+                season=CONFIG.CURRENT_SEASON,
+                player_id_nullable=player_id,
+                per_mode_detailed='PerGame',
+                timeout=30
+            )
+            df = stats.get_data_frames()[0]
+            if len(df) > 0 and 'USG_PCT' in df.columns:
+                usg_pct = float(df.iloc[0]['USG_PCT'])
+                self._usg_cache[cache_key] = usg_pct
+                return usg_pct
+        except Exception as e:
+            logger.debug(f"Failed to fetch USG% for player {player_id}: {e}")
+        
+        self._usg_cache[cache_key] = 0.0
+        return 0.0
     
     def calculate_composite_usage(self, player_id: int, team_id: int, manual_adj_percent: float) -> float:
         """
-        [NEW] Combines automated injury data with manual slider input.
-        Result is passed to build_feature_vector.
+        [LEGACY] Combines automated injury data with manual slider input.
+        Use get_injury_usage_boost() for the new smart method.
         """
         # 1. Get Auto-Impact from API (e.g., 1.10)
         auto_impact = self.injury_manager.get_injury_impact(player_id, team_id)
@@ -1186,15 +1394,20 @@ class FeatureEngineer:
             data_quality.used_fallback_minutes = True
             data_quality.add_warning("Using default 30 minutes (minutes data unavailable)")
         
-        # Usage Trend
+        # Usage Trend - SNIPER MODE: Dynamic Usage Engine
         usage_trend_mult = 1.0
+        usg_season = 0.0
+        usg_l5 = 0.0
         if 'USG_PCT' in df.columns:
-            recent_usg = recent['USG_PCT'].mean()
-            season_usg = df['USG_PCT'].mean()
-            usage_trend = safe_divide(recent_usg, season_usg, 1.0)
+            usg_season = df['USG_PCT'].mean()
+            usg_l5 = recent['USG_PCT'].mean() if len(recent) > 0 else usg_season
             
-            if usage_trend > 1.10:
-                usage_trend_mult = 1.05
+            # Calculate Trend (Damped 50%)
+            if usg_l5 > 0 and usg_season > 0:
+                raw_trend = usg_l5 / usg_season
+                usage_trend_mult = 1.0 + ((raw_trend - 1.0) * 0.5)
+            else:
+                usage_trend_mult = 1.0
         
         return {
             'ema': ema,
@@ -1204,7 +1417,9 @@ class FeatureEngineer:
             'trend':  trend,
             'avg_minutes': avg_minutes,
             'mins_trend': mins_trend,
-            'usage_trend_mult': usage_trend_mult, # Ensure this is returned!
+            'usage_trend_mult': usage_trend_mult,
+            'usg_season': usg_season,
+            'usg_l5': usg_l5,
             'games_played': len(df),
             'used_fallback_std': used_fallback_std,
             'used_fallback_minutes': used_fallback_minutes,
@@ -1649,6 +1864,10 @@ class FeatureEngineer:
             personal_fatigue_factor=personal_rest_factor,
             b2b_games_in_sample=b2b_games_count,
             dynamic_std_mult=dynamic_std_mult,
+            # V16 market & role context (defaults, populated at bet time)
+            odds_decimal=1.91,  # Will be updated with actual odds
+            usg_season=self.get_season_usage_pct(player_id),
+            clv=0.0,  # Calculated after closing line known
             data_quality=data_quality
         )
 
@@ -2540,6 +2759,44 @@ class Backtester:
         self.simulation_engine = simulation_engine
         self.decision_policy = decision_policy
         self.config = config
+        self._rng = np.random.default_rng(42)  # Reproducible randomness for CLV
+    
+    def _generate_synthetic_clv(self, ev: float, prob: float, line: float, hit: bool) -> float:
+        """
+        Generate realistic synthetic CLV for backtest data.
+        
+        In real markets:
+        - Sharp bets (high EV, high prob) see lines move toward them (+CLV)
+        - Square/public bets see adverse movement (-CLV)
+        - Winning bets correlate with positive CLV (market was right)
+        - Random noise simulates market uncertainty
+        
+        Returns CLV in points (e.g., +0.5 means line moved 0.5 toward your bet)
+        """
+        # Base CLV from EV signal (sharp money moves lines)
+        # EV of +5% → expect ~0.3 pts CLV, EV of -5% → expect ~-0.3 pts CLV
+        ev_component = ev * 6.0  # Scale EV to reasonable CLV range
+        
+        # Probability component (high confidence → market likely agrees)
+        prob_component = (prob - 0.5) * 1.0  # 60% prob → +0.1, 40% → -0.1
+        
+        # Outcome component (winners had sharper reads on average)
+        outcome_component = 0.2 if hit else -0.1
+        
+        # Random market noise (-0.5 to +0.5 pts typical)
+        noise = self._rng.normal(0, 0.3)
+        
+        # Combine components
+        raw_clv = ev_component + prob_component + outcome_component + noise
+        
+        # Scale by line (bigger lines have bigger absolute movements)
+        # A 25.5 PTS line moves more than a 1.5 STL line
+        scale_factor = max(0.5, min(2.0, line / 15.0))
+        
+        # Clamp to realistic range (-3 to +3 pts for most props)
+        clv = max(-3.0, min(3.0, raw_clv * scale_factor))
+        
+        return round(clv, 2)
     
     def run_backtest(
         self,
@@ -2832,10 +3089,11 @@ class Backtester:
                     'trend': features.trend,
                     'avg_minutes': features.avg_minutes,
                     'mins_trend': features.mins_trend,
-                    'hit_rate_l5': features.hit_rate_l5,
-                    'hit_rate_l10': features.hit_rate_l10,
-                    'hit_rate_l15': features.hit_rate_l15,
-                    'hit_rate_season': features.hit_rate_season,
+                    # Use shortened names to match tracker export format
+                    'hit_l5': features.hit_rate_l5,
+                    'hit_l10': features.hit_rate_l10,
+                    'hit_l15': features.hit_rate_l15,
+                    'hit_season': features.hit_rate_season,
                     'pace_mult': features.pace_mult,
                     'def_mult': features.def_mult,
                     'position_mult': features.position_mult,
@@ -2851,14 +3109,27 @@ class Backtester:
                     'games_played': features.games_played,
                     'days_rest': features.days_rest,
                     'game_total': features.game_total,
-                    'opponent_drtg_season': features.opponent_drtg_season,
-                    'opponent_drtg_l5': features.opponent_drtg_l5,
+                    # Use shortened names to match tracker export format
+                    'opp_drtg_season': features.opponent_drtg_season,
+                    'opp_drtg_l5': features.opponent_drtg_l5,
                     # V15 NEW FEATURES
                     'blowout_prob': features.blowout_prob,
                     'personal_fatigue_factor': features.personal_fatigue_factor,
                     'b2b_games_in_sample': features.b2b_games_in_sample,
                     'dynamic_std_mult': features.dynamic_std_mult,
-                    'coef_variation': features.coef_variation
+                    'coef_variation': features.coef_variation,
+                    # V16 MARKET & ROLE CONTEXT
+                    'odds_decimal': 1.91,  # -110 odds in backtest
+                    'usg_season': features.usg_season,
+                    # Synthetic CLV: Simulate realistic line movement
+                    # Sharp bets (high EV, high prob) tend to see favorable CLV
+                    # Add noise to simulate market uncertainty
+                    'clv': self._generate_synthetic_clv(
+                        ev=decision.expected_value,
+                        prob=decision.probability,
+                        line=line,
+                        hit=hit
+                    )
                 }
                 
                 results.append(BacktestResult(
@@ -2872,6 +3143,9 @@ class Backtester:
                     actual_value=actual_value,
                     hit=hit,
                     grade=decision.grade. value,
+                    opponent=opp_abbrev,
+                    position=player_position,
+                    is_home=is_home,
                     features=feature_dict
                 ))
                 
@@ -2932,23 +3206,73 @@ class Backtester:
                 }
         
         # Create results dataframe with flattened features for ML
+        # MUST MATCH TRACKER EXPORT SCHEMA EXACTLY
         rows = []
         for r in results:
+            # Calculate margin and margin_pct
+            if r.predicted_side == 'OVER':
+                margin = r.actual_value - r.line
+            else:
+                margin = r.line - r.actual_value
+            
+            margin_pct = ((r.actual_value - r.line) / r.line * 100) if r.line > 0 else 0
+            if r.predicted_side == 'UNDER':
+                margin_pct = -margin_pct
+            
+            # Determine result quality based on margin
+            abs_margin = abs(margin)
+            if r.hit:
+                if abs_margin <= 1.5:
+                    result_quality = 'sweat_win'
+                elif abs_margin <= 3.5:
+                    result_quality = 'close_win'
+                elif abs_margin <= 7.5:
+                    result_quality = 'solid_win'
+                else:
+                    result_quality = 'blowout_win'
+            else:
+                if abs_margin <= 1.5:
+                    result_quality = 'bad_beat'
+                elif abs_margin <= 3.5:
+                    result_quality = 'close_loss'
+                elif abs_margin <= 7.5:
+                    result_quality = 'clear_loss'
+                else:
+                    result_quality = 'bad_read'
+            
             row = {
+                # Match tracker export column order exactly
                 'date': r.date,
                 'player': r.player_name,
+                'opponent': r.opponent,  # Now populated from BacktestResult
                 'market': r.market,
+                'position': r.position,  # Now populated from BacktestResult
                 'line': r.line,
                 'predicted_side': r.predicted_side,
                 'predicted_prob': r.predicted_prob,
                 'predicted_ev': r.predicted_ev,
+                'projected_value': r.features.get('ema', 0),
+                'result': 'Win' if r.hit else 'Loss',
+                'hit': 1 if r.hit else 0,
                 'actual_value': r.actual_value,
-                'hit': 1 if r.hit else 0,  # Binary for ML
+                'margin': margin,
+                'margin_pct': margin_pct,
+                'result_quality': result_quality,
+                # Snapshot fields (use feature values as point-in-time snapshots)
+                'snapshot_l5_hit_rate': r.features.get('hit_l5', 0),
+                'snapshot_days_rest': r.features.get('days_rest', 1),
+                'snapshot_def_rank': int(r.features.get('opp_drtg_season', 115)),
+                'tag': 'backtest',  # Tag for filtering
                 'grade': r.grade,
             }
             # Flatten features with 'feat_' prefix
             for feat_name, feat_value in r.features.items():
                 row[f'feat_{feat_name}'] = feat_value
+            # Add missing tracker columns with defaults
+            row['closing_line'] = 0
+            row['clv'] = 0
+            # feat_usg_season and feat_clv already set from features dict above
+            row['feat_usg_trend'] = row.get('feat_usage_mult', 1.0)
             rows.append(row)
         
         results_df = pd.DataFrame(rows)
@@ -2982,6 +3306,22 @@ NBA_DIVISIONS = {
     'Pacific': ['GSW', 'LAC', 'LAL', 'PHX', 'SAC'],
     'Southwest': ['DAL', 'HOU', 'MEM', 'NOP', 'SAS']
 }
+
+# Canonical feature list used for model training (exact order, 36 numeric features)
+TRAINING_FEATURE_COLUMNS = [
+    'feat_ema', 'feat_std', 'feat_sma_5', 'feat_sma_10', 'feat_trend',
+    'feat_avg_minutes', 'feat_mins_trend',
+    'feat_hit_l5', 'feat_hit_l10', 'feat_hit_l15', 'feat_hit_season',
+    'feat_pace_mult', 'feat_def_mult', 'feat_position_mult',
+    'feat_base_matchup_mult', 'feat_combined_matchup_mult',
+    'feat_split_factor', 'feat_rest_factor', 'feat_blowout_factor', 'feat_usage_mult',
+    'feat_is_home', 'feat_is_b2b', 'feat_spread', 'feat_games_played', 'feat_days_rest',
+    'feat_game_total', 'feat_opp_drtg_season', 'feat_opp_drtg_l5',
+    'feat_blowout_prob', 'feat_personal_fatigue_factor', 'feat_b2b_games_in_sample',
+    'feat_dynamic_std_mult', 'feat_coef_variation',
+    # Market & Role Context (V16 additions)
+    'feat_odds_decimal', 'feat_usg_season', 'feat_clv'
+]
 
 def get_top_active_players(limit: int = 50, min_games: int = 10) -> List[Dict]:
     """
@@ -3342,18 +3682,60 @@ def generate_ml_training_data(
     combined_df = pd.concat(all_results, ignore_index=True)
     output_path = DATA_DIR / output_file
     
+    # TRAINING_FEATURE_COLUMNS is defined at module scope
+
+    # Canonical column order - MUST MATCH TRACKER EXPORT EXACTLY
+    canonical_columns = [
+        'date', 'player', 'opponent', 'market', 'position',
+        'line', 'predicted_side', 'predicted_prob', 'predicted_ev', 'projected_value',
+        'result', 'hit', 'actual_value', 'margin', 'margin_pct', 'result_quality',
+        # Snapshot: Point-in-time frozen stats (time capsule for Robot training)
+        'snapshot_l5_hit_rate', 'snapshot_days_rest', 'snapshot_def_rank',
+        # Tag: Bet source for filtering training data
+        'tag',
+        'feat_ema', 'feat_std', 'feat_sma_5', 'feat_sma_10', 'feat_trend',
+        'feat_avg_minutes', 'feat_mins_trend',
+        'feat_hit_l5', 'feat_hit_l10', 'feat_hit_l15', 'feat_hit_season',
+        'feat_pace_mult', 'feat_def_mult', 'feat_position_mult',
+        'feat_base_matchup_mult', 'feat_combined_matchup_mult',
+        'feat_split_factor', 'feat_rest_factor', 'feat_blowout_factor', 'feat_usage_mult',
+        'feat_spread', 'feat_is_home', 'feat_is_b2b', 'feat_days_rest',
+        'feat_game_total', 'feat_opp_drtg_season', 'feat_opp_drtg_l5',
+        'feat_games_played', 'closing_line', 'clv',
+        'feat_blowout_prob', 'feat_personal_fatigue_factor', 'feat_b2b_games_in_sample', 
+        'feat_dynamic_std_mult', 'feat_coef_variation',
+        # V16 market & role context
+        'feat_odds_decimal', 'feat_usg_season', 'feat_clv',
+        'feat_usg_trend', 'grade'
+    ]
+    
+    # Ensure all canonical columns exist (fill missing with defaults)
+    for col in canonical_columns:
+        if col not in combined_df.columns:
+            combined_df[col] = 0 if col.startswith('feat_') else ''
+    
     # Read-Merge-Write: Append to existing data and deduplicate
-    # This prevents "double-dipping" when manual bets overlap with generated data
+    # CRITICAL: Manual tracked bets (with real snapshots/tags) must be PRESERVED
+    # Backtest data should only fill gaps, not overwrite your actual betting decisions
     if output_path.exists():
         try:
             existing_df = pd.read_csv(output_path)
             logger.info(f"Found existing data: {len(existing_df)} rows")
             
-            # Merge: new data goes AFTER existing, so 'keep=last' prefers new/manual entries
-            combined_df = pd.concat([existing_df, combined_df], ignore_index=True)
+            # Ensure existing data has all canonical columns too
+            for col in canonical_columns:
+                if col not in existing_df.columns:
+                    existing_df[col] = 0 if col.startswith('feat_') else ''
+            
+            # Count manual bets (non-backtest tags) before merge
+            manual_bets_before = len(existing_df[existing_df['tag'] != 'backtest']) if 'tag' in existing_df.columns else 0
+            
+            # Merge: existing (your bets) goes AFTER new (backtest), then keep='last'
+            # This ensures YOUR manual bets overwrite backtest data for same player/date/market
+            combined_df = pd.concat([combined_df, existing_df], ignore_index=True)
             
             # Deduplicate: A player only plays one game per market per day
-            # keep='last' ensures manual tracked bets (with actual results) overwrite generated versions
+            # keep='last' ensures manual tracked bets (with real snapshots) are PRESERVED over backtest
             before_dedup = len(combined_df)
             combined_df = combined_df.drop_duplicates(
                 subset=['date', 'player', 'market'], 
@@ -3364,10 +3746,18 @@ def generate_ml_training_data(
             if duplicates_removed > 0:
                 logger.info(f"Removed {duplicates_removed} duplicate entries (date/player/market)")
             
+            # Verify manual bets were preserved
+            manual_bets_after = len(combined_df[combined_df['tag'] != 'backtest']) if 'tag' in combined_df.columns else 0
+            logger.info(f"✅ Manual bets preserved: {manual_bets_after} (was {manual_bets_before})")
+            
             logger.info(f"Merged total: {len(combined_df)} rows")
         except Exception as e:
             logger.warning(f"Could not read existing data, overwriting: {e}")
     
+    # Reorder columns to canonical order and save
+    # Keep only canonical columns (drop any extras like 'grade' duplicates)
+    final_columns = [c for c in canonical_columns if c in combined_df.columns]
+    combined_df = combined_df[final_columns]
     combined_df.to_csv(output_path, index=False)
     logger.info(f"✓ ML training data saved to {output_path}")
     
@@ -3455,17 +3845,12 @@ class PredictionOrchestrator:
     
     def __init__(self, config: Config = CONFIG):
         self.config = config
-        self.data_loader = DataLoader(config)
-        self.feature_engineer = FeatureEngineer(config)
-        self.model_engine = ModelEngine(config)
-        self.simulation_engine = SimulationEngine(config)
-        self.decision_policy = DecisionPolicy(config)
-        self.decision_policy = DecisionPolicy(config)
         self.tracker = Tracker()
-
         self.data_loader = DataLoader(config)
         self.feature_engineer = FeatureEngineer(config)
-        self.model_engine = ModelEngine(config, tracker=self.tracker) 
+        self.model_engine = ModelEngine(config, tracker=self.tracker)
+        self.simulation_engine = SimulationEngine(config)
+        self.decision_policy = DecisionPolicy(config) 
         self.simulation_engine = SimulationEngine(config)
         self.backtester = Backtester(
             self.data_loader,
@@ -3555,6 +3940,26 @@ class PredictionOrchestrator:
             # Step 4: Ensure team data is loaded
             self._ensure_team_data_loaded()
             
+            # Step 4.5: [INJURY-AWARE] Get player's team and calculate usage boost
+            # The player's team is in their game logs (most recent)
+            player_team_id = None
+            injured_teammates = []
+            injury_boost = 1.0
+            try:
+                if 'TEAM_ID' in df.columns and len(df) > 0:
+                    player_team_id = int(df.iloc[-1]['TEAM_ID'])
+                    injury_boost, injured_teammates = self.feature_engineer.get_injury_usage_boost(
+                        player_name=p_obj['full_name'],
+                        team_id=player_team_id
+                    )
+                    if injured_teammates:
+                        logger.info(f"🏥 Injury boost for {p_obj['full_name']}: {injury_boost:.0%} due to {injured_teammates}")
+            except Exception as e:
+                logger.debug(f"Injury boost calculation skipped: {e}")
+            
+            # Apply injury boost to usage_mult
+            effective_usage_mult = usage_mult * injury_boost
+            
             # Step 5: Build feature vector
             features = self.feature_engineer.build_feature_vector(
                 player_id=p_obj['id'],
@@ -3565,7 +3970,7 @@ class PredictionOrchestrator:
                 is_home=is_home,
                 is_b2b=is_b2b,
                 spread=spread,
-                usage_mult=usage_mult,
+                usage_mult=effective_usage_mult,
                 df=df,
                 stat_col=market,
                 line=line,
@@ -3618,7 +4023,9 @@ class PredictionOrchestrator:
                 simulation=simulation,
                 decision=decision,
                 game_logs=df,
-                hit_rates=hit_rates
+                hit_rates=hit_rates,
+                injured_teammates=injured_teammates,
+                injury_usage_boost=injury_boost
             )
             
         except DataLoaderError as e:
@@ -3783,6 +4190,15 @@ class Tracker:
                     else:
                         bet['margin'] = line - actual_value
                     
+                    # Calculate margin_pct: Standardizes "luck" vs "lock" across stat types
+                    # +1.7% margin on PTS is barely a win, +23.8% on REB is dominant
+                    if line > 0:
+                        bet['margin_pct'] = ((actual_value - line) / line) * 100
+                        if side == 'UNDER':  # Flip sign for unders
+                            bet['margin_pct'] = -bet['margin_pct']
+                    else:
+                        bet['margin_pct'] = 0.0
+                    
                     # Pass market to use appropriate thresholds (low-count vs high-count)
                     bet['result_quality'] = self._categorize_result(new_status, bet['margin'], market)
                 
@@ -3922,14 +4338,23 @@ class Tracker:
         return df
 
     def export_bets_to_training_csv(self, output_file: str = "ml_training_data.csv") -> Tuple[int, str]:
+        """
+        Export tracked bets to ML training CSV.
+        FIXED: Reads existing CSV header first to match column structure exactly.
+        """
         import csv
         bets = self.get_bets()
         output_path = DATA_DIR / output_file
         
-        fieldnames = [
+        # Default fieldnames (full schema for new files) - MUST match canonical_columns
+        default_fieldnames = [
             'date', 'player', 'opponent', 'market', 'position',
             'line', 'predicted_side', 'predicted_prob', 'predicted_ev', 'projected_value',
-            'result', 'hit', 'actual_value', 'margin', 'result_quality',
+            'result', 'hit', 'actual_value', 'margin', 'margin_pct', 'result_quality',
+            # Snapshot: Point-in-time frozen stats (time capsule for Robot training)
+            'snapshot_l5_hit_rate', 'snapshot_days_rest', 'snapshot_def_rank',
+            # Tag: Bet source for filtering training data
+            'tag',
             'feat_ema', 'feat_std', 'feat_sma_5', 'feat_sma_10', 'feat_trend',
             'feat_avg_minutes', 'feat_mins_trend',
             'feat_hit_l5', 'feat_hit_l10', 'feat_hit_l15', 'feat_hit_season',
@@ -3939,10 +4364,30 @@ class Tracker:
             'feat_spread', 'feat_is_home', 'feat_is_b2b', 'feat_days_rest',
             'feat_game_total', 'feat_opp_drtg_season', 'feat_opp_drtg_l5',
             'feat_games_played', 'closing_line', 'clv',
-            'feat_blowout_prob', 'feat_personal_fatigue_factor', 'feat_b2b_games_in_sample', 'feat_dynamic_std_mult', 'feat_coef_variation'
+            'feat_blowout_prob', 'feat_personal_fatigue_factor', 'feat_b2b_games_in_sample', 
+            'feat_dynamic_std_mult', 'feat_coef_variation',
+            # V16 market & role context
+            'feat_odds_decimal', 'feat_usg_season', 'feat_clv',
+            'feat_usg_trend', 'grade'
         ]
         
+        # Check if file exists and read its header to match column structure
         file_exists = output_path.exists()
+        if file_exists:
+            try:
+                with open(output_path, 'r', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    existing_header = next(reader, None)
+                    if existing_header:
+                        # Use existing header to maintain consistency
+                        fieldnames = existing_header
+                    else:
+                        fieldnames = default_fieldnames
+            except Exception:
+                fieldnames = default_fieldnames
+        else:
+            fieldnames = default_fieldnames
+        
         exported_count = 0
         bets_modified = False
         
@@ -3956,6 +4401,7 @@ class Tracker:
                     bet.get('actual_value') is not None and 
                     not bet.get('exported_to_csv', False)):
                     
+                    # Build row with all possible fields - DictWriter will ignore extras
                     row = {
                         'date': str(bet.get('date', '2024-01-01')).split(' ')[0],
                         'player': bet.get('player', ''),
@@ -3971,7 +4417,14 @@ class Tracker:
                         'hit': 1 if bet.get('result') == 'Win' else 0,
                         'actual_value': bet.get('actual_value', 0),
                         'margin': bet.get('margin', 0),
+                        'margin_pct': bet.get('margin_pct', 0),  # Standardized margin across stat types
                         'result_quality': bet.get('result_quality', 'legacy'),
+                        # Snapshot: Frozen point-in-time stats (Time Capsule)
+                        'snapshot_l5_hit_rate': bet.get('snapshot_l5_hit_rate', bet.get('feat_hit_l5', 0)),
+                        'snapshot_days_rest': bet.get('snapshot_days_rest', bet.get('feat_days_rest', 1)),
+                        'snapshot_def_rank': bet.get('snapshot_def_rank', 0),
+                        # Tag: Bet source for filtering training data
+                        'tag': bet.get('tag', 'legacy'),
                         'feat_ema': bet.get('feat_ema', 0),
                         'feat_std': bet.get('feat_std', 0),
                         'feat_sma_5': bet.get('feat_sma_5', 0),
@@ -4006,7 +4459,15 @@ class Tracker:
                         'feat_personal_fatigue_factor': bet.get('personal_fatigue_factor', 1),
                         'feat_b2b_games_in_sample': bet.get('b2b_games_in_sample', 0),
                         'feat_dynamic_std_mult': bet.get('dynamic_std_mult', 1),
-                        'feat_coef_variation': bet.get('coef_variation', 0)
+                        'feat_coef_variation': bet.get('coef_variation', 0),
+                        # V16 market & role context
+                        'feat_odds_decimal': bet.get('odds_decimal', american_to_decimal(bet.get('odds', -110))),
+                        'feat_usg_season': bet.get('usg_season', 0),
+                        'feat_clv': (bet.get('closing_line', 0) - bet.get('line', 0)) if bet.get('closing_line') else 0,
+                        'feat_usg_trend': bet.get('feat_usg_trend', 1.0),
+                        # Backtest-style column aliases (for compatibility)
+                        'player_name': bet.get('player', ''),
+                        'grade': 'A' if bet.get('ev', 0) > 0.05 else 'B',
                     }
                     
                     writer.writerow(row)
@@ -4365,9 +4826,202 @@ def render_data_quality_card(result: AnalysisResult):
         st.success(f"📡 Data Quality: **{dq.grade}** (100/100) - All data available")
 
 
+def render_ticket_card(result: 'AnalysisResult', bankroll: float):
+    """
+    Render a betting ticket-style card with Sniper Mode safety features.
+    Includes: Rust Alert, Injury News Link, Evidence Row.
+    """
+    decision = result.decision
+    projection = result.projection
+    features = result.features
+
+    # 1. Color & Badge Logic
+    grade_colors = {'A': '#00c853', 'B': '#4caf50', 'C': '#ff9800', 'D': '#f44336', 'F': '#b71c1c'}
+    grade_bg = {'A': 'rgba(0,200,83,0.15)', 'B': 'rgba(76,175,80,0.15)', 'C': 'rgba(255,152,0,0.15)', 'D': 'rgba(244,67,54,0.15)', 'F': 'rgba(183,28,28,0.15)'}
+    
+    grade_val = decision.grade.value
+    grade_color = grade_colors.get(grade_val, '#888')
+    bg_color = grade_bg.get(grade_val, 'rgba(100,100,100,0.15)')
+
+    is_over = decision.recommended_side == 'OVER'
+    side_color = '#00c853' if is_over else '#f44336'
+    side_icon = '📈' if is_over else '📉'
+
+    robot_prob = projection.ml_prob if projection.ml_prob is not None else 0.0
+    robot_approved = robot_prob >= 0.60
+    robot_badge = '🤖✓' if robot_approved else ('🤖✗' if projection.ml_prob is not None else '')
+
+    # Conflict Logic
+    is_conflict = (projection.ml_prob is not None) and (projection.ml_prob < 0.50) and (grade_val in ['A', 'B'])
+    conflict_div = f"""<div style="background: rgba(255,152,0,0.2); border: 1px solid #ff9800; border-radius: 6px; padding: 8px; margin-top: 12px; text-align: center;"><span style="color: #ff9800; font-weight: bold; font-size: 12px;">⚠️ ROBOT DISAGREES ({robot_prob:.1%})</span></div>""" if is_conflict else ""
+
+    # --- SNIPER MODE: Rust Alert ---
+    rest_days = getattr(features, 'days_rest', 1)
+    rust_alert = ""
+    if rest_days > 7 and rest_days < 100:
+        rust_alert = f'<span style="color: #ff9800; font-weight: bold; margin-right: 10px;">⚠️ {int(rest_days)} Days Rust</span>'
+    
+    # --- SNIPER MODE: Injury News Link ---
+    clean_name = result.player_name.replace(" ", "+")
+    news_url = f"https://www.google.com/search?q={clean_name}+injury+status+nba&tbm=nws"
+
+    # --- Evidence Row: Form, Matchup, Fatigue ---
+    l5_hit = result.hit_rates.get('l5', 0) if hasattr(result, 'hit_rates') and result.hit_rates else 0
+    if l5_hit >= 0.80:
+        form_label, form_color = "🔥 HOT", "#00c853"
+    elif l5_hit >= 0.60:
+        form_label, form_color = "✅ WARM", "#4caf50"
+    elif l5_hit >= 0.40:
+        form_label, form_color = "😐 COLD", "#ff9800"
+    else:
+        form_label, form_color = "❄️ ICE", "#f44336"
+    
+    def_mult = features.def_mult if features.def_mult else 1.0
+    if def_mult >= 1.10:
+        matchup_label, matchup_color = "🧈 SOFT", "#00c853"
+    elif def_mult >= 1.02:
+        matchup_label, matchup_color = "✅ GOOD", "#4caf50"
+    elif def_mult >= 0.95:
+        matchup_label, matchup_color = "😐 AVG", "#ff9800"
+    else:
+        matchup_label, matchup_color = "🧱 TOUGH", "#f44336"
+    
+    is_b2b = features.is_b2b if hasattr(features, 'is_b2b') else False
+    if is_b2b:
+        rest_label, rest_color = "😴 B2B", "#f44336"
+    elif rest_days >= 3:
+        rest_label, rest_color = "💪 RESTED", "#00c853"
+    elif rest_days == 2:
+        rest_label, rest_color = "✅ FRESH", "#4caf50"
+    else:
+        rest_label, rest_color = "😐 STD", "#ff9800"
+
+    # Build Evidence Row HTML
+    evidence_row = f"""<div style="display: flex; justify-content: space-around; text-align: center; margin-top: 12px; padding-top: 12px; border-top: 1px solid #333;">
+<div>
+<div style="font-size: 14px; font-weight: 700; color: {form_color};">{form_label}</div>
+<div style="font-size: 10px; color: #888;">L5: {l5_hit:.0%}</div>
+<div style="font-size: 9px; color: #666; text-transform: uppercase;">Form</div>
+</div>
+<div style="border-left: 1px solid #444; padding-left: 15px;">
+<div style="font-size: 14px; font-weight: 700; color: {matchup_color};">{matchup_label}</div>
+<div style="font-size: 10px; color: #888;">×{def_mult:.2f}</div>
+<div style="font-size: 9px; color: #666; text-transform: uppercase;">Matchup</div>
+</div>
+<div style="border-left: 1px solid #444; padding-left: 15px;">
+<div style="font-size: 14px; font-weight: 700; color: {rest_color};">{rest_label}</div>
+<div style="font-size: 10px; color: #888;">{rest_days}d rest</div>
+<div style="font-size: 9px; color: #666; text-transform: uppercase;">Fatigue</div>
+</div>
+</div>"""
+
+    # Safety Lock Row (Rust + Injury Link)
+    safety_row = f"""<div style="text-align: center; margin-top: 10px; font-size: 12px;">
+{rust_alert}
+<a href="{news_url}" target="_blank" style="color: #4dabf7; text-decoration: none; font-weight: bold; border: 1px solid #4dabf7; padding: 4px 10px; border-radius: 12px;">🏥 Check Injury Status</a>
+</div>"""
+
+    # --- INJURY-AWARE: Show teammate injuries boosting this player's usage ---
+    injury_boost_row = ""
+    if hasattr(result, 'injured_teammates') and result.injured_teammates:
+        injured_list = ", ".join(result.injured_teammates)
+        boost_pct = (result.injury_usage_boost - 1.0) * 100
+        injury_boost_row = f"""<div style="background: rgba(76, 175, 80, 0.15); border: 1px solid #4caf50; border-radius: 6px; padding: 8px; margin-top: 10px; text-align: center;">
+<span style="color: #4caf50; font-weight: bold; font-size: 12px;">📈 USAGE BOOST +{boost_pct:.0f}%</span>
+<div style="color: #888; font-size: 10px; margin-top: 4px;">Teammate(s) OUT: {injured_list}</div>
+</div>"""
+
+    # 2. HTML Construction (FLUSH LEFT)
+    ticket_html = f"""<div style="background: linear-gradient(135deg, {bg_color} 0%, rgba(30,30,30,0.9) 100%); border-left: 5px solid {side_color}; border-radius: 12px; padding: 16px; margin: 10px 0; font-family: sans-serif; box-shadow: 0 4px 15px rgba(0,0,0,0.3);">
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+<div>
+<div style="font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 1px;">NBA Prop</div>
+<div style="font-size: 20px; font-weight: 700; color: white;">{result.player_name}</div>
+<div style="color: #aaa; font-size: 12px;">vs {result.opponent_name}</div>
+</div>
+<div style="text-align: right;">
+<div style="background: {grade_color}; color: white; padding: 4px 12px; border-radius: 16px; font-weight: 700; font-size: 14px;">Grade {grade_val}</div>
+<div style="margin-top: 4px; font-size: 12px;">{robot_badge}</div>
+</div>
+</div>
+<div style="background: rgba(255,255,255,0.05); border-radius: 8px; padding: 12px; margin: 10px 0; text-align: center;">
+<div style="font-size: 12px; color: #888;">{result.market}</div>
+<div style="font-size: 28px; font-weight: 800; color: {side_color};">{side_icon} {decision.recommended_side} {result.line}</div>
+<div style="font-size: 12px; color: #aaa;">Proj: {projection.final_projection:.1f} | Odds: {result.odds}</div>
+</div>
+<div style="display: flex; justify-content: space-between; text-align: center; margin-bottom: 12px; font-size: 14px;">
+<div><span style="color: {'#00c853' if decision.probability >= 0.6 else '#ff9800'}; font-weight: 700;">{decision.probability:.0%}</span> <span style="font-size: 10px; color: #888;">Win</span></div>
+<div><span style="color: {'#00c853' if decision.expected_value > 0 else '#f44336'}; font-weight: 700;">{decision.expected_value:+.1%}</span> <span style="font-size: 10px; color: #888;">EV</span></div>
+<div><span style="color: {'#00c853' if robot_prob >= 0.6 else '#ff9800' if robot_prob >= 0.5 else '#f44336'}; font-weight: 700;">{robot_prob:.0%}</span> <span style="font-size: 10px; color: #888;">🤖 ML</span></div>
+<div><span style="color: white; font-weight: 700;">₱{decision.kelly_stake:.0f}</span> <span style="font-size: 10px; color: #888;">Stake</span></div>
+</div>
+{evidence_row}
+{injury_boost_row}
+{safety_row}
+{conflict_div}
+</div>"""
+
+    # 3. Render
+    st.markdown(ticket_html, unsafe_allow_html=True)
+    
+    # ML Signal expander
+    if projection.ml_prob is not None:
+        with st.expander("🧠 ML Decoder", expanded=False):
+            render_ml_decoder(result)
+
+
+def render_ml_decoder(result: AnalysisResult):
+    """Render the ML signal decoder panel."""
+    features = result.features
+    projection = result.projection
+    
+    # ROW 1: RISK FACTORS
+    st.caption("🛡️ **Risk Profile**")
+    r1, r2, r3 = st.columns(3)
+    
+    with r1:  # Blowout
+        prob = features.blowout_prob * 100
+        if prob >= 35: 
+            label, color = "HIGH", "red"
+        elif prob >= 20: 
+            label, color = "MED", "orange"
+        else: 
+            label, color = "LOW", "green"
+        st.metric("Blowout Risk", f"{prob:.0f}%", label, delta_color="inverse" if prob >= 20 else "normal")
+    
+    with r2:  # Volatility
+        cv = features.coef_variation * 100
+        if cv >= 30: 
+            label, color = "HIGH", "red"
+        elif cv >= 20: 
+            label, color = "MED", "orange"
+        else: 
+            label, color = "LOW", "green"
+        st.metric("Volatility (CV)", f"{cv:.0f}%", label, delta_color="inverse" if cv >= 30 else "normal")
+    
+    with r3:  # Fatigue
+        fatigue = features.personal_fatigue_factor
+        if fatigue < 0.92: 
+            label = "FATIGUED"
+        elif fatigue > 1.02: 
+            label = "RESTED"
+        else: 
+            label = "NORMAL"
+        st.metric("Fatigue Factor", f"{fatigue:.2f}", label)
+    
+    # ROW 2: EDGE FACTORS
+    st.caption("📊 **Edge Factors**")
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Pace", f"{features.pace_mult:.2f}")
+    e2.metric("Defense", f"{features.def_mult:.2f}")
+    e3.metric("Position", f"{features.position_mult:.2f}")
+    e4.metric("Matchup", f"{features.combined_matchup_mult:.2f}")
+
+
 def render_recommendation_card(result: AnalysisResult, bankroll: float):
     """
     Render clean, mobile-friendly recommendation card.
+
     FIXED: explicit labels to prevent 'Over/Under' confusion.
     """
     decision = result.decision
@@ -4917,6 +5571,172 @@ def render_ml_data_tab(tracker: Tracker):
     """Render enhanced ML data tab with better preview."""
     st.markdown("### 🤖 ML Training Data")
     
+    csv_path = DATA_DIR / "ml_training_data.csv"
+    
+    # =========================================================================
+    # SECTION 1: THEORETICAL PERFORMANCE (The Math - from CSV)
+    # =========================================================================
+    with st.expander("📐 Theoretical Performance (The Math)", expanded=False):
+        st.caption("Based on simulation data from ml_training_data.csv")
+        
+        if csv_path.exists():
+            try:
+                csv_df = pd.read_csv(csv_path, on_bad_lines='skip')
+                skipped_warning = False
+                
+                # Quick check for corruption
+                try:
+                    with open(csv_path, 'r', encoding='utf-8') as f:
+                        raw_line_count = sum(1 for _ in f)
+                    if raw_line_count > len(csv_df) + 10:
+                        skipped_warning = True
+                        st.warning(f"⚠️ CSV has {raw_line_count - len(csv_df) - 1} corrupted rows. Click 'Repair CSV' below.")
+                except:
+                    pass
+                
+                if 'hit' in csv_df.columns:
+                    total_sim_bets = len(csv_df)
+                    sim_wins = int(csv_df['hit'].sum())
+                    sim_losses = total_sim_bets - sim_wins
+                    sim_win_rate = sim_wins / total_sim_bets if total_sim_bets > 0 else 0
+                    
+                    # --- Theoretical Win Rate (Raw) ---
+                    # Standard -110 odds = 1.91 decimal
+                    sim_units_won = sim_wins * 0.91
+                    sim_units_lost = sim_losses * 1.0
+                    sim_net_units = sim_units_won - sim_units_lost
+                    sim_roi = (sim_net_units / total_sim_bets * 100) if total_sim_bets > 0 else 0
+                    
+                    # --- Quality Units (Only bets where predicted_prob > 60%) ---
+                    quality_df = csv_df[csv_df['predicted_prob'] > 0.60] if 'predicted_prob' in csv_df.columns else pd.DataFrame()
+                    if len(quality_df) > 0:
+                        quality_total = len(quality_df)
+                        quality_wins = int(quality_df['hit'].sum())
+                        quality_losses = quality_total - quality_wins
+                        quality_win_rate = quality_wins / quality_total if quality_total > 0 else 0
+                        quality_units_won = quality_wins * 0.91
+                        quality_units_lost = quality_losses * 1.0
+                        quality_net_units = quality_units_won - quality_units_lost
+                        quality_roi = (quality_net_units / quality_total * 100) if quality_total > 0 else 0
+                    else:
+                        quality_total = 0
+                        quality_win_rate = 0
+                        quality_net_units = 0
+                        quality_roi = 0
+                    
+                    # Display: Theoretical (Raw) vs Quality (Filtered)
+                    st.markdown("**📊 Theoretical Win Rate (All Sim Bets)**")
+                    th_c1, th_c2, th_c3, th_c4 = st.columns(4)
+                    th_c1.metric("Total Samples", f"{total_sim_bets:,}")
+                    th_c2.metric("Win Rate", f"{sim_win_rate:.1%}")
+                    if sim_net_units >= 0:
+                        th_c3.metric("Net Units", f"+{sim_net_units:.1f}u")
+                    else:
+                        th_c3.metric("Net Units", f"{sim_net_units:.1f}u")
+                    th_c4.metric("ROI", f"{sim_roi:+.1f}%")
+                    
+                    st.markdown("---")
+                    st.markdown("**🎯 Quality Units (Only Prob > 60%)**")
+                    st.caption("What would happen if you only bet the strong signals")
+                    q_c1, q_c2, q_c3, q_c4 = st.columns(4)
+                    q_c1.metric("Filtered Bets", f"{quality_total:,}")
+                    q_c2.metric("Win Rate", f"{quality_win_rate:.1%}")
+                    if quality_net_units >= 0:
+                        q_c3.metric("Quality Units", f"+{quality_net_units:.1f}u", delta="Strong signals only")
+                    else:
+                        q_c3.metric("Quality Units", f"{quality_net_units:.1f}u", delta="Strong signals only", delta_color="inverse")
+                    q_c4.metric("ROI", f"{quality_roi:+.1f}%")
+                else:
+                    st.info("CSV missing 'hit' column. Cannot calculate theoretical performance.")
+                
+                # Repair button
+                if skipped_warning:
+                    if st.button("🔧 Repair CSV", type="primary"):
+                        clean_df = pd.read_csv(csv_path, on_bad_lines='skip')
+                        backup_path = DATA_DIR / "ml_training_data_backup.csv"
+                        import shutil
+                        shutil.copy(csv_path, backup_path)
+                        clean_df.to_csv(csv_path, index=False)
+                        st.success(f"✅ Repaired! Kept {len(clean_df):,} valid rows. Backup saved to {backup_path.name}")
+                        st.rerun()
+                    
+            except Exception as e:
+                st.warning(f"Could not read CSV file: {e}")
+        else:
+            st.info("📂 No training data file found. Generate data using backtest or track bets to create one.")
+    
+    # =========================================================================
+    # SECTION 2: REAL PERFORMANCE (The Human - from tracker.history ONLY)
+    # =========================================================================
+    with st.expander("🧑 Real Performance (Your Actual Bets)", expanded=True):
+        st.caption("Based on YOUR tracked bets in bet_tracker.json - this is what actually happened")
+        
+        tracker_bets = tracker.get_bets()
+        decided_bets = [b for b in tracker_bets if b.get('result') in ['Win', 'Loss']]
+        
+        if len(decided_bets) > 0:
+            real_wins = len([b for b in decided_bets if b.get('result') == 'Win'])
+            real_losses = len([b for b in decided_bets if b.get('result') == 'Loss'])
+            real_total = real_wins + real_losses
+            real_win_rate = real_wins / real_total if real_total > 0 else 0
+            
+            # Calculate real units (using actual odds from tracked bets)
+            real_units_profit = 0
+            for bet in decided_bets:
+                odds = bet.get('odds', 1.91)  # Default to -110 if missing
+                if bet.get('result') == 'Win':
+                    real_units_profit += (odds - 1)  # Win pays (odds - 1) units
+                else:
+                    real_units_profit -= 1  # Loss costs 1 unit
+            
+            real_roi = (real_units_profit / real_total * 100) if real_total > 0 else 0
+            
+            # Display real performance metrics
+            r_c1, r_c2, r_c3, r_c4 = st.columns(4)
+            r_c1.metric("Your Bets", f"{real_total:,}")
+            r_c2.metric("Win Rate", f"{real_win_rate:.1%}")
+            if real_units_profit >= 0:
+                r_c3.metric("Net Units", f"+{real_units_profit:.1f}u", delta="Real $$$")
+            else:
+                r_c3.metric("Net Units", f"{real_units_profit:.1f}u", delta="Real $$$", delta_color="inverse")
+            r_c4.metric("ROI", f"{real_roi:+.1f}%")
+            
+            # Show pending count
+            pending_bets = [b for b in tracker_bets if b.get('result', 'Pending') == 'Pending']
+            if len(pending_bets) > 0:
+                st.caption(f"📋 {len(pending_bets)} pending bets awaiting results")
+            
+            # Real performance chart (cumulative units over time)
+            st.markdown("**📈 Cumulative Units Over Time**")
+            
+            # Sort by date and calculate cumulative units
+            chart_data = []
+            cumulative = 0
+            sorted_bets = sorted(decided_bets, key=lambda x: x.get('date', ''))
+            
+            for bet in sorted_bets:
+                odds = bet.get('odds', 1.91)
+                if bet.get('result') == 'Win':
+                    cumulative += (odds - 1)
+                else:
+                    cumulative -= 1
+                chart_data.append({
+                    'date': bet.get('date', 'Unknown'),
+                    'units': cumulative,
+                    'player': bet.get('player_name', bet.get('player', 'Unknown')),
+                    'result': bet.get('result')
+                })
+            
+            if chart_data:
+                chart_df = pd.DataFrame(chart_data)
+                # Color based on positive/negative
+                line_color = "#00ff00" if cumulative >= 0 else "#ff4444"
+                st.line_chart(chart_df.set_index('date')['units'], color=line_color)
+        else:
+            st.info("📋 No decided bets yet. Track bets and update their results to see your real performance.")
+    
+    st.markdown("---")
+    
     feature_stats = tracker.get_feature_stats()
     training_df = tracker.export_training_data()
     
@@ -5053,19 +5873,40 @@ def render_train_model_tab():
             status.write("Loading dataset...")
             df = pd.read_csv(data_path)
             
-            # Filter for feature columns (must start with 'feat_')
-            feature_cols = [c for c in df.columns if c.startswith('feat_')]
+            # Use canonical, ordered, numeric training features (36 exactly)
+            try:
+                # Access constant defined in ML generator section
+                feature_cols = TRAINING_FEATURE_COLUMNS  # type: ignore[name-defined]
+            except NameError:
+                # Fallback in case of refactor – define inline (must match module-level constant)
+                feature_cols = [
+                    'feat_ema', 'feat_std', 'feat_sma_5', 'feat_sma_10', 'feat_trend',
+                    'feat_avg_minutes', 'feat_mins_trend',
+                    'feat_hit_l5', 'feat_hit_l10', 'feat_hit_l15', 'feat_hit_season',
+                    'feat_pace_mult', 'feat_def_mult', 'feat_position_mult',
+                    'feat_base_matchup_mult', 'feat_combined_matchup_mult',
+                    'feat_split_factor', 'feat_rest_factor', 'feat_blowout_factor', 'feat_usage_mult',
+                    'feat_is_home', 'feat_is_b2b', 'feat_spread', 'feat_games_played', 'feat_days_rest',
+                    'feat_game_total', 'feat_opp_drtg_season', 'feat_opp_drtg_l5',
+                    'feat_blowout_prob', 'feat_personal_fatigue_factor', 'feat_b2b_games_in_sample',
+                    'feat_dynamic_std_mult', 'feat_coef_variation',
+                    # V16 market & role context
+                    'feat_odds_decimal', 'feat_usg_season', 'feat_clv'
+                ]
             target_col = 'hit'
-            
-            if len(feature_cols) != 33:
+
+            missing = [c for c in feature_cols if c not in df.columns]
+            if missing:
                 status.update(label="❌ Error", state="error")
-                st.error(f"Shape Mismatch! Found {len(feature_cols)} features, expected 33. Regenerate your dataset.")
+                st.error("Training data missing required features. Please regenerate dataset.")
+                st.caption(f"Missing: {', '.join(missing)}")
                 return
 
             # 2. Prepare Data
             status.write(f"Processing {len(df)} samples with {len(feature_cols)} features...")
-            X = df[feature_cols]
-            y = df[target_col]
+            # Coerce to numeric to avoid dtype issues from mixed sources
+            X = df[feature_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+            y = pd.to_numeric(df[target_col], errors='coerce').fillna(0).astype(int)
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
             
             # 3. Train Model
@@ -5211,8 +6052,8 @@ def main():
         st.caption(f"1u = ₱{unit_size:,.0f} | 5u = ₱{unit_size*5:,.0f}")
         st.caption("Stakes: A=5u | B=3u | C=1u")
         
-        usage_bump = st.slider("Usage Adj %", -30, 30, 0, 5)
-        usage_mult = 1 + (usage_bump / 100.0)
+        # Sniper Mode: Usage is now AUTO-calculated from L5 trend
+        usage_mult = 1.0  # Base - will be auto-adjusted by stats engine
         st.session_state.usage_mult = usage_mult
         
         # Quick stats with P/L in units
@@ -5310,113 +6151,159 @@ def main():
         if result and result.success:
             st.markdown("---")
             
-            # Main recommendation at top
-            render_recommendation_card(result, bankroll)
+            # Sniper Mode Toggle
+            sniper_mode = st.toggle("🎯 Sniper Mode", value=False, help="Hide non-Grade A picks")
             
-            # Bet Rules Validation
-            render_bet_rules_card(result)
+            # Check if this bet passes Sniper Mode criteria
+            is_sniper_worthy = (
+                result.decision.grade == BetGrade.A and
+                (result.projection.ml_prob is None or result.projection.ml_prob >= 0.50)
+            )
             
-            # Action buttons
-            col_track, col_parlay = st.columns(2)
-            with col_track: 
-                if st.button("💾 Track", use_container_width=True):
-                    features = result.features
-                    tracker.log_bet({
-                        "player": result.player_name,
-                        "opponent": result.opponent_name,
-                        "market": result.market,
-                        "line": result.line,
-                        "side": result.decision.recommended_side,
-                        "odds": result.odds,
-                        "ev": result.decision.expected_value,
-                        "proj": result.projection.final_projection,
-                        "stake": result.decision.kelly_stake,
-                        "prob": result.decision.probability,
-                        "rollover_suitable": result.decision.rollover_suitable,
-                        "rollover_score": result.decision.rollover_score,
-                        "feat_ema": float(features.ema),
-                        "feat_std": float(features.std),
-                        "feat_sma_5": float(features.sma_5),
-                        "feat_sma_10": float(features.sma_10),
-                        "feat_trend": float(features.trend),
-                        "feat_avg_minutes": float(features.avg_minutes),
-                        "feat_mins_trend": float(features.mins_trend),
-                        "feat_hit_l5": float(features.hit_rate_l5),
-                        "feat_hit_l10": float(features.hit_rate_l10),
-                        "feat_hit_l15": float(features.hit_rate_l15),
-                        "feat_hit_season": float(features.hit_rate_season),
-                        "feat_pace_mult": float(features.pace_mult),
-                        "feat_def_mult": float(features.def_mult),
-                        "feat_position_mult": float(features.position_mult),
-                        "feat_base_matchup_mult": float(features.base_matchup_mult),
-                        "feat_combined_matchup_mult": float(features.combined_matchup_mult),
-                        "feat_split_factor": float(features.split_factor),
-                        "feat_rest_factor": float(features.rest_factor),
-                        "feat_blowout_factor": float(features.blowout_factor),
-                        "feat_usage_mult": float(features.usage_mult),
-                        "feat_spread": float(features.spread),
-                        "feat_is_home": bool(features.is_home),
-                        "feat_is_b2b": bool(features.is_b2b),
-                        "feat_position": features.player_position,
-                        "feat_games_played": int(features.games_played),
-                        "feat_days_rest": int(features.days_rest),
-                        "feat_game_total": float(features.game_total),
-                        "feat_opp_drtg_season": float(features.opponent_drtg_season),
-                        "feat_opp_drtg_l5": float(features.opponent_drtg_l5),
-                        "feat_proj": float(result.projection.final_projection),
-                        "feat_ev": float(result.decision.expected_value),
-                        "feat_prob": float(result.decision.probability),
-                    })
-                    st.toast("Bet tracked!", icon="💾")
+            if sniper_mode and not is_sniper_worthy:
+                st.info("🔇 **Filtered Out** — This pick doesn't meet Sniper Mode criteria (Grade A + Robot Approved)")
+                st.caption(f"Grade: {result.decision.grade.value} | ML: {result.projection.ml_prob:.0%}" if result.projection.ml_prob else f"Grade: {result.decision.grade.value}")
+            else:
+                # Main recommendation - Ticket Style Card
+                render_ticket_card(result, bankroll)
                 
-            with col_parlay: 
-                if result.decision.rollover_suitable:
-                    if st.button("Parlay", use_container_width=True):
-                        leg = {
-                            'player': result.player_name,
-                            'opponent': result.opponent_name,
-                            'market': result.market,
-                            'line': result.line,
-                            'side': result.decision.recommended_side,
-                            'odds': result.odds,
-                            'prob': result.decision.probability,
-                            'proj': result.projection.final_projection,
-                            'ev': result.decision.expected_value,
-                            'position': result.features.player_position,
-                            'result': 'Pending'
-                        }
-                        existing = [l for l in st.session_state.parlay_builder 
-                                    if l['player'] == leg['player'] and l['market'] == leg['market']]
-                        if existing:
-                            st.warning("Already in parlay!")
-                        elif len(st.session_state.parlay_builder) >= CONFIG.MAX_PARLAY_LEGS: 
-                            st.warning(f"Max {CONFIG.MAX_PARLAY_LEGS} legs!")
-                        else:
-                            st.session_state.parlay_builder.append(leg)
-                            st.toast("Added!", icon="🎲")
-                            st.rerun()
-                else: 
-                    st.button("Parlay", disabled=True, use_container_width=True,
-                             help="Not suitable for parlay")
+                # Bet Rules Validation
+                render_bet_rules_card(result)
             
-            # Details in expander to reduce clutter
-            with st.expander("Details & Chart", expanded=False):
-                render_blowout_info(result)
+                # Action buttons
+                col_track, col_parlay = st.columns(2)
+                # Tag selection for bet source tracking
+                tag_options = ["Sniper", "Robot_Top_Pick", "Gut_Feel", "Live_Bet"]
+                # Auto-suggest tag based on context
+                default_tag = "Sniper" if (result.decision.grade == BetGrade.A and 
+                    (result.projection.ml_prob is None or result.projection.ml_prob >= 0.50)) else "Gut_Feel"
+                selected_tag = st.selectbox("Bet Source Tag:", tag_options, 
+                    index=tag_options.index(default_tag), key="bet_tag_select",
+                    help="Tag for filtering training data - 'Sniper' = disciplined picks")
                 
-                # Hit rates
-                st.markdown("**Hit Rates:**")
-                cols = st.columns(4)
-                for i, (label, rate) in enumerate([
-                    ("L5", result.hit_rates['l5']), 
-                    ("L10", result.hit_rates['l10']),
-                    ("L15", result.hit_rates['l15']), 
-                    ("Season", result.hit_rates['season'])
-                ]):
-                    color = "green" if rate >= 0.6 else "orange" if rate >= 0.4 else "red"
-                    cols[i].metric(label, f"{rate:.0%}")
+                with col_track: 
+                    if st.button("💾 Track", use_container_width=True):
+                        try:
+                            features = result.features
+                            tracker.log_bet({
+                                "player": result.player_name,
+                                "opponent": result.opponent_name,
+                                "market": result.market,
+                                "line": result.line,
+                                "side": result.decision.recommended_side,
+                                "odds": result.odds,
+                                "ev": result.decision.expected_value,
+                                "proj": result.projection.final_projection,
+                                "stake": result.decision.kelly_stake,
+                                "prob": result.decision.probability,
+                                "rollover_suitable": result.decision.rollover_suitable,
+                                "rollover_score": result.decision.rollover_score,
+                                # === SNAPSHOT: Freeze point-in-time stats ===
+                                "snapshot_l5_hit_rate": float(features.hit_rate_l5),
+                                "snapshot_days_rest": int(features.days_rest),
+                                "snapshot_def_rank": int(round(features.opponent_drtg_season)),  # Approx rank
+                                # === TAG: Bet source for filtering ===
+                                "tag": selected_tag,
+                                # === FEATURES ===
+                                "feat_ema": float(features.ema),
+                                "feat_std": float(features.std),
+                                "feat_sma_5": float(features.sma_5),
+                                "feat_sma_10": float(features.sma_10),
+                                "feat_trend": float(features.trend),
+                                "feat_avg_minutes": float(features.avg_minutes),
+                                "feat_mins_trend": float(features.mins_trend),
+                                "feat_hit_l5": float(features.hit_rate_l5),
+                                "feat_hit_l10": float(features.hit_rate_l10),
+                                "feat_hit_l15": float(features.hit_rate_l15),
+                                "feat_hit_season": float(features.hit_rate_season),
+                                "feat_pace_mult": float(features.pace_mult),
+                                "feat_def_mult": float(features.def_mult),
+                                "feat_position_mult": float(features.position_mult),
+                                "feat_base_matchup_mult": float(features.base_matchup_mult),
+                                "feat_combined_matchup_mult": float(features.combined_matchup_mult),
+                                "feat_split_factor": float(features.split_factor),
+                                "feat_rest_factor": float(features.rest_factor),
+                                "feat_blowout_factor": float(features.blowout_factor),
+                                "feat_usage_mult": float(features.usage_mult),
+                                "feat_spread": float(features.spread),
+                                "feat_is_home": bool(features.is_home),
+                                "feat_is_b2b": bool(features.is_b2b),
+                                "feat_position": features.player_position,
+                                "feat_games_played": int(features.games_played),
+                                "feat_days_rest": int(features.days_rest),
+                                "feat_game_total": float(features.game_total),
+                                "feat_opp_drtg_season": float(features.opponent_drtg_season),
+                                "feat_opp_drtg_l5": float(features.opponent_drtg_l5),
+                                "feat_proj": float(result.projection.final_projection),
+                                "feat_ev": float(result.decision.expected_value),
+                                "feat_prob": float(result.decision.probability),
+                                # V15 raw fields to fully populate training features
+                                "blowout_prob": float(getattr(features, 'blowout_prob', 0.0)),
+                                "personal_fatigue_factor": float(getattr(features, 'personal_fatigue_factor', 1.0)),
+                                "b2b_games_in_sample": float(getattr(features, 'b2b_games_in_sample', 0.0)),
+                                "dynamic_std_mult": float(getattr(features, 'dynamic_std_mult', 1.0)),
+                                "coef_variation": float(getattr(features, 'coef_variation', 0.0)),
+                                # V16 market & role context
+                                "odds_decimal": american_to_decimal(result.odds) if result.odds else 1.91,
+                                "usg_season": float(getattr(features, 'usg_season', 0.0)),
+                                "clv": 0.0,  # Populated later when closing line known
+                                # Sniper Mode: Usage trend features for ML
+                                "feat_usg_season": 0.0,  # Raw USG_PCT requires log access
+                                "feat_usg_trend": float(features.usage_mult),  # Already incorporates damped trend
+                            })
+                            st.toast(f"Bet tracked! [{selected_tag}]", icon="💾")
+                        except Exception as e:
+                            st.error(f"Failed to track bet: {e}")
+                            logger.error(f"Bet tracking failed: {e}")
                 
-                st.caption(result.projection.context)
-                render_distribution_chart(result)
+                with col_parlay: 
+                    if result.decision.rollover_suitable:
+                        if st.button("Parlay", use_container_width=True):
+                            leg = {
+                                'player': result.player_name,
+                                'opponent': result.opponent_name,
+                                'market': result.market,
+                                'line': result.line,
+                                'side': result.decision.recommended_side,
+                                'odds': result.odds,
+                                'prob': result.decision.probability,
+                                'proj': result.projection.final_projection,
+                                'ev': result.decision.expected_value,
+                                'position': result.features.player_position,
+                                'result': 'Pending'
+                            }
+                            existing = [l for l in st.session_state.parlay_builder 
+                                        if l['player'] == leg['player'] and l['market'] == leg['market']]
+                            if existing:
+                                st.warning("Already in parlay!")
+                            elif len(st.session_state.parlay_builder) >= CONFIG.MAX_PARLAY_LEGS: 
+                                st.warning(f"Max {CONFIG.MAX_PARLAY_LEGS} legs!")
+                            else:
+                                st.session_state.parlay_builder.append(leg)
+                                st.toast("Added!", icon="🎲")
+                                st.rerun()
+                    else: 
+                        st.button("Parlay", disabled=True, use_container_width=True,
+                                 help="Not suitable for parlay")
+            
+                # Details in expander to reduce clutter
+                with st.expander("Details & Chart", expanded=False):
+                    render_blowout_info(result)
+                    
+                    # Hit rates
+                    st.markdown("**Hit Rates:**")
+                    cols = st.columns(4)
+                    for i, (label, rate) in enumerate([
+                        ("L5", result.hit_rates['l5']), 
+                        ("L10", result.hit_rates['l10']),
+                        ("L15", result.hit_rates['l15']), 
+                        ("Season", result.hit_rates['season'])
+                    ]):
+                        color = "green" if rate >= 0.6 else "orange" if rate >= 0.4 else "red"
+                        cols[i].metric(label, f"{rate:.0%}")
+                    
+                    st.caption(result.projection.context)
+                    render_distribution_chart(result)
     
     # Tab 2: Backtest
     with tab2:
@@ -5498,6 +6385,7 @@ def main():
         st.markdown("Bet Tracker")
         
         stats = tracker.get_stats()
+        all_bets = tracker.get_bets()
         
         if stats['total_decided'] > 0:
             c1, c2, c3, c4 = st.columns(4)
@@ -5505,6 +6393,69 @@ def main():
             c2.metric("Record", f"{stats['wins']}-{stats['losses']}")
             c3.metric("P/L", f"₱{stats['total_profit']:+,.0f}")
             c4.metric("Pending", stats['pending'])
+            
+            # =========================================================================
+            # EQUITY CURVE - Cumulative Profit Chart
+            # =========================================================================
+            decided_bets = [b for b in all_bets if b.get('result') in ['Win', 'Loss']]
+            if len(decided_bets) >= 2:
+                # Sort by date
+                decided_bets.sort(key=lambda x: x.get('date', '2024-01-01'))
+                
+                # Calculate cumulative P/L (assuming 1 unit per bet, -110 odds)
+                cumulative = []
+                running_total = 0
+                for bet in decided_bets:
+                    if bet.get('result') == 'Win':
+                        running_total += 0.91  # Win at -110 odds
+                    else:
+                        running_total -= 1.0   # Lose 1 unit
+                    cumulative.append({
+                        'Bet #': len(cumulative) + 1,
+                        'Date': bet.get('date', '')[:10] if bet.get('date') else '',
+                        'Player': bet.get('player', '')[:15],
+                        'P/L': running_total
+                    })
+                
+                equity_df = pd.DataFrame(cumulative)
+                
+                # Create the chart
+                with st.expander("📈 Equity Curve", expanded=True):
+                    # Use matplotlib for a clean line chart
+                    fig, ax = plt.subplots(figsize=(10, 3))
+                    
+                    # Plot the line
+                    ax.plot(equity_df['Bet #'], equity_df['P/L'], linewidth=2.5, color='#00c853' if running_total >= 0 else '#f44336')
+                    ax.fill_between(equity_df['Bet #'], 0, equity_df['P/L'], 
+                                   where=(equity_df['P/L'] >= 0), alpha=0.3, color='#00c853', interpolate=True)
+                    ax.fill_between(equity_df['Bet #'], 0, equity_df['P/L'], 
+                                   where=(equity_df['P/L'] < 0), alpha=0.3, color='#f44336', interpolate=True)
+                    
+                    # Styling
+                    ax.axhline(y=0, color='white', linestyle='--', linewidth=0.8, alpha=0.5)
+                    ax.set_xlabel('Bet #', fontsize=10)
+                    ax.set_ylabel('Units', fontsize=10)
+                    ax.set_title(f'Cumulative P/L: {running_total:+.2f}u ({stats["wins"]}-{stats["losses"]})', fontsize=12, fontweight='bold')
+                    ax.grid(True, alpha=0.2)
+                    ax.spines['top'].set_visible(False)
+                    ax.spines['right'].set_visible(False)
+                    
+                    # Set y-axis limits with padding
+                    y_max = max(abs(equity_df['P/L'].min()), abs(equity_df['P/L'].max())) * 1.2
+                    ax.set_ylim(-max(y_max, 1), max(y_max, 1))
+                    
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+                    
+                    # Quick stats below chart
+                    eq_c1, eq_c2, eq_c3 = st.columns(3)
+                    peak = equity_df['P/L'].max()
+                    trough = equity_df['P/L'].min()
+                    max_dd = peak - trough if peak > trough else 0
+                    eq_c1.metric("Peak", f"+{peak:.2f}u" if peak > 0 else f"{peak:.2f}u")
+                    eq_c2.metric("Trough", f"{trough:.2f}u")
+                    eq_c3.metric("Max Drawdown", f"{max_dd:.2f}u")
             
             # Score Box Summary (if we have margin data)
             if stats.get('margin_count', 0) > 0:
@@ -5561,11 +6512,21 @@ def main():
         
         st.divider()
         
-        all_bets = tracker.get_bets()
         if all_bets: 
-            filter_opts = ["Pending", "Win", "Loss", "Push"]
-            selected_filters = st.multiselect("Filter by Result:", options=filter_opts, default=["Pending", "Win", "Loss"])
-            filtered_bets = [b for b in all_bets if b.get('result', 'Pending') in selected_filters]
+            # Tag filter for training data purification
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                filter_opts = ["Pending", "Win", "Loss", "Push"]
+                selected_filters = st.multiselect("Filter by Result:", options=filter_opts, default=["Pending", "Win", "Loss"])
+            with filter_col2:
+                tag_opts = list(set(b.get('tag', 'legacy') for b in all_bets))
+                tag_opts.sort()
+                selected_tags = st.multiselect("Filter by Tag:", options=tag_opts, default=tag_opts,
+                                              help="Filter training data: 'Sniper' = disciplined bets only")
+            
+            filtered_bets = [b for b in all_bets 
+                            if b.get('result', 'Pending') in selected_filters 
+                            and b.get('tag', 'legacy') in selected_tags]
             
             sort_map = {'Pending': 1, 'Win': 2, 'Loss': 3, 'Push': 4}
             filtered_bets.sort(key=lambda x: (sort_map.get(x.get('result', 'Pending'), 99), -x.get('id', 0)))
@@ -5576,12 +6537,14 @@ def main():
             for bet in filtered_bets:
                 with st.container(border=True):
                     bet_res = bet.get('result', 'Pending')
+                    bet_tag = bet.get('tag', 'legacy')
+                    tag_emoji = {'Sniper': '🎯', 'Robot_Top_Pick': '🤖', 'Gut_Feel': '🎲', 'Live_Bet': '⚡'}.get(bet_tag, '📋')
                     icon = {"Win": "✅", "Loss": "❌", "Push": "🔄"}.get(bet_res, "⏳")
                     color = {"Win": "green", "Loss": "red", "Push": "blue"}.get(bet_res, "gray")
                     
-                    # Compact header line
-                    st.markdown(f"{icon} :{color}[**{bet['player']}**] {bet['side']} {bet['line']} ({bet['market']})")
-                    st.caption(f"vs {bet.get('opponent')} | Proj: {bet.get('proj', 0):.1f} | EV: {bet.get('ev', 0):+.1%} | {bet.get('date', 'N/A')}")
+                    # Compact header line with tag
+                    st.markdown(f"{icon} {tag_emoji} :{color}[**{bet['player']}**] {bet['side']} {bet['line']} ({bet['market']})")
+                    st.caption(f"vs {bet.get('opponent')} | Proj: {bet.get('proj', 0):.1f} | EV: {bet.get('ev', 0):+.1%} | {bet.get('date', 'N/A')} | Tag: {bet_tag}")
                     
                     # Column labels row
                     lbl1, lbl2, lbl3, lbl4 = st.columns([1.5, 1.5, 1.5, 0.5])
@@ -5630,6 +6593,7 @@ def main():
                     # Show score box info if available
                     if bet.get('margin') is not None:
                         margin = bet['margin']
+                        margin_pct = bet.get('margin_pct', 0)
                         quality = bet.get('result_quality', 'unknown')
                         quality_emoji = {
                             'bad_beat': '💔', 'close_loss': '😤', 'clear_loss': '📉', 'bad_read': '🚫',
@@ -5637,7 +6601,8 @@ def main():
                             'push': '🔄'
                         }.get(quality, '❓')
                         margin_color = 'green' if margin > 0 else ('red' if margin < 0 else 'gray')
-                        st.caption(f"{quality_emoji} :{margin_color}[Margin: {margin:+.1f}] | Quality: {quality.replace('_', ' ').title()}")
+                        # Show both raw margin and percentage (standardized across stat types)
+                        st.caption(f"{quality_emoji} :{margin_color}[Margin: {margin:+.1f} ({margin_pct:+.1f}%)] | Quality: {quality.replace('_', ' ').title()}")
         else:
             st.info("No bets tracked yet. Run an analysis and click 'Track' to save a bet.")
     
