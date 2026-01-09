@@ -6,3 +6,5 @@ matplotlib
 joblib
 scikit-learn
 xgboost
+requests
+beautifulsoup4

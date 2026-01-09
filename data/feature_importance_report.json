@@ -1,0 +1,1011 @@
+{
+  "generated_at": "2026-01-09T10:55:30.967788",
+  "version": "v18",
+  "total_samples": 270640,
+  "temporal_validation": {
+    "train_accuracy": 0.6367,
+    "test_accuracy": 0.6373,
+    "test_precision": 0.6397,
+    "test_auc": 0.6881,
+    "test_brier": 0.2234,
+    "overfit_ratio": 0.999,
+    "train_period": "2024-10-31 to 2025-11-29",
+    "test_period": "2025-11-29 to 2026-01-07",
+    "train_samples": 216512,
+    "test_samples": 54128
+  },
+  "market_groups": {
+    "scoring": {
+      "market_group": "scoring",
+      "total_features": 40,
+      "important_features": [
+        {
+          "feature": "feat_clv",
+          "importance": 0.1138
+        },
+        {
+          "feature": "feat_trend",
+          "importance": 0.0468
+        },
+        {
+          "feature": "feat_sma_10",
+          "importance": 0.0392
+        },
+        {
+          "feature": "feat_rest_factor",
+          "importance": 0.0386
+        },
+        {
+          "feature": "feat_dynamic_std_mult",
+          "importance": 0.0377
+        },
+        {
+          "feature": "feat_hit_l10",
+          "importance": 0.0373
+        },
+        {
+          "feature": "feat_sma_5",
+          "importance": 0.0357
+        },
+        {
+          "feature": "feat_days_rest",
+          "importance": 0.0342
+        },
+        {
+          "feature": "feat_coef_variation",
+          "importance": 0.0329
+        },
+        {
+          "feature": "feat_is_b2b",
+          "importance": 0.0324
+        },
+        {
+          "feature": "feat_mins_trend",
+          "importance": 0.0309
+        },
+        {
+          "feature": "feat_ema",
+          "importance": 0.0307
+        },
+        {
+          "feature": "feat_split_factor",
+          "importance": 0.0305
+        },
+        {
+          "feature": "feat_std",
+          "importance": 0.0298
+        },
+        {
+          "feature": "feat_avg_minutes",
+          "importance": 0.0294
+        },
+        {
+          "feature": "feat_hit_l5",
+          "importance": 0.0282
+        },
+        {
+          "feature": "feat_personal_fatigue_factor",
+          "importance": 0.0267
+        },
+        {
+          "feature": "feat_opp_drtg_season",
+          "importance": 0.0262
+        },
+        {
+          "feature": "feat_base_matchup_mult",
+          "importance": 0.0262
+        },
+        {
+          "feature": "feat_combined_matchup_mult",
+          "importance": 0.0256
+        },
+        {
+          "feature": "feat_spread",
+          "importance": 0.0253
+        },
+        {
+          "feature": "feat_game_total",
+          "importance": 0.0244
+        },
+        {
+          "feature": "feat_games_played",
+          "importance": 0.0241
+        },
+        {
+          "feature": "feat_hit_season",
+          "importance": 0.0237
+        },
+        {
+          "feature": "feat_pace_mult",
+          "importance": 0.0234
+        },
+        {
+          "feature": "feat_position_mult",
+          "importance": 0.0234
+        },
+        {
+          "feature": "feat_def_mult",
+          "importance": 0.0229
+        },
+        {
+          "feature": "feat_blowout_prob",
+          "importance": 0.0226
+        },
+        {
+          "feature": "feat_b2b_games_in_sample",
+          "importance": 0.0201
+        },
+        {
+          "feature": "feat_blowout_factor",
+          "importance": 0.0196
+        },
+        {
+          "feature": "feat_hit_l15",
+          "importance": 0.0196
+        },
+        {
+          "feature": "feat_is_home",
+          "importance": 0.0182
+        }
+      ],
+      "prunable_features": [
+        {
+          "feature": "feat_usage_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_opp_drtg_l5",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_odds_decimal",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_usg_season",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_scoring",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_counting",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_combo",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_rare",
+          "importance": 0.0
+        }
+      ],
+      "top_10": [
+        "feat_clv",
+        "feat_trend",
+        "feat_sma_10",
+        "feat_rest_factor",
+        "feat_dynamic_std_mult",
+        "feat_hit_l10",
+        "feat_sma_5",
+        "feat_days_rest",
+        "feat_coef_variation",
+        "feat_is_b2b"
+      ]
+    },
+    "counting": {
+      "market_group": "counting",
+      "total_features": 40,
+      "important_features": [
+        {
+          "feature": "feat_clv",
+          "importance": 0.1537
+        },
+        {
+          "feature": "feat_trend",
+          "importance": 0.0804
+        },
+        {
+          "feature": "feat_hit_l5",
+          "importance": 0.079
+        },
+        {
+          "feature": "feat_hit_season",
+          "importance": 0.0511
+        },
+        {
+          "feature": "feat_std",
+          "importance": 0.0466
+        },
+        {
+          "feature": "feat_avg_minutes",
+          "importance": 0.0413
+        },
+        {
+          "feature": "feat_sma_5",
+          "importance": 0.0392
+        },
+        {
+          "feature": "feat_mins_trend",
+          "importance": 0.037
+        },
+        {
+          "feature": "feat_sma_10",
+          "importance": 0.0346
+        },
+        {
+          "feature": "feat_ema",
+          "importance": 0.0345
+        },
+        {
+          "feature": "feat_rest_factor",
+          "importance": 0.034
+        },
+        {
+          "feature": "feat_hit_l10",
+          "importance": 0.0294
+        },
+        {
+          "feature": "feat_dynamic_std_mult",
+          "importance": 0.0276
+        },
+        {
+          "feature": "feat_personal_fatigue_factor",
+          "importance": 0.0262
+        },
+        {
+          "feature": "feat_days_rest",
+          "importance": 0.0253
+        },
+        {
+          "feature": "feat_games_played",
+          "importance": 0.0252
+        },
+        {
+          "feature": "feat_split_factor",
+          "importance": 0.0248
+        },
+        {
+          "feature": "feat_game_total",
+          "importance": 0.0229
+        },
+        {
+          "feature": "feat_combined_matchup_mult",
+          "importance": 0.0212
+        },
+        {
+          "feature": "feat_base_matchup_mult",
+          "importance": 0.0203
+        },
+        {
+          "feature": "feat_is_b2b",
+          "importance": 0.0199
+        },
+        {
+          "feature": "feat_hit_l15",
+          "importance": 0.0198
+        },
+        {
+          "feature": "feat_pace_mult",
+          "importance": 0.0175
+        },
+        {
+          "feature": "feat_b2b_games_in_sample",
+          "importance": 0.0164
+        },
+        {
+          "feature": "feat_spread",
+          "importance": 0.016
+        },
+        {
+          "feature": "feat_coef_variation",
+          "importance": 0.0151
+        },
+        {
+          "feature": "feat_position_mult",
+          "importance": 0.0143
+        },
+        {
+          "feature": "feat_def_mult",
+          "importance": 0.0139
+        },
+        {
+          "feature": "feat_blowout_prob",
+          "importance": 0.0128
+        }
+      ],
+      "prunable_features": [
+        {
+          "feature": "feat_blowout_factor",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_usage_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_is_home",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_opp_drtg_season",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_opp_drtg_l5",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_odds_decimal",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_usg_season",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_scoring",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_counting",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_combo",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_rare",
+          "importance": 0.0
+        }
+      ],
+      "top_10": [
+        "feat_clv",
+        "feat_trend",
+        "feat_hit_l5",
+        "feat_hit_season",
+        "feat_std",
+        "feat_avg_minutes",
+        "feat_sma_5",
+        "feat_mins_trend",
+        "feat_sma_10",
+        "feat_ema"
+      ]
+    },
+    "combo": {
+      "market_group": "combo",
+      "total_features": 40,
+      "important_features": [
+        {
+          "feature": "feat_clv",
+          "importance": 0.1653
+        },
+        {
+          "feature": "feat_coef_variation",
+          "importance": 0.059
+        },
+        {
+          "feature": "feat_hit_l5",
+          "importance": 0.05
+        },
+        {
+          "feature": "feat_mins_trend",
+          "importance": 0.05
+        },
+        {
+          "feature": "feat_trend",
+          "importance": 0.0489
+        },
+        {
+          "feature": "feat_sma_10",
+          "importance": 0.0426
+        },
+        {
+          "feature": "feat_avg_minutes",
+          "importance": 0.0425
+        },
+        {
+          "feature": "feat_sma_5",
+          "importance": 0.0394
+        },
+        {
+          "feature": "feat_std",
+          "importance": 0.0385
+        },
+        {
+          "feature": "feat_is_b2b",
+          "importance": 0.0384
+        },
+        {
+          "feature": "feat_dynamic_std_mult",
+          "importance": 0.036
+        },
+        {
+          "feature": "feat_rest_factor",
+          "importance": 0.0343
+        },
+        {
+          "feature": "feat_days_rest",
+          "importance": 0.0297
+        },
+        {
+          "feature": "feat_position_mult",
+          "importance": 0.0288
+        },
+        {
+          "feature": "feat_ema",
+          "importance": 0.0277
+        },
+        {
+          "feature": "feat_hit_season",
+          "importance": 0.0259
+        },
+        {
+          "feature": "feat_base_matchup_mult",
+          "importance": 0.0242
+        },
+        {
+          "feature": "feat_hit_l10",
+          "importance": 0.0235
+        },
+        {
+          "feature": "feat_combined_matchup_mult",
+          "importance": 0.0232
+        },
+        {
+          "feature": "feat_split_factor",
+          "importance": 0.023
+        },
+        {
+          "feature": "feat_game_total",
+          "importance": 0.0224
+        },
+        {
+          "feature": "feat_hit_l15",
+          "importance": 0.022
+        },
+        {
+          "feature": "feat_personal_fatigue_factor",
+          "importance": 0.0204
+        },
+        {
+          "feature": "feat_def_mult",
+          "importance": 0.0177
+        },
+        {
+          "feature": "feat_blowout_prob",
+          "importance": 0.0152
+        },
+        {
+          "feature": "feat_games_played",
+          "importance": 0.0137
+        },
+        {
+          "feature": "feat_pace_mult",
+          "importance": 0.0136
+        },
+        {
+          "feature": "feat_b2b_games_in_sample",
+          "importance": 0.0135
+        },
+        {
+          "feature": "feat_spread",
+          "importance": 0.0105
+        }
+      ],
+      "prunable_features": [
+        {
+          "feature": "feat_blowout_factor",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_usage_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_is_home",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_opp_drtg_season",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_opp_drtg_l5",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_odds_decimal",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_usg_season",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_scoring",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_counting",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_combo",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_rare",
+          "importance": 0.0
+        }
+      ],
+      "top_10": [
+        "feat_clv",
+        "feat_coef_variation",
+        "feat_hit_l5",
+        "feat_mins_trend",
+        "feat_trend",
+        "feat_sma_10",
+        "feat_avg_minutes",
+        "feat_sma_5",
+        "feat_std",
+        "feat_is_b2b"
+      ]
+    },
+    "rare": {
+      "market_group": "rare",
+      "total_features": 40,
+      "important_features": [
+        {
+          "feature": "feat_std",
+          "importance": 0.1731
+        },
+        {
+          "feature": "feat_sma_10",
+          "importance": 0.1519
+        },
+        {
+          "feature": "feat_clv",
+          "importance": 0.1492
+        },
+        {
+          "feature": "feat_coef_variation",
+          "importance": 0.1202
+        },
+        {
+          "feature": "feat_ema",
+          "importance": 0.1115
+        },
+        {
+          "feature": "feat_hit_l15",
+          "importance": 0.108
+        },
+        {
+          "feature": "feat_avg_minutes",
+          "importance": 0.0665
+        },
+        {
+          "feature": "feat_trend",
+          "importance": 0.0551
+        },
+        {
+          "feature": "feat_hit_season",
+          "importance": 0.0399
+        },
+        {
+          "feature": "feat_blowout_prob",
+          "importance": 0.0246
+        }
+      ],
+      "prunable_features": [
+        {
+          "feature": "feat_sma_5",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_mins_trend",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_hit_l5",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_hit_l10",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_pace_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_def_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_position_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_base_matchup_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_combined_matchup_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_split_factor",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_rest_factor",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_blowout_factor",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_usage_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_is_home",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_is_b2b",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_spread",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_games_played",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_days_rest",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_game_total",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_opp_drtg_season",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_opp_drtg_l5",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_personal_fatigue_factor",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_b2b_games_in_sample",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_dynamic_std_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_odds_decimal",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_usg_season",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_scoring",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_counting",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_combo",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_rare",
+          "importance": 0.0
+        }
+      ],
+      "top_10": [
+        "feat_std",
+        "feat_sma_10",
+        "feat_clv",
+        "feat_coef_variation",
+        "feat_ema",
+        "feat_hit_l15",
+        "feat_avg_minutes",
+        "feat_trend",
+        "feat_hit_season",
+        "feat_blowout_prob"
+      ]
+    },
+    "universal": {
+      "market_group": "universal",
+      "total_features": 40,
+      "important_features": [
+        {
+          "feature": "feat_market_combo",
+          "importance": 0.1464
+        },
+        {
+          "feature": "feat_clv",
+          "importance": 0.115
+        },
+        {
+          "feature": "feat_std",
+          "importance": 0.1117
+        },
+        {
+          "feature": "feat_coef_variation",
+          "importance": 0.0642
+        },
+        {
+          "feature": "feat_trend",
+          "importance": 0.0526
+        },
+        {
+          "feature": "feat_market_rare",
+          "importance": 0.0464
+        },
+        {
+          "feature": "feat_ema",
+          "importance": 0.0455
+        },
+        {
+          "feature": "feat_hit_l15",
+          "importance": 0.0449
+        },
+        {
+          "feature": "feat_avg_minutes",
+          "importance": 0.0436
+        },
+        {
+          "feature": "feat_sma_10",
+          "importance": 0.0365
+        },
+        {
+          "feature": "feat_mins_trend",
+          "importance": 0.0338
+        },
+        {
+          "feature": "feat_sma_5",
+          "importance": 0.0334
+        },
+        {
+          "feature": "feat_hit_season",
+          "importance": 0.033
+        },
+        {
+          "feature": "feat_market_counting",
+          "importance": 0.028
+        },
+        {
+          "feature": "feat_dynamic_std_mult",
+          "importance": 0.028
+        },
+        {
+          "feature": "feat_hit_l5",
+          "importance": 0.0277
+        },
+        {
+          "feature": "feat_blowout_prob",
+          "importance": 0.0208
+        },
+        {
+          "feature": "feat_days_rest",
+          "importance": 0.0199
+        },
+        {
+          "feature": "feat_split_factor",
+          "importance": 0.0129
+        },
+        {
+          "feature": "feat_hit_l10",
+          "importance": 0.0124
+        }
+      ],
+      "prunable_features": [
+        {
+          "feature": "feat_personal_fatigue_factor",
+          "importance": 0.0095
+        },
+        {
+          "feature": "feat_rest_factor",
+          "importance": 0.0091
+        },
+        {
+          "feature": "feat_game_total",
+          "importance": 0.009
+        },
+        {
+          "feature": "feat_games_played",
+          "importance": 0.0082
+        },
+        {
+          "feature": "feat_combined_matchup_mult",
+          "importance": 0.0074
+        },
+        {
+          "feature": "feat_pace_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_def_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_position_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_base_matchup_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_blowout_factor",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_usage_mult",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_is_home",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_is_b2b",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_spread",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_opp_drtg_season",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_opp_drtg_l5",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_b2b_games_in_sample",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_odds_decimal",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_usg_season",
+          "importance": 0.0
+        },
+        {
+          "feature": "feat_market_scoring",
+          "importance": 0.0
+        }
+      ],
+      "top_10": [
+        "feat_market_combo",
+        "feat_clv",
+        "feat_std",
+        "feat_coef_variation",
+        "feat_trend",
+        "feat_market_rare",
+        "feat_ema",
+        "feat_hit_l15",
+        "feat_avg_minutes",
+        "feat_sma_10"
+      ]
+    }
+  },
+  "model_performance": {
+    "scoring": {
+      "market_group": "scoring",
+      "dataset_size": 27064,
+      "accuracy": 0.631,
+      "precision": 0.6268,
+      "recall": 0.7766,
+      "f1_score": 0.6937,
+      "auc_roc": 0.6779,
+      "calibration": {
+        "brier_raw": 0.2236,
+        "brier_calibrated": 0.2237,
+        "brier_improvement": -0.0,
+        "log_loss_raw": 0.6376,
+        "log_loss_calibrated": 0.6407,
+        "calibration_error_raw": 0.0455,
+        "calibration_error_calibrated": 0.0434
+      }
+    },
+    "counting": {
+      "market_group": "counting",
+      "dataset_size": 54128,
+      "accuracy": 0.6352,
+      "precision": 0.6628,
+      "recall": 0.5068,
+      "f1_score": 0.5744,
+      "auc_roc": 0.6917,
+      "calibration": {
+        "brier_raw": 0.2215,
+        "brier_calibrated": 0.2211,
+        "brier_improvement": 0.2,
+        "log_loss_raw": 0.6326,
+        "log_loss_calibrated": 0.6312,
+        "calibration_error_raw": 0.0416,
+        "calibration_error_calibrated": 0.0219
+      }
+    },
+    "combo": {
+      "market_group": "combo",
+      "dataset_size": 108256,
+      "accuracy": 0.6037,
+      "precision": 0.6028,
+      "recall": 0.7837,
+      "f1_score": 0.6814,
+      "auc_roc": 0.6352,
+      "calibration": {
+        "brier_raw": 0.2333,
+        "brier_calibrated": 0.2333,
+        "brier_improvement": 0.0,
+        "log_loss_raw": 0.6585,
+        "log_loss_calibrated": 0.6582,
+        "calibration_error_raw": 0.0272,
+        "calibration_error_calibrated": 0.0171
+      }
+    },
+    "rare": {
+      "market_group": "rare",
+      "dataset_size": 81192,
+      "accuracy": 0.6786,
+      "precision": 0.6916,
+      "recall": 0.6331,
+      "f1_score": 0.6611,
+      "auc_roc": 0.7344,
+      "calibration": {
+        "brier_raw": 0.2122,
+        "brier_calibrated": 0.2065,
+        "brier_improvement": 2.7,
+        "log_loss_raw": 0.6136,
+        "log_loss_calibrated": 0.6011,
+        "calibration_error_raw": 0.0677,
+        "calibration_error_calibrated": 0.0219
+      }
+    },
+    "universal": {
+      "market_group": "universal",
+      "dataset_size": 270640,
+      "accuracy": 0.6347,
+      "precision": 0.6344,
+      "recall": 0.6887,
+      "f1_score": 0.6604,
+      "auc_roc": 0.686,
+      "calibration": {
+        "brier_raw": 0.224,
+        "brier_calibrated": 0.223,
+        "brier_improvement": 0.5,
+        "log_loss_raw": 0.6383,
+        "log_loss_calibrated": 0.6358,
+        "calibration_error_raw": 0.0379,
+        "calibration_error_calibrated": 0.0127
+      }
+    }
+  }
+}
