@@ -24,3 +24,18 @@ ml_training_data.csv
 # Logs
 *.log
 data/ml_training_data.csv
+
+# Model artifacts
+*.pkl
+
+# Ignore everything in data/ (generated files), but keep the training script
+/data/*
+!/data/train_model_v20.py
+
+# Legacy/temporary folders
+models_legacy_*/
+g(old)/
+
+# Temporary files
+*.tmp
+*.bak
