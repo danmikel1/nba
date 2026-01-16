@@ -3566,12 +3566,12 @@ _worker_bulk_loader = None
 _worker_team_stats = None
 _worker_config = None
 
-def _init_worker(bulk_cache_dict, team_stats_dict, config_obj):
+def _init_worker(bulk_cache_dict, team_stats_dict, opponent_stats_dict, config_obj):
     """
     Initialize worker process with shared data ONE TIME.
     This eliminates overhead of sending data for every task.
     """
-    global _worker_bulk_loader, _worker_team_stats, _worker_config
+    global _worker_bulk_loader, _worker_team_stats, _worker_opponent_stats, _worker_config
     
     # 1. Store Config
     _worker_config = config_obj
@@ -3617,6 +3617,17 @@ def _init_worker(bulk_cache_dict, team_stats_dict, config_obj):
             df = pd.DataFrame()
         _worker_team_stats[season] = (df, avg_pace, avg_def)
 
+    # 5. Reconstruct Opponent Stats
+    _worker_opponent_stats = {}
+    for season, records in opponent_stats_dict.items():
+        if records:
+            df = pd.DataFrame(records)
+            if 'TEAM_ID' in df.columns:
+                df = df.set_index('TEAM_ID')
+            _worker_opponent_stats[season] = df
+        else:
+            _worker_opponent_stats[season] = pd.DataFrame()
+
 
 def _backtest_worker_task(args: Tuple) -> Optional[pd.DataFrame]:
     """
@@ -3630,7 +3641,7 @@ def _backtest_worker_task(args: Tuple) -> Optional[pd.DataFrame]:
      player_df_dict, player_position, task_idx, total_tasks) = args
     
     # Access shared global data
-    global _worker_bulk_loader, _worker_team_stats, _worker_config
+    global _worker_bulk_loader, _worker_team_stats, _worker_opponent_stats, _worker_config
     
     worker_id = os.getpid()
     
@@ -3667,6 +3678,7 @@ def _backtest_worker_task(args: Tuple) -> Optional[pd.DataFrame]:
             preloaded_df=player_df,
             bulk_loader=_worker_bulk_loader,  # Use the globally cached loader
             preloaded_team_stats_by_season=_worker_team_stats, # Use globally cached stats
+            preloaded_opponent_stats_by_season=_worker_opponent_stats, # Use globally cached opponent stats
             preloaded_position=player_position
         )
         
