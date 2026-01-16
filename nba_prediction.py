@@ -2689,6 +2689,12 @@ class Backtester:
                     if not opponent_stats.empty and 'TEAM_ID' in opponent_stats.columns:
                         opponent_stats = opponent_stats.set_index('TEAM_ID')
                     self._opponent_stats_cache[game_season] = opponent_stats
+
+            # FIX 3: ENSURE INT INDEX IN LOOP
+            if opponent_stats is not None and not opponent_stats.empty:
+                if opponent_stats.index.dtype != 'int64' and opponent_stats.index.dtype != 'int32':
+                     opponent_stats.index = opponent_stats.index.astype(int)
+
             except Exception:
                 opponent_stats = None
 
@@ -3631,6 +3637,7 @@ def _init_worker(bulk_cache_dict, team_stats_dict, opponent_stats_dict, config_o
             df = pd.DataFrame(records)
             if 'TEAM_ID' in df.columns:
                 df = df.set_index('TEAM_ID')
+                df.index = df.index.astype(int)  # FIX 1: Force int index
             _worker_opponent_stats[season] = df
         else:
             _worker_opponent_stats[season] = pd.DataFrame()
@@ -3661,6 +3668,12 @@ def _backtest_worker_task(args: Tuple) -> Optional[pd.DataFrame]:
         if 'GAME_DATE' in player_df.columns:
             player_df['GAME_DATE'] = pd.to_datetime(player_df['GAME_DATE'])
         
+        # FIX 2: FORCE NUMERICS FOR USAGE CALC
+        usage_cols = ['FGA', 'FTA', 'TOV', 'MIN_FLOAT', 'PTS']
+        for col in usage_cols:
+            if col in player_df.columns:
+                player_df[col] = pd.to_numeric(player_df[col], errors='coerce').fillna(0.0)
+
         # Create fresh instances for this worker using cached config
         data_loader = DataLoader(_worker_config)
         feature_engineer = FeatureEngineer(_worker_config)
