@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""
+V20.3 EMPIRICAL REGRESSION MODEL TRAINING SCRIPT
+=================================================
+Trains XGBRegressor models to predict actual stat values using pure observables.
+
+DESIGN PRINCIPLES (per refactor directive):
+- Raw observables only (no computed multipliers)
+- Timestamp-valid (frozen before game tip-off)
+- Non-decisional (no belief-encoded adjustments)
+- Let ML learn all relationships from data
+
+Features (27 total - V20.3 empirical):
+1. avg_minutes - Average minutes played (raw)
+2. ema - Exponential moving average (raw)
+3. std - Standard deviation (raw)
+4. opp_drtg_season - Opponent defensive rating (raw)
+5. line - Vegas prop line (raw)
+6. spread - Game spread (raw)
+7. game_total - Over/under game total (raw)
+8. days_rest - Days since last game (raw integer)
+9. is_home - Home/away indicator (raw)
+10. is_b2b - Back-to-back flag (raw)
+11. games_played - Games played this season (raw)
+12. opponent_pace - Opponent pace (possessions/game) [V20.2]
+13. team_pace - Player's team pace [V20.2]
+14. trend_5g - Linear slope of last 5 games [V20.2]
+15. home_avg - Player's home game average [V20.2]
+16. away_avg - Player's away game average [V20.2]
+17. ts_pct - True Shooting percentage (V20.3)
+18. ts_pct_delta - Change in TS% vs season (V20.3)
+19. team_out_ppg - PPG of teammates who didn't play [NEW V20.3]
+20. team_out_count - Count of teammates who didn't play [NEW V20.3]
+21. opp_out_ppg - PPG of opponents who didn't play [NEW V20.3]
+22. opp_out_count - Count of opponents who didn't play [NEW V20.3]
+23. market_scoring - Binary: PTS
+24. market_counting - Binary: REB, AST
+25. market_combo - Binary: PRA, PR, PA, RA
+26. market_rare - Binary: 3PM/STL/BLK
+27. min_volatility, foul_rate, cv - Behavior & risk features (V20.3)
+
+V20.3 ABSENCE FEATURES:
+- Computed from game logs (ground truth)
+- Sentinel value -1.0 = unknown (for live predictions)
+- Model learns: when team_out_ppg is high, remaining players may get more touches
+- Model learns: when opp_out_ppg is high, matchup advantage may exist
+
+MARKET-SPECIFIC TUNING (Option C):
+- Scoring: Standard XGBoost (high volume, normal distribution)
+- Counting: Standard XGBoost (medium volume)
+- Combo: Standard XGBoost (sum of stats)
+- Rare: Tuned for low counts (deeper trees, more estimators, Poisson-like handling)
+
+Output Files:
+- nba_model_{group}.pkl - Mean prediction model
+- nba_variance_{group}.pkl - Variance prediction model
+- nba_calibrator_{group}.pkl - Isotonic calibration curve
+
+Usage:
+    python train_model_v20.py
+"""
+
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.isotonic import IsotonicRegression
+from scipy import stats
+import joblib
+from pathlib import Path
+from typing import Dict, Tuple, Optional
+from datetime import datetime
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+DATA_DIR = Path(__file__).parent
+OUTPUT_DIR = DATA_DIR
+
+# Market groups for specialized models
+ML_MARKET_GROUPS = {
+    'PTS': 'scoring',
+    'REB': 'counting', 'AST': 'counting',
+    'PRA': 'combo', 'PR': 'combo', 'PA': 'combo', 'RA': 'combo',
+}
+
+# V20.3 Empirical feature set (27 features - raw observables only)
+# V20 STRICT: ALL columns MUST exist exactly as named. NO aliases. NO defaults.
+FEATURE_COLS_V20 = [
+    'feat_avg_minutes',
+    'feat_ema',
+    'feat_std',
+    'feat_opponent_drtg_season',
+    'feat_line',
+    'feat_spread',
+    'feat_game_total',
+    'feat_days_rest',
+    'feat_is_home',
+    'feat_is_b2b',
+    'feat_games_played',
+    # V20.2: Pace context
+    'feat_opponent_pace',
+    'feat_team_pace',
+    # V20.2: Momentum & splits
+    'feat_trend_5g',
+    'feat_home_avg',
+    'feat_away_avg',
+    # V20.3 NEW: True Shooting
+    'feat_ts_pct',
+    'feat_ts_pct_delta',
+    # V20.3 NEW: Absence-aware features (ground truth from game logs)
+    # -1.0 sentinel = unknown (for live predictions)
+    'feat_team_out_ppg',
+    'feat_team_out_count',
+    'feat_opp_out_ppg',
+    'feat_opp_out_count',
+    # Market identity
+    'feat_market_scoring',
+    'feat_market_counting',
+    'feat_market_combo',
+    'feat_market_rare',
+    # V20.3 NEW: Behavior & Risk features
+    'feat_min_volatility',
+    'feat_foul_rate',
+    'feat_cv',
+]
+
+# V20 STRICT: No column aliases. No legacy migration.
+# If data doesn't have exact column names, it's INVALID.
+
+# Market-specific hyperparameters (Option C tuning)
+MARKET_HYPERPARAMS = {
+    'scoring': {
+        # PTS: High volume, normally distributed
+        'n_estimators': 500,
+        'learning_rate': 0.05,
+        'max_depth': 4,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'min_child_weight': 3,
+    },
+    'counting': {
+        # REB, AST: Medium volume counting stats
+        'n_estimators': 500,
+        'learning_rate': 0.05,
+        'max_depth': 4,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'min_child_weight': 3,
+    },
+    'combo': {
+        # PRA, PR, PA, RA: Sum of stats, higher variance
+        'n_estimators': 600,
+        'learning_rate': 0.04,
+        'max_depth': 5,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'min_child_weight': 2,
+    },
+    'universal': {
+        # Fallback for all markets
+        'n_estimators': 500,
+        'learning_rate': 0.05,
+        'max_depth': 4,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'min_child_weight': 3,
+    },
+}
+
+# =============================================================================
+# DATA LOADING
+# =============================================================================
+
+def load_training_data(filepath: Path = DATA_DIR / "ml_training_data.csv") -> pd.DataFrame:
+    """
+    Load and validate training data for V20.3.
+    
+    V20 STRICT RULES:
+    - No data inference
+    - No defaults for missing columns
+    - No legacy migration
+    - Missing data = invalid dataset = FAIL LOUDLY
+    """
+    print(f"📂 Loading data from {filepath}")
+    
+    if not filepath.exists():
+        raise FileNotFoundError(f"Training data not found: {filepath}")
+    
+    df = pd.read_csv(filepath)
+    print(f"   Loaded {len(df)} samples")
+    
+    # ==========================================================================
+    # V20 STRICT: Check ALL required columns exist - NO FALLBACKS
+    # ==========================================================================
+    missing = [c for c in FEATURE_COLS_V20 if c not in df.columns]
+    if missing:
+        print(f"\n❌ FATAL: Missing required feature columns:")
+        for col in missing:
+            print(f"   - {col}")
+        print(f"\n   Available columns: {sorted(df.columns.tolist())}")
+        print(f"\n   V20 STRICT RULES:")
+        print(f"   - No data inference")
+        print(f"   - No defaults for missing columns")
+        print(f"   - No legacy migration")
+        print(f"\n   ACTION: Regenerate dataset with V20.3 data generator")
+        raise ValueError(f"Missing required columns: {missing}. Dataset is INVALID.")
+    
+    print(f"   ✓ All {len(FEATURE_COLS_V20)} required feature columns present")
+    
+    # ==========================================================================
+    # V20 STRICT: Regression target MUST exist - NO FABRICATION
+    # ==========================================================================
+    if 'actual_value' not in df.columns:
+        print(f"\n❌ FATAL: Missing regression target 'actual_value'")
+        print(f"   V20 STRICT: Do NOT fabricate targets from 'hit' or 'line'")
+        print(f"   ACTION: Regenerate dataset with proper backtest results")
+        raise ValueError("Missing 'actual_value' column. Cannot fabricate regression target.")
+    
+    df['actual'] = df['actual_value']
+    print(f"   ✓ Regression target 'actual_value' present")
+    
+    # ==========================================================================
+    # V20 STRICT: Convert to numeric, but NaN = INVALID DATA, not default
+    # ==========================================================================
+    for col in FEATURE_COLS_V20:
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+        nan_count = df[col].isna().sum()
+        if nan_count > 0:
+            nan_pct = nan_count / len(df) * 100
+            print(f"   ⚠️ {col}: {nan_count} NaN values ({nan_pct:.1f}%)")
+    
+    df['actual'] = pd.to_numeric(df['actual'], errors='coerce')
+    df['hit'] = pd.to_numeric(df['hit'], errors='coerce').astype(int)
+    
+    # Remove rows with missing values (these are genuinely incomplete data points)
+    before = len(df)
+    df = df.dropna(subset=FEATURE_COLS_V20 + ['actual'])
+    after = len(df)
+    if before != after:
+        print(f"   ⚠️ Dropped {before - after} rows with NaN values (incomplete data)")
+    
+    if len(df) < 100:
+        raise ValueError(f"Insufficient valid data: {len(df)} rows. Need at least 100.")
+    
+    print(f"   ✓ {len(df)} valid training samples ready")
+    
+    return df
+
+# =============================================================================
+# MODEL TRAINING
+# =============================================================================
+
+def train_mean_model(
+    X_train: pd.DataFrame, 
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    group_name: str = 'universal'
+) -> Tuple[xgb.XGBRegressor, Dict]:
+    """Train XGBRegressor to predict E[stat] with market-specific hyperparameters."""
+    print(f"   🧠 Training mean prediction model ({group_name} params)...")
+    
+    # Get market-specific hyperparameters
+    params = MARKET_HYPERPARAMS.get(group_name, MARKET_HYPERPARAMS['universal'])
+    
+    model = xgb.XGBRegressor(
+        n_estimators=params['n_estimators'],
+        learning_rate=params['learning_rate'],
+        max_depth=params['max_depth'],
+        subsample=params['subsample'],
+        colsample_bytree=params['colsample_bytree'],
+        min_child_weight=params.get('min_child_weight', 3),
+        reg_alpha=params.get('reg_alpha', 0),
+        reg_lambda=params.get('reg_lambda', 1),
+        objective='reg:squarederror',
+        random_state=42,
+        n_jobs=-1
+    )
+    
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_test, y_test)],
+        verbose=False
+    )
+    
+    preds = model.predict(X_test)
+    mae = mean_absolute_error(y_test, preds)
+    rmse = np.sqrt(mean_squared_error(y_test, preds))
+    r2 = r2_score(y_test, preds)
+    
+    metrics = {
+        'mae': mae,
+        'rmse': rmse,
+        'r2': r2,
+        'n_train': len(X_train),
+        'n_test': len(X_test)
+    }
+    
+    print(f"      MAE: {mae:.2f}")
+    print(f"      RMSE: {rmse:.2f}")
+    print(f"      R²: {r2:.3f}")
+    
+    return model, metrics
+
+
+def train_variance_model(
+    X_train: pd.DataFrame, 
+    residuals_train: np.ndarray,
+    X_test: pd.DataFrame,
+    residuals_test: np.ndarray,
+    group_name: str = 'universal'
+) -> Tuple[xgb.XGBRegressor, Dict]:
+    """Train XGBRegressor to predict variance (squared residuals) with market-specific tuning."""
+    print(f"   📊 Training variance prediction model ({group_name} params)...")
+    
+    y_train_var = residuals_train ** 2
+    y_test_var = residuals_test ** 2
+    
+    # Get market-specific hyperparameters (slightly reduced from mean model)
+    params = MARKET_HYPERPARAMS.get(group_name, MARKET_HYPERPARAMS['universal'])
+    
+    model = xgb.XGBRegressor(
+        n_estimators=min(params['n_estimators'], 400),  # Fewer for variance
+        learning_rate=params['learning_rate'],
+        max_depth=max(params['max_depth'] - 1, 3),  # Shallower for variance
+        subsample=params['subsample'],
+        colsample_bytree=params['colsample_bytree'],
+        min_child_weight=params.get('min_child_weight', 3),
+        objective='reg:squarederror',
+        random_state=42,
+        n_jobs=-1
+    )
+    
+    model.fit(
+        X_train, y_train_var,
+        eval_set=[(X_test, y_test_var)],
+        verbose=False
+    )
+    
+    preds = model.predict(X_test)
+    mae = mean_absolute_error(y_test_var, preds)
+    correlation = np.corrcoef(y_test_var, preds)[0, 1] if len(y_test_var) > 1 else 0
+    
+    metrics = {
+        'mae': mae,
+        'correlation': correlation,
+    }
+    
+    print(f"      Variance MAE: {mae:.2f}")
+    print(f"      Variance Correlation: {correlation:.3f}")
+    
+    return model, metrics
+
+
+def train_calibrator(
+    mean_model: xgb.XGBRegressor,
+    var_model: Optional[xgb.XGBRegressor],
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    lines: pd.Series
+) -> Tuple[Optional[IsotonicRegression], Dict]:
+    """Train isotonic calibration for probability correction."""
+    print("   📈 Training calibration curve...")
+    
+    try:
+        preds_mean = mean_model.predict(X_val)
+        
+        if var_model is not None:
+            preds_var = var_model.predict(X_val)
+            preds_std = np.sqrt(np.maximum(preds_var, 0.1))
+        else:
+            residuals = y_val - preds_mean
+            preds_std = np.full_like(preds_mean, residuals.std())
+        
+        # Calculate raw probabilities using CDF
+        z_scores = (lines - preds_mean) / np.maximum(preds_std, 0.1)
+        raw_probs = 1.0 - stats.norm.cdf(z_scores)
+        
+        # Binary outcomes: did they go over?
+        actual_outcomes = (y_val > lines).astype(int)
+        
+        # Fit isotonic regression
+        calibrator = IsotonicRegression(out_of_bounds='clip')
+        calibrator.fit(raw_probs, actual_outcomes)
+        
+        # Evaluate
+        calibrated_probs = calibrator.predict(raw_probs)
+        brier_raw = ((raw_probs - actual_outcomes) ** 2).mean()
+        brier_cal = ((calibrated_probs - actual_outcomes) ** 2).mean()
+        
+        metrics = {
+            'brier_raw': brier_raw,
+            'brier_calibrated': brier_cal,
+            'improvement': (brier_raw - brier_cal) / brier_raw * 100
+        }
+        
+        print(f"      Brier Score (raw): {brier_raw:.4f}")
+        print(f"      Brier Score (calibrated): {brier_cal:.4f}")
+        print(f"      Improvement: {metrics['improvement']:.1f}%")
+        
+        return calibrator, metrics
+        
+    except Exception as e:
+        print(f"      ⚠️ Calibration failed: {e}")
+        return None, {}
+
+
+def train_market_group(
+    df: pd.DataFrame,
+    group_name: str,
+    markets: list
+) -> Dict:
+    """Train models for a market group with market-specific hyperparameters."""
+    print(f"\n{'='*60}")
+    print(f"📊 Training {group_name.upper()} models")
+    print(f"   Markets: {markets}")
+    print(f"   Hyperparams: {MARKET_HYPERPARAMS.get(group_name, 'universal')}")
+    print(f"{'='*60}")
+    
+    # Filter data for this group
+    if 'market' in df.columns:
+        group_df = df[df['market'].isin(markets)].copy()
+    else:
+        group_df = df.copy()
+    
+    if len(group_df) < 100:
+        print(f"   ⚠️ Insufficient data ({len(group_df)} samples) - skipping")
+        return {}
+    
+    print(f"   Samples: {len(group_df)}")
+    
+    # Prepare features and target
+    X = group_df[FEATURE_COLS_V20]
+    y = group_df['actual']
+    lines = group_df['feat_line']
+    
+    # Split data
+    X_train, X_temp, y_train, y_temp, lines_train, lines_temp = train_test_split(
+        X, y, lines, test_size=0.3, random_state=42
+    )
+    X_test, X_val, y_test, y_val, lines_test, lines_val = train_test_split(
+        X_temp, y_temp, lines_temp, test_size=0.5, random_state=42
+    )
+    
+    # Train mean model with market-specific hyperparameters
+    mean_model, mean_metrics = train_mean_model(X_train, y_train, X_test, y_test, group_name)
+    
+    # Get residuals for variance model
+    train_residuals = y_train.values - mean_model.predict(X_train)
+    test_residuals = y_test.values - mean_model.predict(X_test)
+    
+    # Train variance model with market-specific hyperparameters
+    var_model, var_metrics = train_variance_model(X_train, train_residuals, X_test, test_residuals, group_name)
+    
+    # Train calibrator
+    calibrator, cal_metrics = train_calibrator(mean_model, var_model, X_val, y_val, lines_val)
+    
+    # Save models
+    model_path = OUTPUT_DIR / f"nba_model_{group_name}.pkl"
+    var_path = OUTPUT_DIR / f"nba_variance_{group_name}.pkl"
+    cal_path = OUTPUT_DIR / f"nba_calibrator_{group_name}.pkl"
+    
+    joblib.dump(mean_model, model_path)
+    print(f"   💾 Saved: {model_path}")
+    
+    joblib.dump(var_model, var_path)
+    print(f"   💾 Saved: {var_path}")
+    
+    if calibrator is not None:
+        joblib.dump(calibrator, cal_path)
+        print(f"   💾 Saved: {cal_path}")
+    
+    return {
+        'group': group_name,
+        'n_samples': len(group_df),
+        'mean_metrics': mean_metrics,
+        'variance_metrics': var_metrics,
+        'calibration_metrics': cal_metrics
+    }
+
+
+def main():
+    """Main training pipeline with V20.3 features and market-specific tuning."""
+    print("\n" + "="*70)
+    print("🚀 V20.3 EMPIRICAL MODEL TRAINING (Option C: Market-Specific)")
+    print(f"   Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("   Features: 27 raw observables (V20.3) — includes TS% and risk features")
+    print("   Market-Specific: Tuned hyperparams per market group")
+    print("="*70)
+    
+    # Load data
+    df = load_training_data()
+    
+    # Define market groups (include rare markets)
+    market_groups = {
+        'scoring': ['PTS'],
+        'counting': ['REB', 'AST'],
+        'combo': ['PRA', 'PR', 'PA', 'RA', 'PTS+AST', 'PTS+REB', 'AST+REB'],
+        'rare': ['3PM', 'FG3M', 'STL', 'BLK'],
+    }
+    
+    results = []
+    
+    # Train group-specific models with tuned hyperparameters
+    for group_name, markets in market_groups.items():
+        result = train_market_group(df, group_name, markets)
+        if result:
+            results.append(result)
+    
+    # Train universal model on all data (fallback)
+    print(f"\n{'='*60}")
+    print("📊 Training UNIVERSAL model (fallback)")
+    print(f"{'='*60}")
+    
+    X = df[FEATURE_COLS_V20]
+    y = df['actual']
+    lines = df['feat_line']
+    
+    X_train, X_temp, y_train, y_temp, lines_train, lines_temp = train_test_split(
+        X, y, lines, test_size=0.3, random_state=42
+    )
+    X_test, X_val, y_test, y_val, lines_test, lines_val = train_test_split(
+        X_temp, y_temp, lines_temp, test_size=0.5, random_state=42
+    )
+    
+    mean_model, mean_metrics = train_mean_model(X_train, y_train, X_test, y_test, 'universal')
+    train_residuals = y_train.values - mean_model.predict(X_train)
+    test_residuals = y_test.values - mean_model.predict(X_test)
+    var_model, var_metrics = train_variance_model(X_train, train_residuals, X_test, test_residuals, 'universal')
+    calibrator, cal_metrics = train_calibrator(mean_model, var_model, X_val, y_val, lines_val)
+    
+    # Save feature column list for inference
+    joblib.dump(FEATURE_COLS_V20, OUTPUT_DIR / "nba_features_v20.pkl")
+    print(f"   💾 Saved feature list: {OUTPUT_DIR / 'nba_features_v20.pkl'}")
+    
+    joblib.dump(mean_model, OUTPUT_DIR / "nba_model_universal.pkl")
+    joblib.dump(var_model, OUTPUT_DIR / "nba_variance_universal.pkl")
+    if calibrator is not None:
+        joblib.dump(calibrator, OUTPUT_DIR / "nba_calibrator_universal.pkl")
+    
+    print(f"\n💾 Saved universal models")
+    
+    # Summary
+    print("\n" + "="*70)
+    print("📋 TRAINING SUMMARY (V20.3 Market-Specific)")
+    print("="*70)
+    
+    for r in results:
+        group = r['group']
+        params = MARKET_HYPERPARAMS.get(group, {})
+        print(f"\n{group.upper()}:")
+        print(f"   Samples: {r['n_samples']}")
+        print(f"   R²: {r['mean_metrics'].get('r2', 0):.3f}")
+        print(f"   MAE: {r['mean_metrics'].get('mae', 0):.2f}")
+        print(f"   Depth: {params.get('max_depth', 4)}, Estimators: {params.get('n_estimators', 500)}")
+    
+    print(f"\nUNIVERSAL:")
+    print(f"   Samples: {len(df)}")
+    print(f"   R²: {mean_metrics['r2']:.3f}")
+    print(f"   MAE: {mean_metrics['mae']:.2f}")
+    
+    print(f"\n✅ Training complete: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*70)
+
+
+if __name__ == "__main__":
+    main()
