@@ -2502,6 +2502,7 @@ class Backtester:
         preloaded_df: pd.DataFrame = None,  # Optional: use pre-loaded game logs
         bulk_loader: 'BulkGameLogLoader' = None,  # V20.3: For absence feature computation
         preloaded_team_stats_by_season: Dict[str, Tuple[pd.DataFrame, float, float]] = None,  # V20.3: Per-season team stats
+        preloaded_opponent_stats_by_season: Dict[str, pd.DataFrame] = None, # V20.3: Per-season opponent stats
         preloaded_position: str = None  # V20.3: Pre-fetched player position (avoids API call in workers)
     ) -> Optional[BacktestSummary]:
         """
@@ -2571,6 +2572,12 @@ class Backtester:
         else:
             logger.debug(f"Using per-season team stats ({len(preloaded_team_stats_by_season)} seasons)")
         
+        # Initialize opponent stats cache from preloaded if available (V20.3 Optimization)
+        if preloaded_opponent_stats_by_season is not None:
+            if not hasattr(self, '_opponent_stats_cache'):
+                self._opponent_stats_cache = {}
+            self._opponent_stats_cache.update(preloaded_opponent_stats_by_season)
+
         # Sort by date
         df = df.sort_values('GAME_DATE').reset_index(drop=True)
         
@@ -3759,6 +3766,14 @@ def generate_ml_training_data(
         records = stats_df.reset_index().to_dict('records') if len(stats_df) > 0 else []
         team_stats_serialized[season] = (records, avg_pace, avg_def)
 
+    # Serialize opponent stats for init (Fix for worker crash)
+    logger.info("Pre-fetching opponent stats...")
+    opponent_stats_serialized = {}
+    for season in config.TRAINING_SEASONS:
+        opp_stats_df = data_loader.fetch_opponent_stats(season)
+        records = opp_stats_df.to_dict('records') if len(opp_stats_df) > 0 else []
+        opponent_stats_serialized[season] = records
+
     # Serialize bulk logs for init
     logger.info("📦 Serializing bulk data for workers (One-time cost)...")
     bulk_cache_serialized = {}
@@ -3815,7 +3830,7 @@ def generate_ml_training_data(
     with ProcessPoolExecutor(
         max_workers=max_workers,
         initializer=_init_worker,
-        initargs=(bulk_cache_serialized, team_stats_serialized, config)
+        initargs=(bulk_cache_serialized, team_stats_serialized, opponent_stats_serialized, config)
     ) as executor:
         
         futures = {executor.submit(_backtest_worker_task, task): task for task in tasks}
