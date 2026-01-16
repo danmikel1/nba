@@ -3871,6 +3871,7 @@ def generate_ml_training_data(
         'feat_ts_pct', 'feat_ts_pct_delta',
         'feat_team_out_ppg', 'feat_team_out_count',
         'feat_opp_out_ppg', 'feat_opp_out_count',
+        'feat_usage_rate', 'feat_opp_allowed',
         'feat_market_scoring', 'feat_market_counting', 'feat_market_combo', 'feat_market_rare',
         # V20.3 NEW: Behavior & Risk
         'feat_min_volatility', 'feat_foul_rate', 'feat_cv'
@@ -3882,6 +3883,7 @@ def generate_ml_training_data(
             if col in (
                 'feat_ts_pct', 'feat_ts_pct_delta',
                 'feat_team_out_ppg', 'feat_team_out_count', 'feat_opp_out_ppg', 'feat_opp_out_count',
+                'feat_usage_rate', 'feat_opp_allowed',
                 # V20.3: Behavior & Risk unknown sentinel allowed
                 'feat_min_volatility', 'feat_foul_rate', 'feat_cv'
             ):
