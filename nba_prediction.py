@@ -311,6 +311,12 @@ class FeatureVector:
     # Coefficient of variation for target stat (std / ema)
     feat_cv: float = -1.0
     
+    # === V20.3 NEW: USAGE & OPPONENT FEATURES ===
+    # Usage rate proxy: (FGA + 0.44*FTA + TOV) / MIN
+    feat_usage_rate: float = -1.0
+    # Opponent allowed stat (specific to market)
+    feat_opp_allowed: float = -1.0
+
     # === DATA QUALITY (audit only, not used in ML) ===
     data_quality: DataQuality = field(default_factory=DataQuality)
     
@@ -359,6 +365,9 @@ class FeatureVector:
             float(self.feat_min_volatility),
             float(self.feat_foul_rate),
             float(self.feat_cv),
+            # V20.3 NEW: Usage & Opponent features
+            float(self.feat_usage_rate),
+            float(self.feat_opp_allowed),
         ]
         return np.array(numeric_features)
 
@@ -499,7 +508,7 @@ class MLModelRequiredError(Exception):
     
     This enforces the commitment to ML as the sole prediction engine.
     If you see this error, you need to:
-    1. Train models using data/train_model_v19.py
+    1. Train models using data/train_model_v20.py
     2. Ensure .pkl files are in the data/ directory
     3. Or set CONFIG.ML_REQUIRE_MODEL = False (not recommended)
     """
@@ -1298,6 +1307,23 @@ class FeatureEngineer:
         except Exception:
             cv = 0.0
 
+        # === V20.3 NEW: USAGE RATE PROXY ===
+        # (FGA + 0.44 * FTA + TOV) / MIN
+        usage_rate = -1.0
+        if len(recent) > 0:
+            try:
+                # Sum recent stats
+                sum_fga = recent['FGA'].sum() if 'FGA' in recent.columns else 0
+                sum_fta = recent['FTA'].sum() if 'FTA' in recent.columns else 0
+                sum_tov = recent['TOV'].sum() if 'TOV' in recent.columns else 0
+                sum_min = recent['MIN_FLOAT'].sum() if 'MIN_FLOAT' in recent.columns else 0
+
+                if sum_min > 0:
+                    poss_proxy = sum_fga + 0.44 * sum_fta + sum_tov
+                    usage_rate = float(poss_proxy / sum_min)
+            except Exception:
+                usage_rate = -1.0
+
         return {
             'ema': ema,
             'std': std_dev,
@@ -1311,6 +1337,7 @@ class FeatureEngineer:
             'min_volatility': min_volatility,
             'foul_rate': foul_rate,
             'cv': cv,
+            'usage_rate': usage_rate,
         }
     
     def _calculate_ts_pct(self, df: pd.DataFrame, lookback: int = 15) -> Tuple[float, float]:
@@ -1364,7 +1391,8 @@ class FeatureEngineer:
         game_total: float = 0.0,
         player_team_id: int = None,  # V20.2: For team pace lookup
         player_team_abbrev: str = None,  # V20.3: For injury-based absence features
-        data_loader: 'DataLoader' = None  # V20.3: For PPG lookups
+        data_loader: 'DataLoader' = None,  # V20.3: For PPG lookups
+        opponent_stats: pd.DataFrame = None  # V20.3: For opponent allowed stats
     ) -> FeatureVector: 
         """
         Build pure empirical feature vector for ML models.
@@ -1474,6 +1502,44 @@ class FeatureEngineer:
             # Non-fatal: keep sentinel values
             feat_ts_pct = feat_ts_pct
             feat_ts_pct_delta = feat_ts_pct_delta
+
+        # === V20.3 NEW: OPPONENT ALLOWED STAT ===
+        feat_opp_allowed = -1.0
+        if opponent_stats is not None and len(opponent_stats) > 0 and opponent_id in opponent_stats.index:
+            try:
+                opp_row = opponent_stats.loc[opponent_id]
+                # Map market to OPP column
+                # Note: leaguedashteamstats with MeasureType='Opponent' has columns like OPP_PTS, OPP_REB, etc.
+                market_map = {
+                    'PTS': 'OPP_PTS',
+                    'REB': 'OPP_REB',
+                    'AST': 'OPP_AST',
+                    'STL': 'OPP_STL',
+                    'BLK': 'OPP_BLK',
+                    'TOV': 'OPP_TOV',
+                    '3PM': 'OPP_FG3M',
+                    'FG3M': 'OPP_FG3M',
+                }
+
+                # Handle Combo stats
+                if market in market_map:
+                    col = market_map[market]
+                    if col in opp_row:
+                        feat_opp_allowed = float(opp_row[col])
+                elif market == 'PRA':
+                    if 'OPP_PTS' in opp_row and 'OPP_REB' in opp_row and 'OPP_AST' in opp_row:
+                        feat_opp_allowed = float(opp_row['OPP_PTS'] + opp_row['OPP_REB'] + opp_row['OPP_AST'])
+                elif market == 'PA':
+                    if 'OPP_PTS' in opp_row and 'OPP_AST' in opp_row:
+                        feat_opp_allowed = float(opp_row['OPP_PTS'] + opp_row['OPP_AST'])
+                elif market == 'PR':
+                    if 'OPP_PTS' in opp_row and 'OPP_REB' in opp_row:
+                        feat_opp_allowed = float(opp_row['OPP_PTS'] + opp_row['OPP_REB'])
+                elif market == 'RA':
+                    if 'OPP_REB' in opp_row and 'OPP_AST' in opp_row:
+                        feat_opp_allowed = float(opp_row['OPP_REB'] + opp_row['OPP_AST'])
+            except Exception:
+                feat_opp_allowed = -1.0
         
         # === BUILD V20.3 FEATURE VECTOR ===
         return FeatureVector(
@@ -1513,6 +1579,9 @@ class FeatureEngineer:
             feat_min_volatility=stats.get('min_volatility', 0.0),
             feat_foul_rate=stats.get('foul_rate', 0.0),
             feat_cv=stats.get('cv', 0.0),
+            # V20.3 NEW: Usage & Opponent features
+            feat_usage_rate=stats.get('usage_rate', -1.0),
+            feat_opp_allowed=feat_opp_allowed,
             # Market identity (one-hot encoded)
             market_scoring=1 if market == 'PTS' else 0,
             market_counting=1 if market in ['REB', 'AST'] else 0,
@@ -1741,6 +1810,9 @@ class ModelEngine:
             'feat_min_volatility': float(features.feat_min_volatility),
             'feat_foul_rate': float(features.feat_foul_rate),
             'feat_cv': float(features.feat_cv),
+            # V20.3 NEW: Usage & Opponent
+            'feat_usage_rate': float(features.feat_usage_rate),
+            'feat_opp_allowed': float(features.feat_opp_allowed),
         }
         
         # Extract values in the exact order expected by the model
@@ -1951,14 +2023,14 @@ class ModelEngine:
         if not regression['has_model']:
             raise MLModelRequiredError(
                 f"No ML model available for market '{market}'. "
-                f"Run train_model_v20.py to train models."
+                f"Run data/train_model_v20.py to train models."
             )
         
         if not regression['is_regression']:
             # Old classifier detected - treat as error
             raise MLModelRequiredError(
                 f"Classifier model detected for '{market}'. "
-                f"V20 requires regression models. Retrain with train_model_v20.py."
+                f"V20 requires regression models. Retrain with data/train_model_v20.py."
             )
         
         # 2. EXTRACT ML OUTPUTS
@@ -2590,6 +2662,29 @@ class Backtester:
             opp_team = next((t for t in all_teams if t['abbreviation'] == opp_abbrev), None)
             opponent_id = int(opp_team['id']) if opp_team else 0
             
+            # Fetch opponent stats (allowed)
+            opponent_stats = None
+            try:
+                # Need to fetch allowed stats - reusing logic similar to team stats
+                # But we need to use 'Opponent' measure type
+                if not hasattr(self, '_opponent_stats_cache'):
+                    self._opponent_stats_cache = {}
+
+                # Use cached or fetch
+                if game_season in self._opponent_stats_cache:
+                    opponent_stats = self._opponent_stats_cache[game_season]
+                else:
+                    # Fetch fresh
+                    # Note: DataLoader has fetch_opponent_stats but it might not be per-season in loop
+                    # We should use DataLoader's method
+                    opponent_stats = self.data_loader.fetch_opponent_stats(game_season)
+                    # Set index to TEAM_ID if present
+                    if not opponent_stats.empty and 'TEAM_ID' in opponent_stats.columns:
+                        opponent_stats = opponent_stats.set_index('TEAM_ID')
+                    self._opponent_stats_cache[game_season] = opponent_stats
+            except Exception:
+                opponent_stats = None
+
             # =========================================================================
             # SYNTHETIC VEGAS LINES CALCULATION
             # Since historical Vegas odds aren't available via API, we calculate
@@ -2729,7 +2824,8 @@ class Backtester:
                     player_team_id=player_team_id,
                     # FIX: Set to None to prevent workers from hitting ESPN
                     player_team_abbrev=None,  
-                    data_loader=None
+                    data_loader=None,
+                    opponent_stats=opponent_stats
                 )
                 
                 # V20.3: Inject absence features into feature vector
@@ -2808,6 +2904,9 @@ class Backtester:
                     'team_out_count': frozen_snapshot['team_out_count'],
                     'opp_out_ppg': frozen_snapshot['opp_out_ppg'],
                     'opp_out_count': frozen_snapshot['opp_out_count'],
+                    # V20.3 NEW: Usage & Opponent
+                    'feat_usage_rate': frozen_snapshot.get('feat_usage_rate', -1.0),
+                    'feat_opp_allowed': frozen_snapshot.get('feat_opp_allowed', -1.0),
                     # Market identity (one-hot encoded)
                     'market_scoring': frozen_snapshot['market_scoring'],
                     'market_counting': frozen_snapshot['market_counting'],
@@ -6505,6 +6604,9 @@ def main():
                             "feat_team_out_count": int(features.team_out_count),
                             "feat_opp_out_ppg": float(features.opp_out_ppg),
                             "feat_opp_out_count": int(features.opp_out_count),
+                            # V20.3 NEW: Usage & Opponent (2)
+                            "feat_usage_rate": float(features.feat_usage_rate),
+                            "feat_opp_allowed": float(features.feat_opp_allowed),
                             # Market identity (4)
                             **get_market_group_features(result.market),
                         })
