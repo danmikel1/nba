@@ -125,6 +125,9 @@ FEATURE_COLS_V20 = [
     'feat_min_volatility',
     'feat_foul_rate',
     'feat_cv',
+    # V20.3 NEW: Usage & Opponent features
+    'feat_usage_rate',
+    'feat_opp_allowed',
 ]
 
 # V20 STRICT: No column aliases. No legacy migration.
