@@ -100,6 +100,28 @@ logger = logging.getLogger(__name__)
 CURRENT_VERSION = 'v20.3'
 
 
+def _get_dynamic_seasons():
+    """Return dynamic season strings based on today's date.
+
+    - If month >= Oct, season starts in current year (e.g., Oct 2025 -> '2025-26').
+    - If month < Oct, season starts in previous year (e.g., Jan 2026 -> '2025-26').
+    Returns: (current_season, prev_season, training_seasons_tuple)
+    """
+    now = datetime.now()
+    start_year = now.year if now.month >= 10 else now.year - 1
+
+    def fmt(y):
+        return f"{y}-{str(y+1)[-2:]}"
+
+    curr = fmt(start_year)
+    prev = fmt(start_year - 1)
+    train = (curr, prev, fmt(start_year - 2), fmt(start_year - 3))
+    return curr, prev, train
+
+
+_DYNAMIC_CURRENT_SEASON, _DYNAMIC_PREV_SEASON, _DYNAMIC_TRAINING_SEASONS = _get_dynamic_seasons()
+
+
 @dataclass(frozen=True)
 class Config:
     """
@@ -109,19 +131,19 @@ class Config:
     Model learns relationships from data, not hardcoded assumptions.
     """
     # === IDENTIFIERS ===
-    CURRENT_SEASON: str = "2025-26"
-    PREV_SEASON: str = "2024-25"
+    CURRENT_SEASON: str = _DYNAMIC_CURRENT_SEASON
+    PREV_SEASON: str = _DYNAMIC_PREV_SEASON
     
     # === MULTI-SEASON TRAINING (V20.1) ===
     # More data = better generalization
-    TRAINING_SEASONS: tuple = ("2025-26", "2024-25", "2023-24", "2022-23")
+    TRAINING_SEASONS: tuple = _DYNAMIC_TRAINING_SEASONS
     
     # === API / CACHE ===
     API_DELAY: float = 1.0
     API_MAX_RETRIES: int = 3
-    CACHE_TTL_TEAM_STATS: int = 3600
-    CACHE_TTL_PLAYER_IDS: int = 86400
-    CACHE_TTL_GAME_LOGS: int = 1800
+    CACHE_TTL_TEAM_STATS: int = 3600    # 1 hour
+    CACHE_TTL_PLAYER_IDS: int = 3600    # 1 hour (was 86400 / 24h)
+    CACHE_TTL_GAME_LOGS: int = 600      # 10 minutes (was 1800 / 30m)
     
     # === ML COMMITMENT ===
     # ML is the SOLE prediction engine. No fallbacks.
@@ -699,17 +721,17 @@ class DataLoader:
             return 'SF'
     
     @_conditional_cache(ttl=CONFIG.CACHE_TTL_GAME_LOGS)
-    def fetch_game_logs(self, player_id: int, season: str = None) -> pd.DataFrame:
+    def fetch_game_logs(_self, player_id: int, season: str = None) -> pd.DataFrame:
         """
         Fetch player game logs for a season.
         Uses DataEngine for bulk fetching and caching.
         """
         if season is None:
-            season = self.config.CURRENT_SEASON
+            season = _self.config.CURRENT_SEASON
         
         try: 
             # Use DataEngine to get player logs from cached master file
-            df = self.data_engine.get_player_logs(player_id, season)
+            df = _self.data_engine.get_player_logs(player_id, season)
             
             if df.empty:
                 return pd.DataFrame()
@@ -778,12 +800,12 @@ class DataLoader:
             logger.error(f"Failed to fetch game logs for player {player_id}: {e}")
             return pd.DataFrame()
     
-    def fetch_multi_season_logs(self, player_id: int) -> pd.DataFrame:
+    def fetch_multi_season_logs(_self, player_id: int) -> pd.DataFrame:
         """Fetch logs from current and previous season."""
         try:
             # DataEngine makes this fast - hits local parquet for both seasons
-            df_current = self.fetch_game_logs(player_id, self.config.CURRENT_SEASON)
-            df_prev = self.fetch_game_logs(player_id, self.config.PREV_SEASON)
+            df_current = _self.fetch_game_logs(player_id, _self.config.CURRENT_SEASON)
+            df_prev = _self.fetch_game_logs(player_id, _self.config.PREV_SEASON)
 
             frames = [df for df in [df_current, df_prev] if len(df) > 0]
             if not frames:
@@ -4058,6 +4080,20 @@ def generate_ml_data_streamlit():
             st.error("Failed to generate training data. Check logs for errors.")
 
 
+# Shared singleton accessor for BulkGameLogLoader
+@st.cache_resource(show_spinner="Initializing Data Engine (One-time)...")
+def get_shared_bulk_loader():
+    """Singleton accessor for the heavy BulkGameLogLoader.
+
+    This loads bulk logs for all configured training seasons once and reuses the
+    loader across Streamlit sessions and UI tabs.
+    """
+    loader = BulkGameLogLoader(CONFIG)
+    # Load all seasons defined in config to ensure full history
+    loader.load_all_game_logs()
+    return loader
+
+
 # =============================================================================
 # ORCHESTRATOR (Replaces EliteModel)
 # =============================================================================
@@ -4272,6 +4308,9 @@ class PredictionOrchestrator:
                 logger.error(f"Player not found for backtest: {player_name}")
                 return None
             
+            # FIX: Retrieve shared loader for absence calculations
+            bulk_loader = get_shared_bulk_loader()
+
             return self.backtester.run_backtest(
                 player_id=p_obj['id'],
                 player_name=p_obj['full_name'],
@@ -4280,7 +4319,8 @@ class PredictionOrchestrator:
                 test_days=test_days,
                 line_offset=line_offset,
                 fixed_spread=fixed_spread,
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                bulk_loader=bulk_loader
             )
         except Exception as e: 
             logger.error(f"Backtest failed: {e}")
@@ -6620,6 +6660,24 @@ def main():
     with st. sidebar:
         st.markdown("### ⚙️ Settings")
         
+        # Emergency: Reset caches (clears cached data in Streamlit)
+        if st.button("🗑️ Reset Cache", use_container_width=True):
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            try:
+                if hasattr(st, 'cache_resource'):
+                    st.cache_resource.clear()
+            except Exception:
+                pass
+            try:
+                st.toast("Cache cleared! Reloading...", icon="🔄")
+            except Exception:
+                st.info("Cache cleared! Reloading...")
+            time.sleep(1)
+            st.rerun()
+        
         # Bankroll Mode Toggle
         bankroll_enabled = st.toggle("💰 Bankroll Mode", value=True, help="Turn off when just gathering data for ML")
         st.session_state.bankroll_enabled = bankroll_enabled
@@ -6695,7 +6753,7 @@ def main():
                     if p_list:
                         p_id = p_list[0]['id']
                         from nba_api.stats.endpoints import commonplayerinfo
-                        import time
+                        # Use top-level time import to avoid shadowing the module name in this function
                         time.sleep(0.3)
                         player_info = commonplayerinfo.CommonPlayerInfo(player_id=p_id).get_data_frames()[0]
                         if 'TEAM_ABBREVIATION' in player_info.columns:
