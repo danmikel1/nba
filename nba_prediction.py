@@ -3070,6 +3070,17 @@ TRAINING_FEATURE_COLUMNS = [
     'feat_cv',
 ]
 
+# Canonical export schema used for writing ML training CSVs (single source of truth)
+ML_EXPORT_METADATA = [
+    'date', 'player', 'opponent', 'market', 'position',
+    'line', 'predicted_side', 'predicted_prob', 'predicted_ev', 'projected_value',
+    'result', 'hit', 'actual_value', 'margin', 'margin_pct', 'result_quality',
+    'tag', 'grade',
+]
+
+# The full ordered schema for CSV export: metadata followed by canonical training features
+ML_EXPORT_SCHEMA = ML_EXPORT_METADATA + TRAINING_FEATURE_COLUMNS.copy()
+
 def get_market_group_features(market: str) -> Dict[str, int]:
     """
     Convert market to one-hot encoded group features.
@@ -3086,6 +3097,77 @@ def get_market_group_features(market: str) -> Dict[str, int]:
             features[f'feat_market_{group_name}'] = 1
             break
     return features
+
+
+def extract_features_dynamically(features_obj: Any, market: Optional[str] = None) -> Dict[str, Any]:
+    """Dynamically extract ML feature keys based on the canonical `ML_EXPORT_SCHEMA`.
+
+    - Iterates over `ML_EXPORT_SCHEMA` looking for keys starting with `feat_`.
+    - For each, derives the attribute name on the `features_obj` by stripping the `feat_` prefix.
+    - If attribute exists, converts to an appropriate type and returns it.
+    - If attribute is missing, uses a sensible sentinel and logs a debug message.
+    - Market identity features (feat_market_*) are handled by merging `get_market_group_features`.
+    """
+    result: Dict[str, Any] = {}
+
+    # Resolve market for market-derived features
+    resolved_market = market or getattr(features_obj, 'market', None) or 'PTS'
+
+    for col in ML_EXPORT_SCHEMA:
+        if not col.startswith('feat_'):
+            continue
+
+        # Market identity handled separately
+        if col.startswith('feat_market_'):
+            continue
+
+        attr_name = col[len('feat_'):]
+
+        # Try multiple candidate attribute names to support both 'avg_minutes' and 'feat_ts_pct' style attributes
+        candidates = [attr_name, f'feat_{attr_name}']
+        found_attr = None
+        raw_val = None
+        for cand in candidates:
+            if hasattr(features_obj, cand):
+                found_attr = cand
+                raw_val = getattr(features_obj, cand)
+                break
+
+        if found_attr is not None:
+            try:
+                if col.endswith('_count'):
+                    val = int(raw_val)
+                elif col in ('feat_is_home', 'feat_is_b2b'):
+                    val = 1 if bool(raw_val) else 0
+                else:
+                    # Generic numeric features -> float
+                    val = float(raw_val) if raw_val is not None else -1.0
+            except Exception:
+                # Fallback to sentinel on any conversion error
+                if col.endswith('_count'):
+                    val = -1
+                elif col in ('feat_is_home', 'feat_is_b2b'):
+                    val = 0
+                else:
+                    val = -1.0
+                logger.debug(f"Failed to coerce feature '{found_attr}' value; using sentinel {val}")
+        else:
+            # Missing attribute -> sentinel
+            if col.endswith('_count'):
+                val = -1
+            elif col in ('feat_is_home', 'feat_is_b2b'):
+                val = 0
+            else:
+                val = -1.0
+            logger.debug(f"Feature '{attr_name}' missing on features object; using sentinel {val}")
+
+        result[col] = val
+
+    # Merge market identity one-hot features
+    result.update(get_market_group_features(resolved_market))
+
+    return result
+
 
 def get_top_active_players(limit: int = 50, min_games: int = 10) -> List[Dict]:
     """
@@ -3236,7 +3318,7 @@ class BulkGameLogLoader:
         self._loaded = True
         return True
     
-    def _organize_by_player(self, df: pd.DataFrame):
+    def _organize_by_player(self, df: pd.DataFrame):    
         """
         Organize the bulk data by player ID.
         """
@@ -3387,14 +3469,17 @@ class BulkGameLogLoader:
             if len(team_games) > 0:
                 ppg = team_games['PTS'].mean() if 'PTS' in team_games.columns else 0.0
                 name = team_games['PLAYER_NAME'].iloc[0] if 'PLAYER_NAME' in team_games.columns else 'Unknown'
-                # Pre-calculate min_date to avoid dataframe scanning in the hot loop
+                # Pre-calculate min_date and max_date to avoid expensive dataframe scans in hot loop
                 min_date = team_games['GAME_DATE'].min()
+                # FIX: Track last game date for recency-based "ghost" filtering
+                max_date = team_games['GAME_DATE'].max()
                 
                 roster[pid] = {
                     'name': name, 
                     'ppg': ppg, 
                     'games': len(team_games),
-                    'min_date': min_date  # STORE THIS FOR SPEED
+                    'min_date': min_date,  # STORE THIS FOR SPEED
+                    'max_date': max_date
                 }
         
         # 3. SAVE TO CACHE
@@ -3429,22 +3514,39 @@ class BulkGameLogLoader:
         team_out_ppg = 0.0
         team_out_count = 0
         
+        # Define ghost cutoff: players who haven't played in the last 60 days are treated as gone
+        ghost_cutoff = game_date - pd.Timedelta(days=60)
+        
         # Iterate roster (~15 items) - Super fast now
         for pid, info in team_roster.items():
             if pid == player_id: continue
-            if pid not in team_played and info['games'] >= 5:
-                # OPTIMIZATION: Compare pre-cached date instead of scanning dataframe
-                if info['min_date'] < game_date:
-                     team_out_ppg += info['ppg']
-                     team_out_count += 1
+            # Check if they are NOT playing today
+            if pid not in team_played:
+                # Filter 1: Must have played at least 5 games
+                if info.get('games', 0) < 5:
+                    continue
+                # Filter 2: Must have joined the team BEFORE today
+                if info.get('min_date') >= game_date:
+                    continue
+                # Filter 3: Ghost player filter - if last game < ghost_cutoff, skip
+                if info.get('max_date') < ghost_cutoff:
+                    continue
+                # If all filters pass, count them as "out"
+                team_out_ppg += info.get('ppg', 0.0)
+                team_out_count += 1
         
         opp_out_ppg = 0.0
         opp_out_count = 0
         for pid, info in opp_roster.items():
-            if pid not in opp_played and info['games'] >= 5:
-                 if info['min_date'] < game_date:
-                     opp_out_ppg += info['ppg']
-                     opp_out_count += 1
+            if pid not in opp_played:
+                if info.get('games', 0) < 5:
+                    continue
+                if info.get('min_date') >= game_date:
+                    continue
+                if info.get('max_date') < ghost_cutoff:
+                    continue
+                opp_out_ppg += info.get('ppg', 0.0)
+                opp_out_count += 1
         
         return {
             'team_out_ppg': round(team_out_ppg, 1),
@@ -3699,27 +3801,63 @@ def generate_ml_training_data(
     
     all_results = []
     completed = 0
-    
-    # Pass the heavy data ONCE via initializer
-    with ProcessPoolExecutor(
-        max_workers=max_workers,
-        initializer=_init_worker,
-        initargs=(bulk_cache_serialized, team_stats_serialized, config)
-    ) as executor:
-        
-        futures = {executor.submit(_backtest_worker_task, task): task for task in tasks}
-        
-        for future in as_completed(futures):
+
+    # =========================================================================
+    # STEP 4: Execute with Initializer (The Speed Fix)
+    # Use guarded execution to avoid Windows 'spawn' pickling issues when the
+    # module has been re-imported (Streamlit reloads can cause this).
+    # If we're not in the main Streamlit process, or if the ProcessPool fails
+    # to initialize due to pickling, fall back to a sequential execution.
+    # =========================================================================
+    if _IN_MAIN_PROCESS:
+        try:
+            logger.info(f"🚀 Launching {max_workers} workers with shared memory init...")
+            # Pass the heavy data ONCE via initializer
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                initializer=_init_worker,
+                initargs=(bulk_cache_serialized, team_stats_serialized, config)
+            ) as executor:
+
+                futures = {executor.submit(_backtest_worker_task, task): task for task in tasks}
+
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            all_results.append(result)
+                    except Exception as e:
+                        logger.warning(f"Task failed: {e}")
+
+                    completed += 1
+                    if progress_callback:
+                        # Progress from 40% to 100%
+                        progress_callback(0.40 + 0.60 * (completed / total_tasks))
+        except Exception as e:
+            logger.warning("Parallel workers failed (pickling/initializer issue). Falling back to sequential execution.")
+            logger.debug(str(e))
+            # Sequential fallback
+            for task in tasks:
+                try:
+                    result = _backtest_worker_task(task)
+                    if result is not None:
+                        all_results.append(result)
+                except Exception as e2:
+                    logger.warning(f"Sequential task failed: {e2}")
+                completed += 1
+                if progress_callback:
+                    progress_callback(0.40 + 0.60 * (completed / total_tasks))
+    else:
+        logger.info("Not in main Streamlit process - running backtests sequentially inside worker.")
+        for task in tasks:
             try:
-                result = future.result()
+                result = _backtest_worker_task(task)
                 if result is not None:
                     all_results.append(result)
             except Exception as e:
-                logger.warning(f"Task failed: {e}")
-            
+                logger.warning(f"Sequential task failed: {e}")
             completed += 1
             if progress_callback:
-                # Progress from 40% to 100%
                 progress_callback(0.40 + 0.60 * (completed / total_tasks))
 
     if not all_results:
@@ -3730,57 +3868,91 @@ def generate_ml_training_data(
     combined_df = pd.concat(all_results, ignore_index=True)
     
     output_path = DATA_DIR / output_file
-    canonical_columns = [
-        'date', 'player', 'opponent', 'market', 'position',
-        'line', 'predicted_side', 'predicted_prob', 'predicted_ev', 'projected_value',
-        'result', 'hit', 'actual_value', 'margin', 'margin_pct', 'result_quality',
-        'tag', 'grade',
-        'feat_avg_minutes', 'feat_ema', 'feat_std',
-        'feat_opponent_drtg_season',
-        'feat_line', 'feat_spread', 'feat_game_total',
-        'feat_days_rest', 'feat_is_home', 'feat_is_b2b',
-        'feat_games_played',
-        'feat_opponent_pace', 'feat_team_pace',
-        'feat_trend_5g', 'feat_home_avg', 'feat_away_avg',
-        'feat_ts_pct', 'feat_ts_pct_delta',
-        'feat_team_out_ppg', 'feat_team_out_count',
-        'feat_opp_out_ppg', 'feat_opp_out_count',
-        'feat_market_scoring', 'feat_market_counting', 'feat_market_combo', 'feat_market_rare',
-        # V20.3 NEW: Behavior & Risk
-        'feat_min_volatility', 'feat_foul_rate', 'feat_cv'
-    ]
-    
+    # Use the module-level single source of truth for schema
+    canonical_columns = ML_EXPORT_SCHEMA
+
+    # Fill missing columns in the newly generated dataframe with explicit sentinels
     for col in canonical_columns:
         if col not in combined_df.columns:
-            # Use -1 sentinel for absence/TS features to preserve unknowns (avoid fabricating zeros)
-            if col in (
-                'feat_ts_pct', 'feat_ts_pct_delta',
-                'feat_team_out_ppg', 'feat_team_out_count', 'feat_opp_out_ppg', 'feat_opp_out_count',
-                # V20.3: Behavior & Risk unknown sentinel allowed
-                'feat_min_volatility', 'feat_foul_rate', 'feat_cv'
-            ):
-                combined_df[col] = -1.0
+            if col in TRAINING_FEATURE_COLUMNS:
+                # integer counts -> -1
+                if col.endswith('_count') or col == 'feat_games_played':
+                    combined_df[col] = -1
+                # boolean / one-hot features -> 0
+                elif col in ('feat_is_home', 'feat_is_b2b') or col.startswith('feat_market_'):
+                    combined_df[col] = 0
+                # float features (including TS% and other metrics) -> -1.0
+                else:
+                    combined_df[col] = -1.0
             else:
-                combined_df[col] = 0 if col.startswith('feat_') else ''
-            
+                # metadata
+                combined_df[col] = ''
+
+    # If an existing file exists, inspect its header BEFORE loading the full file
+    existing_df = None
     if output_path.exists():
+        import csv, shutil
         try:
+            with open(output_path, 'r', encoding='utf-8') as fh:
+                existing_header = next(csv.reader(fh), None)
+        except Exception as e:
+            logger.exception(f"Failed to read existing CSV header: {e}")
+            existing_header = None
+
+        # If header doesn't match exactly, archive and start fresh
+        if existing_header != ML_EXPORT_SCHEMA:
+            ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+            archive_path = output_path.with_name(f"{output_path.stem}.archived.{ts}{output_path.suffix}")
+            try:
+                shutil.move(str(output_path), str(archive_path))
+                logger.warning(f"Archived mismatched ML CSV to {archive_path}; creating fresh file.")
+            except Exception as e:
+                logger.exception(f"Failed to archive mismatched CSV: {e}")
+                raise
+            existing_df = None
+        else:
+            # Safe to load the existing DataFrame and normalize columns
             existing_df = pd.read_csv(output_path)
             for col in canonical_columns:
                 if col not in existing_df.columns:
-                    existing_df[col] = 0 if col.startswith('feat_') else ''
-            combined_df = pd.concat([combined_df, existing_df], ignore_index=True)
-            combined_df = combined_df.drop_duplicates(subset=['date', 'player', 'market'], keep='last')
-        except: pass
+                    if col in TRAINING_FEATURE_COLUMNS:
+                        if col.endswith('_count') or col == 'feat_games_played':
+                            existing_df[col] = -1
+                        elif col in ('feat_is_home', 'feat_is_b2b') or col.startswith('feat_market_'):
+                            existing_df[col] = 0
+                        else:
+                            existing_df[col] = -1.0
+                    else:
+                        existing_df[col] = ''
 
-    final_columns = [c for c in canonical_columns if c in combined_df.columns]
-    combined_df = combined_df[final_columns]
-    combined_df.to_csv(output_path, index=False)
-    
+    # Merge: existing first then new so that newer records take precedence when dropping duplicates
+    if existing_df is not None:
+        merged = pd.concat([existing_df, combined_df], ignore_index=True)
+        merged = merged.drop_duplicates(subset=['date', 'player', 'market'], keep='last')
+        final_df = merged
+    else:
+        final_df = combined_df
+
+    # Reorder and select final columns
+    final_columns = [c for c in canonical_columns if c in final_df.columns]
+    final_df = final_df[final_columns]
+
+    # Atomic write to temp file and replace
+    tmp_path = output_path.with_suffix(output_path.suffix + '.tmp')
+    try:
+        final_df.to_csv(tmp_path, index=False)
+        os.replace(str(tmp_path), str(output_path))
+    except Exception as e:
+        logger.exception(f"Failed to write ML training CSV atomically: {e}")
+        if tmp_path.exists():
+            try: tmp_path.unlink()
+            except: pass
+        raise
+
     logger.info(f"✓ ML training data saved to {output_path}")
     if progress_callback: progress_callback(1.0)
-    
-    return combined_df
+
+    return final_df
 
 def generate_ml_data_streamlit():
     """Streamlit UI wrapper for ML data generation."""
@@ -4128,6 +4300,13 @@ class Tracker:
         if 'result' not in bet_data:
             bet_data['result'] = 'Pending'
             
+        # 4. Ensure all canonical ML feature columns exist on saved bets to prevent schema drift.
+        # This stores explicit sentinel values for any missing V20.3 features so older records
+        # remain compatible with downstream diagnostics and export code.
+        for col in TRAINING_FEATURE_COLUMNS:
+            if col not in bet_data:
+                bet_data[col] = self._ml_column_sentinel(col)
+
         bets.append(bet_data)
         self._save(bets)
 
@@ -4530,150 +4709,246 @@ class Tracker:
         
         return df
 
+    def _map_bet_to_csv_row(self, bet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Map a bet dict to a CSV row that strictly follows `ML_EXPORT_SCHEMA`.
+        Returns None if mandatory V20.2 core features are missing (no fabrication).
+        """
+        # Required core features (V20.2) - must be present
+        required_core = ['feat_opponent_pace', 'feat_team_pace', 'feat_trend_5g', 'feat_home_avg', 'feat_away_avg']
+        missing = [f for f in required_core if bet.get(f) is None]
+        if missing:
+            # Caller will log; we simply indicate missing required fields by returning None
+            return None
+
+        # Parse date robustly
+        date_val = bet.get('date', None)
+        date_iso = None
+        if isinstance(date_val, (datetime, pd.Timestamp)):
+            date_iso = date_val.date().isoformat()
+        else:
+            try:
+                parsed = pd.to_datetime(date_val, errors='coerce')
+                if not pd.isna(parsed):
+                    date_iso = parsed.date().isoformat()
+                else:
+                    date_iso = str(date_val).split(' ')[0]
+            except Exception:
+                date_iso = str(date_val).split(' ')[0]
+
+        # Compute hit flag
+        result = bet.get('result', '')
+        hit_flag = 1 if result == 'Win' else 0
+
+        # Build the canonical row
+        row: Dict[str, Any] = {
+            'date': date_iso,
+            'player': bet.get('player', ''),
+            'opponent': bet.get('opponent', ''),
+            'market': bet.get('market', ''),
+            'position': bet.get('feat_position', bet.get('position', '')),
+            'line': float(bet.get('line', 0) or 0),
+            'predicted_side': bet.get('predicted_side', bet.get('side', '')),
+            'predicted_prob': float(bet.get('predicted_prob', bet.get('prob', bet.get('win_prob', 0))) or 0),
+            'predicted_ev': float(bet.get('predicted_ev', bet.get('ev', 0) or 0)),
+            'projected_value': float(bet.get('projected_value', bet.get('proj', 0) or 0)),
+            'result': result,
+            'hit': int(hit_flag),
+            'actual_value': float(bet.get('actual_value', 0) or 0),
+            'margin': float(bet.get('margin', 0) or 0),
+            'margin_pct': float(bet.get('margin_pct', 0) or 0),
+            'result_quality': bet.get('result_quality', 'legacy'),
+            'tag': bet.get('tag', 'legacy'),
+            'grade': self._calculate_grade(bet.get('ev', bet.get('predicted_ev', 0)), bet.get('win_prob', bet.get('predicted_prob', 0.5))),
+
+            # V20.3 Required Features (canonical names)
+            'feat_avg_minutes': float(bet.get('feat_avg_minutes', bet.get('avg_minutes', 0) or 0)),
+            'feat_ema': float(bet.get('feat_ema', 0) or 0),
+            'feat_std': float(bet.get('feat_std', 0) or 0),
+            'feat_opponent_drtg_season': float(bet.get('feat_opponent_drtg_season', bet.get('feat_opp_drtg_season', 0) or 0)),
+            'feat_line': float(bet.get('line', 0) or 0),
+            'feat_spread': float(bet.get('feat_spread', 0) or 0),
+            'feat_game_total': float(bet.get('feat_game_total', 0) or 0),
+            'feat_days_rest': int(bet.get('feat_days_rest', 0) or 0),
+            'feat_is_home': 1 if bet.get('feat_is_home', False) else 0,
+            'feat_is_b2b': 1 if bet.get('feat_is_b2b', False) else 0,
+            'feat_games_played': int(bet.get('feat_games_played', 0) or 0),
+
+            # V20.2: Pace and trend features
+            'feat_opponent_pace': float(bet.get('feat_opponent_pace')),
+            'feat_team_pace': float(bet.get('feat_team_pace')),
+            'feat_trend_5g': float(bet.get('feat_trend_5g')),
+            'feat_home_avg': float(bet.get('feat_home_avg')),
+            'feat_away_avg': float(bet.get('feat_away_avg')),
+
+            # V20.3: True-Shooting features
+            'feat_ts_pct': float(bet.get('feat_ts_pct', -1.0)),
+            'feat_ts_pct_delta': float(bet.get('feat_ts_pct_delta', -1.0)),
+
+            # V20.3 NEW: Absence-aware features
+            'feat_team_out_ppg': float(bet.get('feat_team_out_ppg', -1.0)),
+            'feat_team_out_count': int(bet.get('feat_team_out_count', -1) or -1),
+            'feat_opp_out_ppg': float(bet.get('feat_opp_out_ppg', -1.0)),
+            'feat_opp_out_count': int(bet.get('feat_opp_out_count', -1) or -1),
+
+            # V20.3 NEW: Behavior & Risk features
+            'feat_min_volatility': float(bet.get('feat_min_volatility', -1.0)),
+            'feat_foul_rate': float(bet.get('feat_foul_rate', -1.0)),
+            'feat_cv': float(bet.get('feat_cv', -1.0)),
+        }
+
+        # Market identity features
+        row.update(get_market_group_features(bet.get('market', 'PTS')))
+
+        return row
+
+    def _ml_column_sentinel(self, col: str):
+        """Return an appropriate sentinel for a given ML export column.
+        - Metadata strings -> ''
+        - Numeric metadata -> -1.0
+        - Integer counters -> -1
+        - Float features -> -1.0
+        - One-hot / boolean features -> 0
+        """
+        # Numeric metadata
+        numeric_meta = {'line', 'predicted_prob', 'predicted_ev', 'projected_value', 'actual_value', 'margin', 'margin_pct'}
+        if col in ML_EXPORT_METADATA:
+            if col in numeric_meta:
+                return -1.0
+            if col == 'hit':
+                return -1
+            return ''
+
+        # Feature columns
+        if col.startswith('feat_'):
+            if col.endswith('_count'):
+                return -1
+            if col in ('feat_is_home', 'feat_is_b2b', 'feat_market_scoring', 'feat_market_counting', 'feat_market_combo', 'feat_market_rare'):
+                return 0
+            return -1.0
+
+        # Fallback
+        return ''
+
+    def _migrate_ml_csv_schema_if_needed(self, output_path: Path) -> None:
+        """Migrate an existing ML CSV in-place to include any missing columns from
+        `ML_EXPORT_SCHEMA` using sentinel backfilling. The migration writes atomically
+        and preserves existing records and any extra legacy columns (they are appended).
+        """
+        import os
+        try:
+            if not output_path.exists():
+                return
+
+            # Read existing CSV (skip corrupted lines)
+            try:
+                df = pd.read_csv(output_path, on_bad_lines='skip')
+            except Exception as e:
+                logger.exception(f"Failed to read existing ML CSV for migration: {e}")
+                raise
+
+            existing_cols = df.columns.tolist()
+
+            # Quick check: if canonical columns already exist in canonical order, nothing to do
+            if existing_cols[:len(ML_EXPORT_SCHEMA)] == ML_EXPORT_SCHEMA:
+                logger.debug("ML CSV already matches canonical schema order. No migration needed.")
+                return
+
+            missing = [c for c in ML_EXPORT_SCHEMA if c not in existing_cols]
+            if missing:
+                logger.info(f"Migrating existing ML CSV: adding missing canonical columns: {missing}")
+            else:
+                logger.info("Existing ML CSV contains canonical columns but ordering differs; reordering to canonical order.")
+
+            # Add missing canonical columns using appropriate sentinels
+            for col in missing:
+                df[col] = self._ml_column_sentinel(col)
+
+            # Coerce canonical columns to sentinel-aware dtypes and fill NaNs where appropriate
+            for col in ML_EXPORT_SCHEMA:
+                if col in df.columns:
+                    s = self._ml_column_sentinel(col)
+                    if isinstance(s, float):
+                        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(s)
+                    elif isinstance(s, int):
+                        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(s).astype(int)
+                    else:
+                        df[col] = df[col].fillna(s).astype(str)
+
+            # Reorder: canonical columns first, then preserve any legacy extras
+            final_cols = ML_EXPORT_SCHEMA + [c for c in df.columns if c not in ML_EXPORT_SCHEMA]
+            df = df[final_cols]
+
+            # Atomic write to temp file and replace
+            tmp_path = output_path.with_suffix(output_path.suffix + '.migrate.tmp')
+            df.to_csv(tmp_path, index=False)
+            os.replace(str(tmp_path), str(output_path))
+
+            logger.info(f"Migrated ML CSV in-place to canonical schema at {output_path}")
+        except Exception as e:
+            logger.exception(f"Failed to migrate ML CSV schema: {e}")
+            raise
+
     def export_bets_to_training_csv(self, output_file: str = "ml_training_data.csv") -> Tuple[int, str]:
         """
-        Export tracked bets to ML training CSV.
-        V20.3: Exports canonical feature set for training.
+        Export tracked bets to ML training CSV with in-place schema migration and sentinel backfilling.
+
+        Behavior changes (Schema Migration):
+        - If an existing CSV header does not match `ML_EXPORT_SCHEMA`, do not archive or delete it.
+        - Instead, migrate the file in-place by adding missing canonical columns with sentinel values
+          and reordering so canonical columns appear first. Preserve legacy extra columns after canonical.
+        - After migration (or if the file did not exist), append new bets using the canonical schema.
         """
         import csv
+        import os
+
         bets = self.get_bets()
         output_path = DATA_DIR / output_file
-        
-        # V20.3 STRICT: Raw observable features + metadata (27 features)
-        default_fieldnames = [
-            'date', 'player', 'opponent', 'market', 'position',
-            'line', 'predicted_side', 'predicted_prob', 'predicted_ev', 'projected_value',
-            'result', 'hit', 'actual_value', 'margin', 'margin_pct', 'result_quality',
-            'tag', 'grade',
-            # V20.3 Required Features (canonical list)
-            'feat_avg_minutes', 'feat_ema', 'feat_std',
-            'feat_opponent_drtg_season',
-            'feat_line', 'feat_spread', 'feat_game_total',
-            'feat_days_rest', 'feat_is_home', 'feat_is_b2b',
-            'feat_games_played',
-            # V20.2: Pace and trend features
-            'feat_opponent_pace', 'feat_team_pace', 'feat_trend_5g', 'feat_home_avg', 'feat_away_avg',
-            # V20.3 NEW: True-Shooting features
-            'feat_ts_pct', 'feat_ts_pct_delta',
-            # V20.3 NEW: Absence-aware features
-            'feat_team_out_ppg', 'feat_team_out_count', 'feat_opp_out_ppg', 'feat_opp_out_count',
-            # Market identity (4 features)
-            'feat_market_scoring', 'feat_market_counting', 'feat_market_combo', 'feat_market_rare',
-            # V20.3 NEW: Behavior & Risk features
-            'feat_min_volatility', 'feat_foul_rate', 'feat_cv'
-        ]
-        
-        # Check if file exists and read its header to match column structure
-        file_exists = output_path.exists()
-        if file_exists:
-            try:
-                with open(output_path, 'r', encoding='utf-8') as f:
-                    reader = csv.reader(f)
-                    existing_header = next(reader, None)
-                    if existing_header:
-                        # Use existing header to maintain consistency
-                        fieldnames = existing_header
-                    else:
-                        fieldnames = default_fieldnames
-            except Exception:
-                fieldnames = default_fieldnames
-        else:
-            fieldnames = default_fieldnames
-        
+
         exported_count = 0
         bets_modified = False
-        
+
+        # If the file exists, migrate it in-place to ensure canonical schema is present first
+        if output_path.exists():
+            try:
+                self._migrate_ml_csv_schema_if_needed(output_path)
+            except Exception:
+                logger.exception("Schema migration failed; aborting export to avoid corruption.")
+                raise
+
+        # If the file does not exist after migration, we'll need to write a canonical header
+        need_write_header = not output_path.exists()
+
         with open(output_path, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-            if not file_exists:
+            writer = csv.DictWriter(f, fieldnames=ML_EXPORT_SCHEMA, extrasaction='ignore')
+            if need_write_header:
                 writer.writeheader()
-            
+
             for bet in bets:
-                if (bet.get('result') in ['Win', 'Loss'] and 
-                    bet.get('actual_value') is not None and 
-                    not bet.get('exported_to_csv', False)):
-                    
-                    # V20.3 STRICT: Skip bets missing core features (no fabrication)
-                    # Note: V20.3 absence features use -1 sentinel for unknown, so not required
-                    missing_required = []
-                    if bet.get('feat_opponent_pace') is None:
-                        missing_required.append('feat_opponent_pace')
-                    if bet.get('feat_team_pace') is None:
-                        missing_required.append('feat_team_pace')
-                    if bet.get('feat_trend_5g') is None:
-                        missing_required.append('feat_trend_5g')
-                    if bet.get('feat_home_avg') is None:
-                        missing_required.append('feat_home_avg')
-                    if bet.get('feat_away_avg') is None:
-                        missing_required.append('feat_away_avg')
-                    
-                    if missing_required:
-                        # V20.3 STRICT: Skip old bets without full feature set
-                        logger.warning(f"Skipping bet {bet.get('id')} - missing V20.2 core features: {missing_required}")
-                        continue
-                    
-                    # V20.3 STREAMLINED: canonical feature set + metadata
-                    row = {
-                        'date': str(bet.get('date', '2024-01-01')).split(' ')[0],
-                        'player': bet.get('player', ''),
-                        'opponent': bet.get('opponent', ''),
-                        'market': bet.get('market', ''),
-                        'position': bet.get('feat_position', ''),
-                        'line': bet.get('line', 0),
-                        'predicted_side': bet.get('side', ''),
-                        'predicted_prob': bet.get('prob', 0),
-                        'predicted_ev': bet.get('ev', 0),
-                        'projected_value': bet.get('proj', 0),
-                        'result': bet.get('result', ''),
-                        'hit': 1 if bet.get('result') == 'Win' else 0,
-                        'actual_value': bet.get('actual_value', 0),
-                        'margin': bet.get('margin', 0),
-                        'margin_pct': bet.get('margin_pct', 0),
-                        'result_quality': bet.get('result_quality', 'legacy'),
-                        'tag': bet.get('tag', 'legacy'),
-                        'grade': self._calculate_grade(bet.get('ev', 0), bet.get('win_prob', 0.5)),
-                        # V20.3 Required Features (canonical names)
-                        'feat_avg_minutes': bet.get('feat_avg_minutes', bet.get('avg_minutes', 0)),
-                        'feat_ema': bet.get('feat_ema', 0),
-                        'feat_std': bet.get('feat_std', 0),
-                        'feat_opponent_drtg_season': bet.get('feat_opponent_drtg_season', bet.get('feat_opp_drtg_season', 0)),
-                        'feat_line': bet.get('line', 0),
-                        'feat_spread': bet.get('feat_spread', 0),
-                        'feat_game_total': bet.get('feat_game_total', 0),
-                        'feat_days_rest': bet.get('feat_days_rest', 0),
-                        'feat_is_home': 1 if bet.get('feat_is_home', False) else 0,
-                        'feat_is_b2b': 1 if bet.get('feat_is_b2b', False) else 0,
-                        'feat_games_played': bet.get('feat_games_played', 0),
-                        # V20.2: Pace and trend features (verified present above)
-                        'feat_opponent_pace': bet.get('feat_opponent_pace'),
-                        'feat_team_pace': bet.get('feat_team_pace'),
-                        'feat_trend_5g': bet.get('feat_trend_5g'),
-                        'feat_home_avg': bet.get('feat_home_avg'),
-                        'feat_away_avg': bet.get('feat_away_avg'),
-                        # V20.3: True-Shooting features
-                        'feat_ts_pct': bet.get('feat_ts_pct', -1.0),
-                        'feat_ts_pct_delta': bet.get('feat_ts_pct_delta', -1.0),
-                        # V20.3 NEW: Absence-aware features
-                        'feat_team_out_ppg': bet.get('feat_team_out_ppg', -1.0),
-                        'feat_team_out_count': bet.get('feat_team_out_count', -1),
-                        'feat_opp_out_ppg': bet.get('feat_opp_out_ppg', -1.0),
-                        'feat_opp_out_count': bet.get('feat_opp_out_count', -1),
-                        # V20.3 NEW: Behavior & Risk features
-                        'feat_min_volatility': bet.get('feat_min_volatility', -1.0),
-                        'feat_foul_rate': bet.get('feat_foul_rate', -1.0),
-                        'feat_cv': bet.get('feat_cv', -1.0),
-                        # Market identity (4 features)
-                        **get_market_group_features(bet.get('market', 'PTS')),
-                    }
-                    
-                    writer.writerow(row)
-                    bet['exported_to_csv'] = True
-                    bets_modified = True
-                    exported_count += 1
-        
+                if not (bet.get('result') in ['Win', 'Loss'] and bet.get('actual_value') is not None and not bet.get('exported_to_csv', False)):
+                    continue
+
+                row = self._map_bet_to_csv_row(bet)
+                if row is None:
+                    # Missing required core features - log and skip
+                    logger.warning(f"Skipping bet {bet.get('id')} - missing required V20.2 core features.")
+                    continue
+
+                # Ensure row contains all canonical columns; fill missing keys with sentinels
+                for col in ML_EXPORT_SCHEMA:
+                    if col not in row:
+                        row[col] = self._ml_column_sentinel(col)
+
+                # All good - write row and mark exported
+                writer.writerow(row)
+                bet['exported_to_csv'] = True
+                bets_modified = True
+                exported_count += 1
+
         if bets_modified:
             self._save(bets)
-        
+
+        logger.info(f"Exported {exported_count} bets to {output_path}")
         return exported_count, str(output_path)
 
     def get_exportable_count(self) -> int:
@@ -5744,20 +6019,40 @@ def render_ml_data_tab(tracker: Tracker):
             feat_cols = [c for c in training_df.columns if c.startswith('feat_')]
             sq1.metric("Feature Columns", len(feat_cols))
             
+            # Schema health diagnostics (compare live df to canonical ML_EXPORT_SCHEMA)
+            canonical_schema = ML_EXPORT_SCHEMA
+            present_schema_cols = [c for c in canonical_schema if c in training_df.columns]
+            missing_features = list(set(canonical_schema) - set(training_df.columns))
+            schema_completeness = (len(present_schema_cols) / len(canonical_schema)) * 100 if canonical_schema else 0
+
+            # Show schema completeness as a top-level metric
+            sq2.metric("Schema Completeness", f"{schema_completeness:.0f}% ({len(present_schema_cols)}/{len(canonical_schema)})")
+
             # Date range
             if 'timestamp' in training_df.columns:
                 try:
                     dates = pd.to_datetime(training_df['timestamp'])
-                    sq2.metric("Date Range", f"{dates.min().strftime('%m/%d')} - {dates.max().strftime('%m/%d')}")
+                    sq3.metric("Date Range", f"{dates.min().strftime('%m/%d')} - {dates.max().strftime('%m/%d')}")
                 except:
-                    sq2.metric("Date Range", "N/A")
+                    sq3.metric("Date Range", "N/A")
             else:
-                sq2.metric("Date Range", "N/A")
-            
+                sq3.metric("Date Range", "N/A")
+
+            # If there are missing canonical columns, surface a clear warning & explanation
+            if missing_features:
+                # Prefer listing only canonical feature names to avoid overwhelming the user
+                missing_list = ', '.join(sorted(missing_features))
+                st.warning(f"Missing {len(missing_features)} canonical columns: {missing_list}")
+                st.caption("These features are present in the CSV generator but missing from historical tracked bets.")
+
             # Avg margin if available
             if 'margin' in training_df.columns:
                 avg_margin = training_df['margin'].mean()
-                sq3.metric("Avg Margin", f"{avg_margin:+.1f}")
+                # If schema is incomplete, display avg margin but add a small note
+                if missing_features:
+                    sq3.metric("Avg Margin", f"{avg_margin:+.1f}", delta="(Schema incomplete)")
+                else:
+                    sq3.metric("Avg Margin", f"{avg_margin:+.1f}")
             else:
                 sq3.metric("Avg Margin", "N/A")
             
@@ -5794,13 +6089,33 @@ def render_ml_data_tab(tracker: Tracker):
         
         with view_tab2:
             # All feature columns
-            feat_cols = [c for c in training_df.columns if c.startswith('feat_')]
-            if feat_cols:
-                # Add identifier columns
-                id_cols = ['player', 'market', 'result']
-                show_cols = [c for c in id_cols if c in training_df.columns] + feat_cols
-                st.caption(f"Showing {len(feat_cols)} feature columns")
-                st.dataframe(training_df[show_cols].tail(20), hide_index=True, width="stretch")
+            canonical_feat_cols = [c for c in ML_EXPORT_SCHEMA if c.startswith('feat_')]
+            present_feat_cols = [c for c in training_df.columns if c.startswith('feat_')]
+            missing_feat_cols = [c for c in canonical_feat_cols if c not in present_feat_cols]
+
+            # Prepare a display copy so we don't mutate the original DataFrame
+            display_df = training_df.copy()
+            if missing_feat_cols:
+                # Fill missing canonical columns with sentinel values for visibility (display-only)
+                for col in missing_feat_cols:
+                    try:
+                        display_df[col] = tracker._ml_column_sentinel(col)
+                    except Exception:
+                        # Fallback to NaN if sentinel helper unavailable
+                        display_df[col] = ''
+
+            # Build ordered columns: identifiers first, then canonical features
+            id_cols = ['player', 'market', 'result']
+            show_cols = [c for c in id_cols if c in display_df.columns] + [c for c in canonical_feat_cols if c in display_df.columns]
+
+            st.caption(f"Showing {len(present_feat_cols)} of {len(canonical_feat_cols)} canonical feature columns")
+
+            if missing_feat_cols:
+                st.warning(f"Missing {len(missing_feat_cols)} feature(s): {', '.join(sorted(missing_feat_cols))}")
+                st.caption("These features are present in the CSV generator but missing from historical tracked bets. Shown above with sentinel values for clarity.")
+
+            if show_cols:
+                st.dataframe(display_df[show_cols].tail(20), hide_index=True, width="stretch")
             else:
                 st.info("No feature columns found")
         
@@ -6460,8 +6775,8 @@ def main():
                 if st.button("💾 Track", use_container_width=True):
                     try:
                         features = result.features
-                        # V20.3: Track all 27 features for ML training export
-                        tracker.log_bet({
+                        # Build payload with static metadata
+                        bet_payload = {
                             "player": result.player_name,
                             "opponent": result.opponent_name,
                             "market": result.market,
@@ -6475,39 +6790,10 @@ def main():
                             "predicted_mean": result.decision.predicted_mean,
                             "predicted_std": result.decision.predicted_std,
                             "tag": selected_tag,
-                            # V20.3 Required Features (27 features - exact names)
-                            # Statistical baseline (3)
-                            "feat_avg_minutes": float(features.avg_minutes),
-                            "feat_ema": float(features.ema),
-                            "feat_std": float(features.std),
-                            # Opponent context (1)
-                            "feat_opponent_drtg_season": float(features.opponent_drtg_season),
-                            # Line and game context (3)
-                            "feat_line": float(features.line),
-                            "feat_spread": float(features.spread),
-                            "feat_game_total": float(features.game_total),
-                            # Rest observables (3)
-                            "feat_days_rest": int(features.days_rest),
-                            "feat_is_home": bool(features.is_home),
-                            "feat_is_b2b": bool(features.is_b2b),
-                            # Sample size (1)
-                            "feat_games_played": int(features.games_played),
-                            # V20.2: Pace context (2)
-                            "feat_opponent_pace": float(features.opponent_pace),
-                            "feat_team_pace": float(features.team_pace),
-                            # V20.2: Momentum & splits (3)
-                            "feat_trend_5g": float(features.trend_5g),
-                            "feat_home_avg": float(features.home_avg),
-                            "feat_away_avg": float(features.away_avg),
-                            # V20.3 NEW: Absence-aware features (4)
-                            # -1.0 sentinel = unknown (live predictions use injury report)
-                            "feat_team_out_ppg": float(features.team_out_ppg),
-                            "feat_team_out_count": int(features.team_out_count),
-                            "feat_opp_out_ppg": float(features.opp_out_ppg),
-                            "feat_opp_out_count": int(features.opp_out_count),
-                            # Market identity (4)
-                            **get_market_group_features(result.market),
-                        })
+                        }
+                        # Dynamically merge features based on canonical schema
+                        bet_payload.update(extract_features_dynamically(features, market=result.market))
+                        tracker.log_bet(bet_payload)
                         st.toast(f"Bet tracked! [{selected_tag}]", icon="💾")
                     except Exception as e:
                         st.error(f"Failed to track bet: {e}")
@@ -6989,6 +7275,11 @@ def main():
 # ENTRY POINT
 # =============================================================================
 
-if __name__ == "__main__": 
+if __name__ == "__main__":
+    # Required on Windows to allow spawned child processes to import this module
+    try:
+        multiprocessing.freeze_support()
+    except Exception:
+        pass
     main()
                 
