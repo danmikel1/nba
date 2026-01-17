@@ -9,3 +9,4 @@ xgboost
 requests
 beautifulsoup4
 scipy
+pyarrow
