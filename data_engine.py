@@ -16,7 +16,7 @@ class DataEngine:
     Uses Parquet for efficient storage and LeagueGameLog for bulk fetching.
     """
 
-    def __init__(self, data_dir: Path, season: str = "2024-25"):
+    def __init__(self, data_dir: Path, season: str = "2025-26"):
         """
         Initialize the DataEngine.
 
