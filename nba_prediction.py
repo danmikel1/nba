@@ -22,6 +22,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy import stats  # V19: For CDF-based probability calculation
 import requests
 from bs4 import BeautifulSoup
+from data_engine import DataEngine
 
 warnings.filterwarnings('ignore')
 
@@ -85,6 +86,13 @@ def _conditional_cache(ttl: int):
         def identity_decorator(func):
             return func
         return identity_decorator
+
+# Initialize Data Engine singleton with st.cache_resource
+if _IN_MAIN_PROCESS:
+    @st.cache_resource
+    def get_data_engine(data_dir: Path, season: str) -> DataEngine:
+        """Singleton provider for DataEngine using Streamlit cache."""
+        return DataEngine(data_dir=data_dir, season=season)
 
 logging.basicConfig(level=logging.INFO if _IN_MAIN_PROCESS else logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -557,13 +565,24 @@ class DataLoader:
     Fails hard with clear errors if data is missing. 
     """
     
-    def __init__(self, config: Config = CONFIG):
+    def __init__(self, config: Config = CONFIG, data_engine: DataEngine = None):
         self.config = config
         self._position_cache: Dict[int, str] = {}
         self._team_stats_cache: Optional[Tuple[pd.DataFrame, float, float]] = None
         self._team_stats_cache_time: float = 0
         # Position Usage Map: {team_id: {position: mean_usg_pct}}
         self._pos_usage_map: Optional[Dict[int, Dict[str, float]]] = None
+
+        # Integrate DataEngine
+        if data_engine:
+            self.data_engine = data_engine
+        elif _IN_MAIN_PROCESS:
+            # Use singleton if available
+            self.data_engine = get_data_engine(DATA_DIR, config.CURRENT_SEASON)
+        else:
+            # Create fresh instance for worker process
+            # Note: Workers will share disk cache (parquet) so this is efficient
+            self.data_engine = DataEngine(DATA_DIR, config.CURRENT_SEASON)
     
     def _api_call_with_retry(self, func, description: str = "API call"):
         """Execute API call with retry logic. Exponential backoff for rate limits."""
@@ -680,62 +699,71 @@ class DataLoader:
             return 'SF'
     
     @_conditional_cache(ttl=CONFIG.CACHE_TTL_GAME_LOGS)
-    def fetch_game_logs(_self, player_id: int, season: str = None) -> pd.DataFrame:
+    def fetch_game_logs(self, player_id: int, season: str = None) -> pd.DataFrame:
         """
         Fetch player game logs for a season.
-        Returns empty DataFrame if no data (not an error for new players).
+        Uses DataEngine for bulk fetching and caching.
         """
         if season is None:
-            season = _self.config. CURRENT_SEASON
+            season = self.config.CURRENT_SEASON
         
         try: 
-            def api_call():
-                return playergamelog. PlayerGameLog(player_id=player_id, season=season).get_data_frames()[0]
+            # Use DataEngine to get player logs from cached master file
+            df = self.data_engine.get_player_logs(player_id, season)
             
-            df = _self._api_call_with_retry(api_call, f"Fetch game logs for player {player_id}")
-            
-            if df is None or len(df) == 0:
+            if df.empty:
                 return pd.DataFrame()
             
-            # Process the dataframe
-            df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
+            # === Feature Engineering ===
+            # Replicate the logic that was previously done after API fetch
+
+            # Ensure sorting
+            if 'GAME_DATE' not in df.columns:
+                # Should have been handled by DataEngine, but double check
+                df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
+
             df = df.sort_values('GAME_DATE')
             
-            # Create combo stats
-            # Ensure critical numeric columns are numeric (prevent string parsing errors)
-            for col in ['PTS', 'REB', 'AST', 'FG3M', 'FGA', 'FTA', 'STL', 'BLK', 'TOV']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+            # DataEngine already handles numeric optimization for basic stats
+            # (PTS, REB, AST, etc.)
 
+            # Create combo stats (these are derived, not in raw logs)
             df['PRA'] = df['PTS'] + df['REB'] + df['AST']
             df['PA'] = df['PTS'] + df['AST']
             df['PR'] = df['PTS'] + df['REB']
             df['RA'] = df['REB'] + df['AST']
-            df['IS_HOME'] = df['MATCHUP'].str.contains('vs. ', na=False)
             
+            # Home/Away logic
+            if 'MATCHUP' in df.columns:
+                df['IS_HOME'] = df['MATCHUP'].str.contains('vs. ', na=False)
+
+            # 3PM alias
             if 'FG3M' in df.columns:
                 df['3PM'] = df['FG3M']
             
-            df['DAYS_REST'] = df['GAME_DATE']. diff().dt.days - 1
+            # Days Rest
+            df['DAYS_REST'] = df['GAME_DATE'].diff().dt.days - 1
             df['DAYS_REST'] = df['DAYS_REST'].fillna(3).clip(lower=0) 
             
-            # Parse minutes
-            if df['MIN'].dtype == object:
-                def parse_minutes(min_val):
-                    try:
-                        if pd.isna(min_val):
-                            return 0.0
-                        if isinstance(min_val, str):
-                            if ': ' in min_val:
-                                parts = min_val. split(':')
-                                return float(parts[0]) + float(parts[1]) / 60
+            # Minutes parsing is handled by DataEngine (MIN_FLOAT created there)
+            # If for some reason MIN_FLOAT is missing (e.g. old cache), fallback
+            if 'MIN_FLOAT' not in df.columns:
+                if 'MIN' in df.columns:
+                    # Quick parse fallback
+                    def parse_minutes(min_val):
+                        try:
+                            if pd.isna(min_val): return 0.0
+                            if isinstance(min_val, (float, int)): return float(min_val)
+                            if isinstance(min_val, str):
+                                if ':' in min_val:
+                                    parts = min_val.split(':')
+                                    return float(parts[0]) + float(parts[1]) / 60
+                                return float(min_val)
                             return float(min_val)
-                        return float(min_val)
-                    except (ValueError, IndexError, TypeError):
-                        return 0.0
-                df['MIN_FLOAT'] = df['MIN'].apply(parse_minutes)
-            else:
-                df['MIN_FLOAT'] = pd.to_numeric(df['MIN'], errors='coerce').fillna(0)
+                        except: return 0.0
+                    df['MIN_FLOAT'] = df['MIN'].apply(parse_minutes)
+                else:
+                    df['MIN_FLOAT'] = 0.0
             
             # Per-minute stats
             target_stats = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'FG3M']
@@ -743,23 +771,29 @@ class DataLoader:
                 if stat in df.columns:
                     df[f'{stat}_PER_MIN'] = df[stat] / df['MIN_FLOAT']
                     df[f'{stat}_PER_MIN'] = df[f'{stat}_PER_MIN'].fillna(0.0)
+
             return df
             
-        except DataLoaderError: 
-            raise
         except Exception as e:
             logger.error(f"Failed to fetch game logs for player {player_id}: {e}")
-            return pd. DataFrame()
+            return pd.DataFrame()
     
     def fetch_multi_season_logs(self, player_id: int) -> pd.DataFrame:
         """Fetch logs from current and previous season."""
         try:
+            # DataEngine makes this fast - hits local parquet for both seasons
             df_current = self.fetch_game_logs(player_id, self.config.CURRENT_SEASON)
             df_prev = self.fetch_game_logs(player_id, self.config.PREV_SEASON)
+
             frames = [df for df in [df_current, df_prev] if len(df) > 0]
-            return pd. concat(frames, ignore_index=True) if frames else pd. DataFrame()
+            if not frames:
+                return pd.DataFrame()
+
+            combined = pd.concat(frames, ignore_index=True)
+            return combined.sort_values('GAME_DATE').reset_index(drop=True)
+
         except Exception as e: 
-            logger.error(f"Failed to fetch multi-season logs:  {e}")
+            logger.error(f"Failed to fetch multi-season logs: {e}")
             return pd.DataFrame()
     
     @_conditional_cache(ttl=CONFIG.CACHE_TTL_TEAM_STATS)
