@@ -4002,21 +4002,24 @@ def generate_ml_data_streamlit():
     - **Temporal Fix**: Each game uses its season's actual DRTG/Pace
     """)
     
-    col1, col2 = st.columns(2)
-    with col1:
-        num_players = st.slider("Number of Players", 10, 600, 50, 10)
-        test_days = st.slider("Games per Player", 30, 300, 150, 10,
-                              help="4 seasons = ~328 games max per player")
+    with st.form(key='ml_gen_form'):
+        col1, col2 = st.columns(2)
+        with col1:
+            num_players = st.slider("Number of Players", 10, 600, 50, 10)
+            test_days = st.slider("Games per Player", 30, 300, 150, 10,
+                                  help="4 seasons = ~328 games max per player")
+
+        with col2:
+            markets = st.multiselect(
+                "Markets",
+                ['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR', '3PM', 'STL', 'BLK'],
+                default=['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR']
+            )
+            output_file = st.text_input("Output Filename", "ml_training_data.csv")
+
+        submitted = st.form_submit_button("🚀 Generate Training Data", type="primary")
     
-    with col2:
-        markets = st.multiselect(
-            "Markets",
-            ['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR', '3PM', 'STL', 'BLK'],
-            default=['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR']
-        )
-        output_file = st.text_input("Output Filename", "ml_training_data.csv")
-    
-    if st.button("🚀 Generate Dataset", type="primary"):
+    if submitted:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -6664,127 +6667,138 @@ def main():
         all_players = players.get_players()
         player_names = sorted([p['full_name'] for p in all_players if p.get('is_active', True)])
         
-        # Primary inputs - always visible
-        col1, col2 = st.columns(2)
-        with col1:
-            player_in = st.selectbox("🏃 Player", player_names, index=None, placeholder="Search...")
-        with col2:
-            nba_teams = teams.get_teams()
-            team_opts = sorted([t['abbreviation'] for t in nba_teams])
-            try:
-                def_idx = team_opts.index('LAL')
-            except ValueError:
-                def_idx = 0
-            opp_in = st.selectbox("🎯 vs", team_opts, index=def_idx)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            market = st.selectbox("📊 Market", ["PTS", "REB", "AST", "PRA", "3PM", "PA", "PR", "RA", "STL", "BLK"])
-        with col2:
-            line_in = st.number_input("🎯 Line", 0.5, 100.0, 25.5, 0.5)
-        with col3:
-            odds_in = st.number_input("💲 Odds", 1.01, 10.00, 1.85, 0.01)
-        
-        # Show injury reports for BOTH teams
-        if opp_in:
-            # Get player's team abbrev (we'll determine this from the analysis context)
-            player_team_abbrev = None
-            if player_in:
+        with st.form(key='analysis_form'):
+            # Primary inputs - always visible
+            col1, col2 = st.columns(2)
+            with col1:
+                player_in = st.selectbox("🏃 Player", player_names, index=None, placeholder="Search...")
+            with col2:
+                nba_teams = teams.get_teams()
+                team_opts = sorted([t['abbreviation'] for t in nba_teams])
                 try:
-                    p_list = players.find_players_by_full_name(player_in)
-                    if p_list:
-                        p_id = p_list[0]['id']
-                        from nba_api.stats.endpoints import commonplayerinfo
-                        import time
-                        time.sleep(0.3)
-                        player_info = commonplayerinfo.CommonPlayerInfo(player_id=p_id).get_data_frames()[0]
-                        if 'TEAM_ABBREVIATION' in player_info.columns:
-                            player_team_abbrev = player_info['TEAM_ABBREVIATION'].iloc[0]
-                except:
-                    pass
+                    def_idx = team_opts.index('LAL')
+                except ValueError:
+                    def_idx = 0
+                opp_in = st.selectbox("🎯 vs", team_opts, index=def_idx)
             
-            inj_col1, inj_col2 = st.columns(2)
-            
-            # Opponent injuries (raw observational data)
-            with inj_col1:
-                with st.expander(f"🏥 {opp_in} Injuries (Opponent)", expanded=False):
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                market = st.selectbox("📊 Market", ["PTS", "REB", "AST", "PRA", "3PM", "PA", "PR", "RA", "STL", "BLK"])
+            with col2:
+                line_in = st.number_input("🎯 Line", 0.5, 100.0, 25.5, 0.5)
+            with col3:
+                odds_in = st.number_input("💲 Odds", 1.01, 10.00, 1.85, 0.01)
+
+            # Show injury reports for BOTH teams
+            # Logic moved inside form so it updates on submit
+            if opp_in:
+                # Get player's team abbrev (we'll determine this from the analysis context)
+                player_team_abbrev = None
+                if player_in:
                     try:
-                        injuries = orchestrator.injury_manager.get_team_injury_report(opp_in)
-                        if injuries:
-                            for inj in injuries:
-                                status = inj.get('status', 'Unknown')
-                                emoji = {'OUT': '🔴', 'DOUBTFUL': '🟠', 'QUESTIONABLE': '🟡', 'DAY-TO-DAY': '🟡', 'PROBABLE': '🟢'}.get(status, '⚪')
-                                pos = inj.get('position', '')
-                                pos_str = f" [{pos}]" if pos else ""
-                                injury_desc = inj.get('injury', '')
-                                st.markdown(f"{emoji} **{inj.get('name', 'Unknown')}**{pos_str} — {status}" + (f" ({injury_desc})" if injury_desc else ""))
-                            st.caption(f"Source: {injuries[0].get('source', 'ESPN')}")
-                        else:
-                            st.info("No injuries reported")
-                    except Exception as e:
-                        st.caption(f"Could not fetch injuries: {e}")
-            
-            # Player's team injuries (raw observational data)
-            with inj_col2:
-                if player_team_abbrev and player_team_abbrev != opp_in:
-                    with st.expander(f"🏥 {player_team_abbrev} Injuries (Player's Team)", expanded=False):
+                        p_list = players.find_players_by_full_name(player_in)
+                        if p_list:
+                            p_id = p_list[0]['id']
+                            from nba_api.stats.endpoints import commonplayerinfo
+                            import time
+                            time.sleep(0.3)
+                            player_info = commonplayerinfo.CommonPlayerInfo(player_id=p_id).get_data_frames()[0]
+                            if 'TEAM_ABBREVIATION' in player_info.columns:
+                                player_team_abbrev = player_info['TEAM_ABBREVIATION'].iloc[0]
+                    except:
+                        pass
+
+                inj_col1, inj_col2 = st.columns(2)
+
+                # Opponent injuries (raw observational data)
+                with inj_col1:
+                    with st.expander(f"🏥 {opp_in} Injuries (Opponent)", expanded=False):
                         try:
-                            team_injuries = orchestrator.injury_manager.get_team_injury_report(player_team_abbrev)
-                            if team_injuries:
-                                for inj in team_injuries:
+                            injuries = orchestrator.injury_manager.get_team_injury_report(opp_in)
+                            if injuries:
+                                for inj in injuries:
                                     status = inj.get('status', 'Unknown')
                                     emoji = {'OUT': '🔴', 'DOUBTFUL': '🟠', 'QUESTIONABLE': '🟡', 'DAY-TO-DAY': '🟡', 'PROBABLE': '🟢'}.get(status, '⚪')
                                     pos = inj.get('position', '')
                                     pos_str = f" [{pos}]" if pos else ""
                                     injury_desc = inj.get('injury', '')
                                     st.markdown(f"{emoji} **{inj.get('name', 'Unknown')}**{pos_str} — {status}" + (f" ({injury_desc})" if injury_desc else ""))
-                                st.caption(f"Source: {team_injuries[0].get('source', 'ESPN')}")
+                                st.caption(f"Source: {injuries[0].get('source', 'ESPN')}")
                             else:
                                 st.info("No injuries reported")
                         except Exception as e:
                             st.caption(f"Could not fetch injuries: {e}")
-        
-        # Advanced options in expander
-        with st.expander("Advanced Options", expanded=False):
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                is_home = st.checkbox("Home", True)
-            with c2:
-                days_rest = st.selectbox("Rest", [0, 1, 2, 3], index=1,
-                                         format_func=lambda x: "B2B" if x == 0 else f"{x}d")
-            with c3:
-                spread = st.number_input("Spread", -25.0, 25.0, 0.0, 0.5)
-            with c4:
-                game_total = st.number_input("Total", 180.0, 280.0, 225.0, 0.5)
-            lookback = st.slider("Lookback Games", 5, 30, 15)
-        
-        is_b2b = days_rest == 0
-        
-        is_valid, error_msg = validate_inputs(line_in, odds_in)
-        if not is_valid: 
-            st.error(error_msg)
-        
-        if st.button("Run Analysis", type="primary", disabled=not player_in or not is_valid):
-            with st.spinner(f"Analyzing {player_in} vs {opp_in}..."):
-                result = orchestrator.run_analysis(
-                    player_name=player_in,
-                    opponent_name=opp_in,
-                    market=market,
-                    line=line_in,
-                    odds=odds_in,
-                    is_home=is_home,
-                    is_b2b=is_b2b,
-                    lookback=lookback,
-                    spread=spread,
-                    bankroll=bankroll,
-                    days_rest=days_rest,
-                    game_total=game_total
-                )
                 
-                if not result.success:
-                    st.error(result.error)
-                else: 
-                    st.session_state.analysis_result = result
+                # Player's team injuries (raw observational data)
+                with inj_col2:
+                    if player_team_abbrev and player_team_abbrev != opp_in:
+                        with st.expander(f"🏥 {player_team_abbrev} Injuries (Player's Team)", expanded=False):
+                            try:
+                                team_injuries = orchestrator.injury_manager.get_team_injury_report(player_team_abbrev)
+                                if team_injuries:
+                                    for inj in team_injuries:
+                                        status = inj.get('status', 'Unknown')
+                                        emoji = {'OUT': '🔴', 'DOUBTFUL': '🟠', 'QUESTIONABLE': '🟡', 'DAY-TO-DAY': '🟡', 'PROBABLE': '🟢'}.get(status, '⚪')
+                                        pos = inj.get('position', '')
+                                        pos_str = f" [{pos}]" if pos else ""
+                                        injury_desc = inj.get('injury', '')
+                                        st.markdown(f"{emoji} **{inj.get('name', 'Unknown')}**{pos_str} — {status}" + (f" ({injury_desc})" if injury_desc else ""))
+                                    st.caption(f"Source: {team_injuries[0].get('source', 'ESPN')}")
+                                else:
+                                    st.info("No injuries reported")
+                            except Exception as e:
+                                st.caption(f"Could not fetch injuries: {e}")
+
+            # Advanced options in expander
+            with st.expander("Advanced Options", expanded=False):
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    is_home = st.checkbox("Home", True)
+                with c2:
+                    days_rest = st.selectbox("Rest", [0, 1, 2, 3], index=1,
+                                             format_func=lambda x: "B2B" if x == 0 else f"{x}d")
+                with c3:
+                    spread = st.number_input("Spread", -25.0, 25.0, 0.0, 0.5)
+                with c4:
+                    game_total = st.number_input("Total", 180.0, 280.0, 225.0, 0.5)
+                lookback = st.slider("Lookback Games", 5, 30, 15)
+
+            is_b2b = days_rest == 0
+
+            is_valid, error_msg = validate_inputs(line_in, odds_in)
+            if not is_valid:
+                st.error(error_msg)
+
+            # V20.3 FIX: Cannot disable submit button based on form inputs (deadlock)
+            # Validation must happen inside the submitted block
+            submitted = st.form_submit_button("Run Analysis", type="primary")
+
+        if submitted:
+            if not player_in:
+                st.error("Please select a player.")
+            elif not is_valid:
+                st.error(f"Invalid inputs: {error_msg}")
+            else:
+                with st.spinner(f"Analyzing {player_in} vs {opp_in}..."):
+                    result = orchestrator.run_analysis(
+                        player_name=player_in,
+                        opponent_name=opp_in,
+                        market=market,
+                        line=line_in,
+                        odds=odds_in,
+                        is_home=is_home,
+                        is_b2b=is_b2b,
+                        lookback=lookback,
+                        spread=spread,
+                        bankroll=bankroll,
+                        days_rest=days_rest,
+                        game_total=game_total
+                    )
+
+                    if not result.success:
+                        st.error(result.error)
+                    else:
+                        st.session_state.analysis_result = result
         
         # Display results
         result = st.session_state.analysis_result

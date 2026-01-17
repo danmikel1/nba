@@ -5,6 +5,7 @@ from nba_api.stats.endpoints import leaguegamelog
 import os
 import time
 import logging
+import uuid
 from datetime import datetime
 
 # Set up logger
@@ -16,7 +17,7 @@ class DataEngine:
     Uses Parquet for efficient storage and LeagueGameLog for bulk fetching.
     """
 
-    def __init__(self, data_dir: Path, season: str = "2025-26"):
+    def __init__(self, data_dir: Path, season: str = "2024-25"):
         """
         Initialize the DataEngine.
 
@@ -138,8 +139,8 @@ class DataEngine:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce').fillna(-1).astype(int)
 
-            # Atomic Write
-            temp_path = cache_path.with_suffix('.tmp')
+            # Atomic Write with unique temp file to prevent race conditions
+            temp_path = cache_path.with_suffix(f'.{uuid.uuid4()}.tmp')
             df.to_parquet(temp_path, index=False)
             os.replace(temp_path, cache_path)
 
