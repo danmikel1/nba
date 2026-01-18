@@ -618,6 +618,39 @@ def american_to_decimal(odds: float) -> float:
         return (100 / abs(odds)) + 1
 
 
+def safe_clean_for_arrow(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robustly clean DataFrame to prevent PyArrow crashes in Streamlit.
+    Forces strict types for boolean and integer columns.
+    """
+    if df is None or df.empty:
+        return df
+        
+    df_clean = df.copy()
+    
+    # 1. Fix Boolean Columns (handles 1, 0, 1.0, "True", True -> bool)
+    # Includes both 'feat_' versions and standard versions
+    bool_targets = [
+        'feat_is_home', 'feat_is_b2b', 
+        'is_home', 'is_b2b', 'hit', 'passes_offset'
+    ]
+    for col in bool_targets:
+        if col in df_clean.columns:
+            # Force numeric (True->1, False->0), fill NaNs with 0, then cast to bool
+            df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0).astype(int).astype(bool)
+
+    # 2. Fix Integer Columns (handles 1.0 -> 1, "5" -> 5)
+    int_targets = [
+        'market_scoring', 'market_counting', 'market_combo', 'market_rare',
+        'feat_market_scoring', 'feat_market_counting', 'feat_market_combo', 'feat_market_rare',
+        'feat_team_out_count', 'feat_opp_out_count', 'feat_games_played'
+    ]
+    for col in int_targets:
+        if col in df_clean.columns:
+            df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(-1).astype(int)
+            
+    return df_clean
+
 # =============================================================================
 # LAYER 1: DATA LOADER
 # =============================================================================
@@ -4145,7 +4178,6 @@ def generate_ml_data_streamlit():
             )
             output_file = st.text_input("Output Filename", "ml_training_data.csv")
         
-        # 🚀 SUBMIT BUTTON
         submitted = st.form_submit_button("🚀 Generate Dataset", type="primary")
     
     # 🛑 LOGIC EXECUTION
@@ -4167,23 +4199,25 @@ def generate_ml_data_streamlit():
             )
             
             if len(df) > 0:
-                # Save to session state immediately
+                # Save to session state
                 st.session_state['last_ml_training_data'] = df
                 st.session_state['last_ml_output_file'] = output_file
-                # Rerun to trigger the display logic below (which now handles cleaning)
-                st.rerun()
+                st.rerun() # Refresh to show results
             else:
                 st.error("Failed to generate training data. Check logs for errors.")
 
-    # 📊 RESULTS DISPLAY (Persists via session state)
+    # 📊 RESULTS DISPLAY
     if 'last_ml_training_data' in st.session_state:
-        # Load from memory
-        df = st.session_state['last_ml_training_data'].copy()
+        # Load and CLEAN immediately
+        raw_df = st.session_state['last_ml_training_data']
+        
+        # 🛡️ USE HELPER FUNCTION
+        df = safe_clean_for_arrow(raw_df)
+        
         filename = st.session_state.get('last_ml_output_file', 'ml_training_data.csv')
         
         st.success(f"✅ Generated {len(df)} training samples!")
         
-        # Show summary stats
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Samples", len(df))
         if 'hit' in df.columns:
@@ -4191,32 +4225,9 @@ def generate_ml_data_streamlit():
         if 'player' in df.columns:
             col3.metric("Unique Players", df['player'].nunique())
         
-        # =================================================================
-        # 🛡️ ARROW CRASH FIX (MOVED HERE to protect EVERY render)
-        # =================================================================
-        try:
-            # 1. Force boolean columns (fixes "int 1 cannot be converted to bool")
-            bool_cols = ['feat_is_home', 'feat_is_b2b']
-            for col in bool_cols:
-                if col in df.columns:
-                    # Convert to numeric first (handles mixed 1/0/True/False), then to bool
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(bool)
-
-            # 2. Force integer columns (fixes mixed float/int types)
-            int_cols = ['market_scoring', 'market_counting', 'market_combo', 'market_rare', 'hit']
-            for col in int_cols:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
-                    
-        except Exception as e:
-            st.warning(f"Auto-correction of column types warning: {e}")
-
-        # =================================================================
-        
-        # Preview (Safe to render now)
+        # Safe Preview
         st.dataframe(df.head(20), width="stretch")
         
-        # Download button
         csv = df.to_csv(index=False)
         st.download_button(
             "📥 Download CSV",
@@ -6333,7 +6344,7 @@ def render_ml_data_tab(tracker: Tracker):
             summary_cols = ['player', 'market', 'line', 'side', 'result', 'margin', 'result_quality', 'feat_prob', 'feat_ev']
             display_cols = [c for c in summary_cols if c in training_df.columns]
             if display_cols:
-                st.dataframe(training_df[display_cols].tail(20), hide_index=True,width="stretch")
+                st.dataframe(safe_clean_for_arrow(training_df[display_cols].tail(20)), hide_index=True, width="stretch")
             else:
                 st.info("No summary columns available")
         
@@ -6365,14 +6376,14 @@ def render_ml_data_tab(tracker: Tracker):
                 st.caption("These features are present in the CSV generator but missing from historical tracked bets. Shown above with sentinel values for clarity.")
 
             if show_cols:
-                st.dataframe(display_df[show_cols].tail(20), hide_index=True, width="stretch")
+                st.dataframe(safe_clean_for_arrow(display_df[show_cols].tail(20)), hide_index=True, width="stretch")
             else:
                 st.info("No feature columns found")
         
         with view_tab3:
             # Full raw data with column count
             st.caption(f"All {len(training_df.columns)} columns × {len(training_df)} rows")
-            st.dataframe(training_df.tail(30), hide_index=True, width="stretch")
+            st.dataframe(safe_clean_for_arrow(training_df.tail(30)), hide_index=True, width="stretch")
         
         # Download buttons
         st.markdown("---")
