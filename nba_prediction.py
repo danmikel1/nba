@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+import google.genai as genai
 import pandas as pd
 import numpy as np
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, leaguedashplayerstats, leaguegamelog
@@ -366,6 +366,10 @@ class FeatureVector:
     team_out_count: int = -1        # Count of teammates out
     opp_out_ppg: float = -1.0       # PPG of opponents who didn't play
     opp_out_count: int = -1         # Count of opponents out
+
+    # === V20.4 NEW: ADVANCED CONTEXT ===
+    feat_usage_rate: float = -1.0   # Rolling usage intensity
+    feat_h2h_avg: float = -1.0      # Avg vs this opponent
     
     # === MARKET IDENTITY (one-hot encoded) ===
     market_scoring: int = 0  # PTS
@@ -429,6 +433,8 @@ class FeatureVector:
             float(self.feat_min_volatility),
             float(self.feat_foul_rate),
             float(self.feat_cv),
+            float(self.feat_usage_rate),
+            float(self.feat_h2h_avg),
         ]
         return np.array(numeric_features)
 
@@ -1399,6 +1405,18 @@ class FeatureEngineer:
             except Exception:
                 foul_rate = 0.0
 
+        usage_rate = 0.0
+        if len(recent) > 0:
+            try:
+                # Create temporary series for calculation
+                usg_series = (recent['FGA'] + 0.44 * recent['FTA'] + recent['TOV']) / recent['MIN_FLOAT']
+                # Clean infinites/NaNs
+                usg_series = usg_series.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                # Take average of last N games
+                usage_rate = usg_series.mean()
+            except Exception:
+                usage_rate = 0.0        
+
         # Coefficient of variation (std / ema) - treat very small ema as unstable
         cv = 0.0
         try:
@@ -1420,6 +1438,7 @@ class FeatureEngineer:
             'min_volatility': min_volatility,
             'foul_rate': foul_rate,
             'cv': cv,
+            'usage_rate': float(usage_rate)
         }
     
     def _calculate_ts_pct(self, df: pd.DataFrame, lookback: int = 15) -> Tuple[float, float]:
@@ -1584,13 +1603,33 @@ class FeatureEngineer:
             feat_ts_pct = feat_ts_pct
             feat_ts_pct_delta = feat_ts_pct_delta
         
-        # === BUILD V20.3 FEATURE VECTOR ===
+        # === V20.4 NEW: HEAD-TO-HEAD HISTORY ===
+        h2h_avg = -1.0
+        try:
+            # Filter for games against this opponent
+            # We use the 'MATCHUP' column which contains "vs. BOS" or "@ BOS"
+            if opponent_abbrev and 'MATCHUP' in df.columns:
+                # Look for abbreviation in matchup string
+                h2h_games = df[df['MATCHUP'].str.contains(opponent_abbrev, case=False, na=False)]
+                
+                if len(h2h_games) > 0:
+                    # Calculate average of the target stat (e.g., PTS)
+                    h2h_avg = h2h_games[stat_col].mean()
+                else:
+                    # No history? Default to season EMA
+                    h2h_avg = stats['ema']
+        except Exception:
+            h2h_avg = stats['ema']
+
+    
+        # === BUILD FEATURE VECTOR ===
         return FeatureVector(
             # Identifiers (not used in ML)
             player_id=player_id,
             player_name=player_name,
             opponent_abbrev=opponent_abbrev,
             market=market,
+            
             # Raw observables only - NO MULTIPLIERS
             line=line,
             avg_minutes=stats['avg_minutes'],
@@ -1603,32 +1642,43 @@ class FeatureEngineer:
             is_home=is_home,
             is_b2b=is_b2b or actual_days_rest == 0,
             games_played=stats['games_played'],
+            
             # V20.2: Pace context
             opponent_pace=opponent_pace,
             team_pace=team_pace,
+            
             # V20.2: Momentum & splits
             trend_5g=stats['trend_5g'],
             home_avg=stats['home_avg'],
             away_avg=stats['away_avg'],
+            
             # V20.3 NEW: True-Shooting features
             feat_ts_pct=feat_ts_pct,
             feat_ts_pct_delta=feat_ts_pct_delta,
+            
             # V20.3 NEW: Absence-aware features (from injury report)
             team_out_ppg=team_out_ppg,
             team_out_count=team_out_count,
             opp_out_ppg=opp_out_ppg,
             opp_out_count=opp_out_count,
+            
             # V20.3 NEW: Behavior & Risk features (stat-derived)
             feat_min_volatility=stats.get('min_volatility', 0.0),
             feat_foul_rate=stats.get('foul_rate', 0.0),
             feat_cv=stats.get('cv', 0.0),
+            
             # Market identity (one-hot encoded)
             market_scoring=1 if market == 'PTS' else 0,
             market_counting=1 if market in ['REB', 'AST'] else 0,
             market_combo=1 if market in ['PRA', 'PR', 'PA', 'RA'] else 0,
             market_rare=1 if market in ['3PM', 'STL', 'BLK'] else 0,
+            
             # Data quality
-            data_quality=data_quality
+            data_quality=data_quality,
+            
+            # 🚀 V20.4 NEW FEATURES (The Missing Link)
+            feat_usage_rate=stats.get('usage_rate', 0.0),
+            feat_h2h_avg=h2h_avg
         )
 
 @dataclass
@@ -3177,6 +3227,8 @@ TRAINING_FEATURE_COLUMNS = [
     'feat_min_volatility',
     'feat_foul_rate',
     'feat_cv',
+    'feat_usage_rate',
+    'feat_h2h_avg'
 ]
 
 # Canonical export schema used for writing ML training CSVs (single source of truth)
@@ -4064,7 +4116,7 @@ def generate_ml_training_data(
     return final_df
 
 def generate_ml_data_streamlit():
-    """Streamlit UI wrapper for ML data generation."""
+    """Streamlit UI wrapper for ML data generation with Persistent Arrow Fix."""
     st.markdown("### 🤖 Generate ML Training Data")
     
     st.info(f"""
@@ -4077,21 +4129,27 @@ def generate_ml_data_streamlit():
     - **Temporal Fix**: Each game uses its season's actual DRTG/Pace
     """)
     
-    col1, col2 = st.columns(2)
-    with col1:
-        num_players = st.slider("Number of Players", 10, 600, 50, 10)
-        test_days = st.slider("Games per Player", 30, 300, 150, 10,
-                              help="4 seasons = ~328 games max per player")
+    # 🚀 START FORM
+    with st.form(key="generate_ml_data_form"):
+        col1, col2 = st.columns(2)
+        with col1:
+            num_players = st.slider("Number of Players", 10, 600, 50, 10)
+            test_days = st.slider("Games per Player", 30, 300, 150, 10,
+                                  help="4 seasons = ~328 games max per player")
+        
+        with col2:
+            markets = st.multiselect(
+                "Markets",
+                ['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR', '3PM', 'STL', 'BLK'],
+                default=['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR']
+            )
+            output_file = st.text_input("Output Filename", "ml_training_data.csv")
+        
+        # 🚀 SUBMIT BUTTON
+        submitted = st.form_submit_button("🚀 Generate Dataset", type="primary")
     
-    with col2:
-        markets = st.multiselect(
-            "Markets",
-            ['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR', '3PM', 'STL', 'BLK'],
-            default=['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR']
-        )
-        output_file = st.text_input("Output Filename", "ml_training_data.csv")
-    
-    if st.button("🚀 Generate Dataset", type="primary"):
+    # 🛑 LOGIC EXECUTION
+    if submitted:
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -4107,30 +4165,66 @@ def generate_ml_data_streamlit():
                 test_days=test_days,
                 progress_callback=update_progress
             )
+            
+            if len(df) > 0:
+                # Save to session state immediately
+                st.session_state['last_ml_training_data'] = df
+                st.session_state['last_ml_output_file'] = output_file
+                # Rerun to trigger the display logic below (which now handles cleaning)
+                st.rerun()
+            else:
+                st.error("Failed to generate training data. Check logs for errors.")
+
+    # 📊 RESULTS DISPLAY (Persists via session state)
+    if 'last_ml_training_data' in st.session_state:
+        # Load from memory
+        df = st.session_state['last_ml_training_data'].copy()
+        filename = st.session_state.get('last_ml_output_file', 'ml_training_data.csv')
         
-        if len(df) > 0:
-            st.success(f"✅ Generated {len(df)} training samples!")
-            
-            # Show summary stats
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total Samples", len(df))
+        st.success(f"✅ Generated {len(df)} training samples!")
+        
+        # Show summary stats
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Samples", len(df))
+        if 'hit' in df.columns:
             col2.metric("Win Rate", f"{df['hit'].mean():.1%}")
+        if 'player' in df.columns:
             col3.metric("Unique Players", df['player'].nunique())
-            
-            # Preview
-            st.dataframe(df.head(20), width="stretch")
-            
-            # Download button
-            csv = df.to_csv(index=False)
-            st.download_button(
-                "📥 Download CSV",
-                csv,
-                output_file,
-                "text/csv",
-                key='download-ml-data'
-            )
-        else:
-            st.error("Failed to generate training data. Check logs for errors.")
+        
+        # =================================================================
+        # 🛡️ ARROW CRASH FIX (MOVED HERE to protect EVERY render)
+        # =================================================================
+        try:
+            # 1. Force boolean columns (fixes "int 1 cannot be converted to bool")
+            bool_cols = ['feat_is_home', 'feat_is_b2b']
+            for col in bool_cols:
+                if col in df.columns:
+                    # Convert to numeric first (handles mixed 1/0/True/False), then to bool
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(bool)
+
+            # 2. Force integer columns (fixes mixed float/int types)
+            int_cols = ['market_scoring', 'market_counting', 'market_combo', 'market_rare', 'hit']
+            for col in int_cols:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+                    
+        except Exception as e:
+            st.warning(f"Auto-correction of column types warning: {e}")
+
+        # =================================================================
+        
+        # Preview (Safe to render now)
+        st.dataframe(df.head(20), width="stretch")
+        
+        # Download button
+        csv = df.to_csv(index=False)
+        st.download_button(
+            "📥 Download CSV",
+            csv,
+            filename,
+            "text/csv",
+            key='download-ml-data'
+        )
 
 
 # Shared singleton accessor for BulkGameLogLoader
