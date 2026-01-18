@@ -124,7 +124,9 @@ FEATURE_COLS_V20 = [
     # V20.3 NEW: Behavior & Risk features
     'feat_min_volatility',
     'feat_foul_rate',
-    'feat_cv',
+    'feat_cv',# 🚀 V20.4 NEW: ADD THESE TWO LINES 🚀
+    'feat_usage_rate',
+    'feat_h2h_avg',
 ]
 
 # V20 STRICT: No column aliases. No legacy migration.

@@ -1,5 +1,5 @@
 import streamlit as st
-import google.genai as genai
+import google.generativeai as genai
 import pandas as pd
 import numpy as np
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, leaguedashplayerstats, leaguegamelog
@@ -1933,6 +1933,10 @@ class ModelEngine:
             'feat_min_volatility': float(features.feat_min_volatility),
             'feat_foul_rate': float(features.feat_foul_rate),
             'feat_cv': float(features.feat_cv),
+            
+            # 🚀 V20.4 NEW: ADD THESE LINES TO FIX THE WARNINGS
+            'feat_usage_rate': float(features.feat_usage_rate),
+            'feat_h2h_avg': float(features.feat_h2h_avg),
         }
         
         # Extract values in the exact order expected by the model
@@ -2523,16 +2527,11 @@ class Backtester:
     ) -> Dict[str, Any]:
         """
         Create a frozen snapshot of features at prediction time.
-        
-        This captures EXACTLY what was known at prediction time,
-        preventing any post-hoc feature drift.
-        
-        V20.3: 24 raw observables including absence-aware features.
         """
         return {
             'snapshot_date': prediction_date.strftime('%Y-%m-%d'),
             'snapshot_season': self._get_season_for_date(prediction_date),
-            # Core features (frozen at prediction time) - V20.3 raw observables
+            # Core features
             'avg_minutes': features.avg_minutes,
             'ema': features.ema,
             'std': features.std,
@@ -2544,21 +2543,24 @@ class Backtester:
             'is_home': int(features.is_home),
             'is_b2b': int(features.is_b2b),
             'games_played': features.games_played,
-            # V20.2: Pace context
+            # V20.2 Features
             'opponent_pace': features.opponent_pace,
             'team_pace': features.team_pace,
-            # V20.2: Momentum & splits
             'trend_5g': features.trend_5g,
             'home_avg': features.home_avg,
             'away_avg': features.away_avg,
-            # V20.3 NEW: True-Shooting features
+            # V20.3 Features
             'feat_ts_pct': features.feat_ts_pct,
             'feat_ts_pct_delta': features.feat_ts_pct_delta,
-            # V20.3 NEW: Behavior & Risk features
             'feat_min_volatility': features.feat_min_volatility,
             'feat_foul_rate': features.feat_foul_rate,
             'feat_cv': features.feat_cv,
-            # V20.3 NEW: Absence-aware features
+            
+            # 🚀 V20.4 NEW: ADD THESE LINES (Currently missing in your file)
+            'feat_usage_rate': features.feat_usage_rate,
+            'feat_h2h_avg': features.feat_h2h_avg,
+            
+            # Absence features
             'team_out_ppg': features.team_out_ppg,
             'team_out_count': features.team_out_count,
             'opp_out_ppg': features.opp_out_ppg,
@@ -2568,7 +2570,7 @@ class Backtester:
             'market_counting': features.market_counting,
             'market_combo': features.market_combo,
             'market_rare': features.market_rare,
-            # Data quality flags (for audit trail)
+            # Audit
             'had_warnings': len(features.data_quality.warnings) > 0 if features.data_quality else False
         }
     
@@ -3000,6 +3002,9 @@ class Backtester:
                     'team_out_count': frozen_snapshot['team_out_count'],
                     'opp_out_ppg': frozen_snapshot['opp_out_ppg'],
                     'opp_out_count': frozen_snapshot['opp_out_count'],
+                    # 🚀 [MISSING PART] ADD THIS HERE:
+                    'feat_usage_rate': frozen_snapshot.get('feat_usage_rate', -1.0),
+                    'feat_h2h_avg': frozen_snapshot.get('feat_h2h_avg', -1.0),
                     # Market identity (one-hot encoded)
                     'market_scoring': frozen_snapshot['market_scoring'],
                     'market_counting': frozen_snapshot['market_counting'],
@@ -4149,7 +4154,7 @@ def generate_ml_training_data(
     return final_df
 
 def generate_ml_data_streamlit():
-    """Streamlit UI wrapper for ML data generation with Persistent Arrow Fix."""
+    """Streamlit UI wrapper for ML data generation (No Form = No Redirect)."""
     st.markdown("### 🤖 Generate ML Training Data")
     
     st.info(f"""
@@ -4162,26 +4167,26 @@ def generate_ml_data_streamlit():
     - **Temporal Fix**: Each game uses its season's actual DRTG/Pace
     """)
     
-    # 🚀 START FORM
-    with st.form(key="generate_ml_data_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            num_players = st.slider("Number of Players", 10, 600, 50, 10)
-            test_days = st.slider("Games per Player", 30, 300, 150, 10,
-                                  help="4 seasons = ~328 games max per player")
-        
-        with col2:
-            markets = st.multiselect(
-                "Markets",
-                ['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR', '3PM', 'STL', 'BLK'],
-                default=['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR']
-            )
-            output_file = st.text_input("Output Filename", "ml_training_data.csv")
-        
-        submitted = st.form_submit_button("🚀 Generate Dataset", type="primary")
+    # ❌ REMOVED st.form wrapper to prevent tab reset
     
-    # 🛑 LOGIC EXECUTION
-    if submitted:
+    col1, col2 = st.columns(2)
+    with col1:
+        # Added unique keys to prevent conflict
+        num_players = st.slider("Number of Players", 10, 600, 50, 10, key="gen_num")
+        test_days = st.slider("Games per Player", 30, 300, 150, 10,
+                                help="4 seasons = ~328 games max per player", key="gen_days")
+    
+    with col2:
+        markets = st.multiselect(
+            "Markets",
+            ['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR', '3PM', 'STL', 'BLK'],
+            default=['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR'],
+            key="gen_markets"
+        )
+        output_file = st.text_input("Output Filename", "ml_training_data.csv", key="gen_file")
+    
+    # 🚀 STANDARD BUTTON (No Form Submit event)
+    if st.button("🚀 Generate Dataset", type="primary"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -4199,21 +4204,34 @@ def generate_ml_data_streamlit():
             )
             
             if len(df) > 0:
+                # 🛡️ CLEAN IMMEDIATELY
+                try:
+                    bool_cols = ['feat_is_home', 'feat_is_b2b']
+                    for col in bool_cols:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(bool)
+
+                    int_cols = ['market_scoring', 'market_counting', 'market_combo', 'market_rare', 'hit']
+                    for col in int_cols:
+                        if col in df.columns:
+                            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+                            
+                except Exception as e:
+                    st.warning(f"Auto-cleaning warning: {e}")
+
                 # Save to session state
                 st.session_state['last_ml_training_data'] = df
                 st.session_state['last_ml_output_file'] = output_file
-                st.rerun() # Refresh to show results
+                
+                # ✅ NO RERUN call here. Just let it flow to the display block below.
+                
             else:
                 st.error("Failed to generate training data. Check logs for errors.")
 
     # 📊 RESULTS DISPLAY
+    # This runs immediately after the button click logic finishes
     if 'last_ml_training_data' in st.session_state:
-        # Load and CLEAN immediately
-        raw_df = st.session_state['last_ml_training_data']
-        
-        # 🛡️ USE HELPER FUNCTION
-        df = safe_clean_for_arrow(raw_df)
-        
+        df = st.session_state['last_ml_training_data'].copy()
         filename = st.session_state.get('last_ml_output_file', 'ml_training_data.csv')
         
         st.success(f"✅ Generated {len(df)} training samples!")
@@ -4225,7 +4243,6 @@ def generate_ml_data_streamlit():
         if 'player' in df.columns:
             col3.metric("Unique Players", df['player'].nunique())
         
-        # Safe Preview
         st.dataframe(df.head(20), width="stretch")
         
         csv = df.to_csv(index=False)
@@ -5023,10 +5040,13 @@ class Tracker:
             'feat_opp_out_ppg': float(bet.get('feat_opp_out_ppg', -1.0)),
             'feat_opp_out_count': int(bet.get('feat_opp_out_count', -1) or -1),
 
-            # V20.3 NEW: Behavior & Risk features
             'feat_min_volatility': float(bet.get('feat_min_volatility', -1.0)),
             'feat_foul_rate': float(bet.get('feat_foul_rate', -1.0)),
             'feat_cv': float(bet.get('feat_cv', -1.0)),
+            
+            # 🚀 V20.4 NEW: ADD THESE LINES
+            'feat_usage_rate': float(bet.get('feat_usage_rate', -1.0)),
+            'feat_h2h_avg': float(bet.get('feat_h2h_avg', -1.0)),
         }
 
         # Market identity features
