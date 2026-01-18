@@ -1,4 +1,5 @@
 import streamlit as st
+import google.generativeai as genai
 import pandas as pd
 import numpy as np
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, leaguedashplayerstats, leaguegamelog
@@ -16,14 +17,12 @@ import logging
 from enum import Enum
 import warnings
 import joblib
-from xgboost import XGBRegressor  # V19: Regression instead of Classification
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy import stats  # V19: For CDF-based probability calculation
 import requests
 from bs4 import BeautifulSoup
 from data_engine import DataEngine
-
 warnings.filterwarnings('ignore')
 
 # =============================================================================
@@ -181,7 +180,48 @@ WATCHLIST_FILE = DATA_DIR / "watchlist.json"
 
 # V20 EMPIRICAL: No grades, no risk categories - just data
 # ResultQuality kept for audit trail only (post-hoc analysis)
+@st.cache_data(ttl=86400) # Cache for 24 hours
+def get_all_nba_players():
+    return players.get_players()
 
+@st.cache_resource
+def get_ai_model():
+    if "GEMINI_API_KEY" in st.secrets:
+        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+        return genai.GenerativeModel('gemini-2.5-flash')
+    return None
+
+def get_ai_second_opinion(prop_analysis, backtest_json):
+    model = get_ai_model()
+    if not model: return "⚠️ Missing API Key."
+
+    prompt = f"""
+    Act as a skeptical professional sports bettor. Compare this Model Prediction vs. Historical Reality.
+
+    **🤖 PART 1: THE MODEL (The Setup)**
+    - Player: {prop_analysis['player']}
+    - Market: {prop_analysis['market']} {prop_analysis['line']}
+    - Signal: {prop_analysis['signal']} (EV: {prop_analysis['ev']}%)
+    - **Trend Stats:** EMA: {prop_analysis['ema']} | L5 Slope: {prop_analysis['trend']}
+
+    **📉 PART 2: THE REALITY (Last 30 Games)**
+    - Hit Rate (L30): {backtest_json['l30_rate']}%
+    - Avg vs Line: {backtest_json['avg_diff']:+.1f}
+    - Last 5 Raw: {backtest_json['l5_trend']}
+    - Recent Logs:
+    {backtest_json['logs_csv']}
+
+    **🎯 YOUR TASK:**
+    1. **Volatility Check:** Compare the smooth EMA ({prop_analysis['ema']}) vs the raw Last 5 games. Is the EMA misleading because of a recent blowout or injury?
+    2. **Pattern Match:** Does the log show inconsistency that the math missed?
+    3. **Verdict:** AGREE or DISAGREE.
+    """
+    
+    try:
+        response = model.generate_content(prompt, generation_config={"temperature": 0.3})
+        return response.text
+    except Exception as e:
+        return f"AI Error: {str(e)}"
 
 class ResultQuality(Enum):
     """
@@ -935,13 +975,26 @@ class InjuryManager:
             'TOR': 'toronto-raptors', 'UTA': 'utah-jazz', 'WAS': 'washington-wizards'
         }
         
+        url_abbrev = team_abbrev.lower()
+        if team_abbrev == 'UTA':
+            url_abbrev = 'utah'
+        elif team_abbrev == 'NOP':
+            url_abbrev = 'no' # ESPN sometimes uses 'no' for New Orleans
+        elif team_abbrev == 'NYK':
+            url_abbrev = 'ny' # ESPN sometimes uses 'ny' for Knicks
+        elif team_abbrev == 'GSW':
+            url_abbrev = 'gs' # ESPN sometimes uses 'gs' for Warriors
+        elif team_abbrev == 'SAS':
+            url_abbrev = 'sa' # ESPN sometimes uses 'sa' for Spurs
+            
         slug = espn_team_slugs.get(team_abbrev)
         if not slug:
             return []
         
         try:
             import re
-            url = f"https://www.espn.com/nba/team/injuries/_/name/{team_abbrev.lower()}/{slug}"
+            # Use the corrected url_abbrev
+            url = f"https://www.espn.com/nba/team/injuries/_/name/{url_abbrev}/{slug}"
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             }
@@ -1194,7 +1247,7 @@ class InjuryManager:
         
         try:
             # Find player ID
-            all_players = players.get_players()
+            all_players = get_all_nba_players()
             normalized = normalize_name(player_name)
             p_obj = next((p for p in all_players if normalize_name(p['full_name']) == normalized), None)
             
@@ -5520,57 +5573,82 @@ def render_distribution_chart(result: AnalysisResult):
     plt.close(fig)
 
 
-def render_backtest_tab(orchestrator: PredictionOrchestrator):
-    """Render compact backtesting tab."""
+def render_backtest_tab(orchestrator):
+    """Render compact backtesting tab with Form Optimization & Bug Fixes."""
     st.markdown("### 📊 Model Backtest")
     
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        all_players = players.get_players()
-        player_names = sorted([p['full_name'] for p in all_players if p. get('is_active', True)])
-        bt_player = st.selectbox("Player", player_names, index=None, placeholder="Search...", key="bt_player")
-    with col2:
-        bt_market = st.selectbox("Market", ["PTS", "REB", "AST", "PRA", "RA"], key="bt_market")
-    with col3:
-        bt_days = st.number_input("Games", 10, 50, 30, key="bt_days")
-    
-    with st.expander("⚙️ Advanced", expanded=False):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            bt_lookback = st.slider("Lookback", 5, 20, 15, key="bt_lookback")
-        with c2:
-            bt_offset = st.number_input("Line Offset", -10.0, 10.0, 0.0, 0.5, key="bt_offset")
-        with c3:
-            bt_spread = st.number_input("Spread", -20.0, 20.0, 0.0, 0.5, key="bt_spread")
-    
-    if st.button("🚀 Run Backtest", type="primary", disabled=not bt_player):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+    # 🚀 START FORM
+    with st.form(key='backtest_form'):
+        col1, col2, col3 = st.columns([2, 1, 1])
+        with col1:
+            # Use the cached player loader we added earlier
+            all_players = get_all_nba_players() 
+            player_names = sorted([p['full_name'] for p in all_players if p.get('is_active', True)])
+            bt_player = st.selectbox("Player", player_names, index=None, placeholder="Search...", key="bt_player")
+        with col2:
+            bt_market = st.selectbox("Market", ["PTS", "REB", "AST", "PRA", "RA"], key="bt_market")
+        with col3:
+            bt_days = st.number_input("Games", 10, 50, 30, key="bt_days")
         
-        def update_progress(pct):
-            progress_bar.progress(pct)
-            status_text.text(f"Processing... {pct:.0%}")
+        with st.expander("⚙️ Advanced", expanded=False):
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                bt_lookback = st.slider("Lookback", 5, 20, 15, key="bt_lookback")
+            with c2:
+                bt_offset = st.number_input("Line Offset", -10.0, 10.0, 0.0, 0.5, key="bt_offset")
+            with c3:
+                bt_spread = st.number_input("Spread", -20.0, 20.0, 0.0, 0.5, key="bt_spread")
         
-        with st.spinner("Running backtest..."):
-            summary = orchestrator.run_backtest(
-                player_name=bt_player,
-                market=bt_market,
-                lookback=bt_lookback,
-                test_days=bt_days,
-                line_offset=bt_offset,
-                fixed_spread=bt_spread,
-                progress_callback=update_progress
-            )
+        submitted = st.form_submit_button("🚀 Run Backtest", type="primary")
+
+    # 🛑 LOGIC EXECUTION
+    if submitted:
+        if not bt_player:
+            st.error("Please select a player to backtest.")
+        else:
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            def update_progress(pct):
+                progress_bar.progress(pct)
+                status_text.text(f"Processing... {pct:.0%}")
+            
+            with st.spinner(f"Running backtest for {bt_player}..."):
+                summary = orchestrator.run_backtest(
+                    player_name=bt_player,
+                    market=bt_market,
+                    lookback=bt_lookback,
+                    test_days=bt_days,
+                    line_offset=bt_offset,
+                    fixed_spread=bt_spread,
+                    progress_callback=update_progress
+                )
+            
+            progress_bar.empty()
+            status_text.empty()
+            
+            if summary is None:
+                st.error("Backtest failed - insufficient data.")
+            else:
+                # Save to session state so it survives refreshes
+                st.session_state['last_backtest_summary'] = summary
+
+    # 📊 RESULTS DISPLAY (Persists via session state)
+    if 'last_backtest_summary' in st.session_state:
+        summary = st.session_state['last_backtest_summary']
         
-        progress_bar.empty()
-        status_text.empty()
-        
-        if summary is None:
-            st.error("Backtest failed - insufficient data.")
+        # Safety Check: Ensure the dataframe isn't empty before accessing it
+        if summary.results_df is None or summary.results_df.empty:
+            st.warning("No results to display.")
             return
-        
-        # Compact results display
-        st.success(f"✅ {summary.total_predictions} predictions analyzed")
+
+        # 🛡️ FIX 1: Get player name safely from the DATAFRAME, not the widget
+        try:
+            safe_player_name = summary.results_df['player'].iloc[0]
+        except:
+            safe_player_name = "Backtest_Result"
+            
+        st.success(f"✅ {summary.total_predictions} predictions analyzed for {safe_player_name}")
         
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Win Rate", f"{summary.win_rate:.0%}")
@@ -5578,7 +5656,6 @@ def render_backtest_tab(orchestrator: PredictionOrchestrator):
         c3.metric("Brier", f"{summary.brier_score:.3f}")
         c4.metric("Record", f"{summary.wins}-{summary.losses}")
         
-        # Results in expander
         with st.expander("📊 Detailed Results", expanded=True):
             if summary.calibration_by_bucket:
                 st.markdown("**Calibration:**")
@@ -5590,6 +5667,7 @@ def render_backtest_tab(orchestrator: PredictionOrchestrator):
                         'Actual': f"{data['actual']:.0%}",
                         'N': data['count'],
                     })
+                # 🛡️ FIX 2: Replace use_container_width with width="stretch"
                 st.dataframe(pd.DataFrame(cal_data), hide_index=True, width="stretch")
             
             if summary.grade_performance:
@@ -5602,12 +5680,20 @@ def render_backtest_tab(orchestrator: PredictionOrchestrator):
                         'Win%': f"{data['win_rate']:.0%}",
                         'ROI': f"{data['roi']:+.1%}"
                     })
+                # 🛡️ FIX 2: Replace use_container_width with width="stretch"
                 st.dataframe(pd.DataFrame(grade_data), hide_index=True, width="stretch")
             
+            # 🛡️ FIX 2: Replace use_container_width with width="stretch"
             st.dataframe(summary.results_df, hide_index=True, width="stretch")
             
             csv = summary.results_df.to_csv(index=False)
-            st.download_button("📥 Download CSV", csv, f"backtest_{bt_player.replace(' ', '_')}.csv", "text/csv")
+            # 🛡️ FIX 1: Use the safe_player_name variable we created above
+            st.download_button(
+                "📥 Download CSV", 
+                csv, 
+                f"backtest_{safe_player_name.replace(' ', '_')}.csv", 
+                "text/csv"
+            )
 
 def load_watchlist():
     if WATCHLIST_FILE.exists():
@@ -5625,152 +5711,148 @@ def save_watchlist(data):
     except Exception as e:
         st.error(f"Failed to save watchlist: {e}")
 
+@st.cache_data(ttl=600, show_spinner=False)
+def get_cached_watchlist_stats(player_id: int, market: str, line: float, _loader) -> dict:
+    try:
+        time.sleep(0.6)
+        df = _loader.fetch_game_logs(player_id)
+        if df.empty or market not in df.columns: 
+            return None
+        
+        recent = df.tail(15)
+        ema = recent[market].ewm(span=len(recent), adjust=False).mean().iloc[-1]
+        l5_hit_rate = (df.tail(5)[market] > line).mean()
+        
+        return {"ema": ema, "l5_hit_rate": l5_hit_rate, "valid": True}
+    except:
+        return None
+
 def render_watchlist_tab(orchestrator):
     """
-    Renders the watchlist tab with Line Input and auto-calculated Offsets (EMA-based).
+    Optimized Watchlist: 
+    1. Uses st.form to batch inputs (No more refreshing while typing).
+    2. Uses cached helper to calculate stats (No more freezing).
     """
     st.markdown("### 👀 Watchlist")
     
-    # 1. Load Watchlist
+    # --- LOAD DATA ---
     if 'watchlist' not in st.session_state:
         st.session_state.watchlist = load_watchlist()
 
-    # 2. Add New Player Row
+    # --- SECTION 1: ADD PLAYER (OPTIMIZED) ---
     with st.container(border=True):
-        # Columns: Player(3) | Stat(1) | Line(1) | Button(1)
-        c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
+        st.caption("Add to Watchlist")
         
-        with c1:
-            all_players = players.get_players()
-            active_players = [p['full_name'] for p in all_players if p.get('is_active', True)]
-            target_player = st.selectbox(
-                "Add Player", 
-                active_players, 
-                key="wl_player_select", 
-                index=None, 
-                placeholder="Search Name..."
-            )
-        
-        with c2:
-            target_market = st.selectbox(
-                "Stat", 
-                ["PTS", "REB", "AST", "PRA", "RA"], 
-                key="wl_market_select"
-            )
+        # 🚀 THE FIX: Wrapping inputs in a form stops the "Triple Reload"
+        with st.form(key="add_watchlist_form", clear_on_submit=True):
+            c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
             
-        with c3:
-            # Line Input for initial add
-            target_line = st.number_input(
-                "Line", 
-                min_value=0.5, 
-                max_value=100.0, 
-                value=15.5, 
-                step=0.5, 
-                key="wl_line_input"
-            )
+            with c1:
+                all_players = get_all_nba_players()
+                active_players = [p['full_name'] for p in all_players if p.get('is_active', True)]
+                # Note: We load the list once. Streamlit handles the search UI efficiently.
+                target_player = st.selectbox("Player", active_players, index=None, placeholder="Search Name...")
+            
+            with c2:
+                target_market = st.selectbox("Stat", ["PTS", "REB", "AST", "PRA", "RA"])
+                
+            with c3:
+                target_line = st.number_input("Line", 0.5, 100.0, 15.5, 0.5)
 
-        with c4:
-            st.write("") # Spacer to align button
-            if st.button("Add ➕", use_container_width=True) and target_player:
-                # Add to session state if not duplicate
+            with c4:
+                st.write("") # Spacer for alignment
+                # The form only submits when this is clicked
+                submit_add = st.form_submit_button("Add ➕", use_container_width="stretch")
+
+        # Logic runs ONLY on submit
+        if submit_add:
+            if target_player:
+                # Check for duplicates
                 if not any(x['player'] == target_player and x['market'] == target_market for x in st.session_state.watchlist):
                     import uuid
                     st.session_state.watchlist.append({
                         'id': str(uuid.uuid4())[:8],
                         'player': target_player, 
                         'market': target_market, 
-                        'line': target_line,  # Save the line
+                        'line': target_line,
                         'added_date': datetime.now().strftime("%Y-%m-%d")
                     })
                     save_watchlist(st.session_state.watchlist)
                     st.rerun()
+            else:
+                st.warning("⚠️ Please select a player.")
 
-    # 3. Display Watchlist Items
+    # --- SECTION 2: VIEW LIST ---
     if not st.session_state.watchlist:
-        st.info("Your watchlist is empty. Add players above to calculate offsets.")
+        st.info("Watchlist empty.")
     else:
         st.write("---")
-        # Header Row
         h1, h2, h3, h4 = st.columns([2, 1, 2, 0.5])
         h1.caption("Player")
         h2.caption("Target Line")
-        h3.caption("Trends & Offset")
+        h3.caption("Trends (Cached ⚡)")
         
-        for i, item in enumerate(st.session_state.watchlist):
-            item_id = item.get('id')
-            if not item_id:
-                import uuid
-                item_id = str(uuid.uuid4())[:8]
-                st.session_state.watchlist[i]['id'] = item_id
+        # Create a copy to iterate safely
+        current_list = st.session_state.watchlist.copy()
+        
+        for i, item in enumerate(current_list):
+            item_id = item.get('id', str(i))
             
             with st.container(border=True):
                 c1, c2, c3, c4 = st.columns([2, 1, 2, 0.5])
                 
                 with c1:
-                    st.subheader(f"{item['player']}")
-                    st.caption(f"Market: **{item['market']}**")
+                    st.subheader(item['player'])
+                    st.caption(f"**{item['market']}**")
                 
                 with c2:
-                    # Editable Line Input
-                    current_line = st.number_input(
+                    # Note: Changing this DOES trigger a reload, which is good! 
+                    # We want to see the new offset immediately.
+                    # Because stats are cached, the reload will be instant.
+                    new_line = st.number_input(
                         "Line", 
                         value=float(item.get('line', 10.5)), 
                         step=0.5, 
-                        key=f"line_{item_id}",
+                        key=f"wl_line_{item_id}",
                         label_visibility="collapsed"
                     )
                     
-                    # Update line in storage if changed
-                    if current_line != item.get('line'):
-                        st.session_state.watchlist[i]['line'] = current_line
+                    # Save if changed
+                    if new_line != item.get('line'):
+                        st.session_state.watchlist[i]['line'] = new_line
                         save_watchlist(st.session_state.watchlist)
 
                 with c3:
-                    # Calculate Stats & Offset
-                    try:
-                        # Find player ID safely
-                        p_obj = next((p for p in all_players if p['full_name'].lower() == item['player'].lower()), None)
+                    # 🚀 CACHED LOOKUP (Fast)
+                    p_obj = next((p for p in all_players if p['full_name'] == item['player']), None)
+                    
+                    if p_obj:
+                        stats = get_cached_watchlist_stats(
+                            player_id=p_obj['id'], 
+                            market=item['market'], 
+                            line=new_line,
+                            _loader=orchestrator.data_loader # Pass loader for data access
+                        )
                         
-                        if p_obj:
-                            df = orchestrator.data_loader.fetch_game_logs(p_obj['id'])
-                            if not df.empty and item['market'] in df.columns:
-                                # Use same lookback as Analyze tab (15 games default)
-                                lookback = 15
-                                recent = df.tail(lookback)
-                                
-                                # Calculate EMA same way as Analyze tab
-                                # Uses span = lookback window size, not hardcoded
-                                ema = recent[item['market']].ewm(span=len(recent), adjust=False).mean().iloc[-1]
-                                
-                                # Calculate L5 hit rate (same as Analyze tab)
-                                # Use tail(5) for MOST RECENT 5 games
-                                l5_games = df.tail(5)
-                                l5_hit_rate = (l5_games[item['market']] > current_line).mean()
-                                
-                                # Hot/Cold based on L5 hit rate (matches Analyze tab)
-                                if l5_hit_rate >= 0.80:
-                                    form_icon, form_color = "🔥", "green"
-                                elif l5_hit_rate >= 0.60:
-                                    form_icon, form_color = "✅", "green"
-                                elif l5_hit_rate >= 0.40:
-                                    form_icon, form_color = "😐", "orange"
-                                else:
-                                    form_icon, form_color = "❄️", "red"
-                                
-                                # Offset shows projection vs line (for OVER/UNDER signal)
-                                offset = ema - current_line
-                                offset_color = "green" if offset > 0 else "red"
-                                offset_arrow = "↑" if offset > 0 else "↓"
-                                
-                                # Display BOTH: EMA projection AND L5 consistency
-                                st.markdown(f"**EMA:** {ema:.1f} :{offset_color}[{offset:+.1f}{offset_arrow}]")
-                                st.markdown(f"**L5:** :{form_color}[{l5_hit_rate:.0%}] {form_icon}")
-                            else:
-                                st.caption("No recent data")
+                        if stats and stats['valid']:
+                            # Visuals
+                            ema = stats['ema']
+                            offset = ema - new_line
+                            off_color = "green" if offset > 0 else "red"
+                            off_sym = "↑" if offset > 0 else "↓"
+                            
+                            l5 = stats['l5_hit_rate']
+                            if l5 >= 0.8: icon, color = "🔥", "green"
+                            elif l5 >= 0.6: icon, color = "✅", "green"
+                            elif l5 >= 0.4: icon, color = "😐", "orange"
+                            else: icon, color = "❄️", "red"
+
+                            st.markdown(f"**EMA:** {ema:.1f} :{off_color}[{offset:+.1f}{off_sym}]")
+                            st.markdown(f"**L5:** :{color}[{l5:.0%}] {icon}")
                         else:
-                            st.caption("Player not found")
-                    except Exception:
-                        st.caption("Stats unavailable")
+                            st.caption("Need more data")
+                    else:
+                        st.caption("Player ID not found")
 
                 with c4:
                     if st.button("🗑️", key=f"del_{item_id}"):
@@ -5817,12 +5899,12 @@ def render_parlay_tab(parlay_tracker: ParlayTracker, bankroll: float, bankroll_e
             parlay_name = st.text_input("Name", placeholder="Optional...", key="parlay_name")
         
         c1, c2 = st.columns(2)
-        if c1.button("✅ Create", type="primary", use_container_width=True):
+        if c1.button("✅ Create", type="primary", use_container_width="stretch"):
             parlay_tracker.create_parlay(legs=builder.copy(), stake=parlay_stake, name=parlay_name)
             st.session_state.parlay_builder = []
             st.toast("Parlay created!", icon="🎲")
             st.rerun()
-        if c2.button("🗑️ Clear", use_container_width=True):
+        if c2.button("🗑️ Clear", use_container_width="stretch"):
             st.session_state.parlay_builder = []
             st.rerun()
     else:
@@ -6202,13 +6284,13 @@ def render_ml_data_tab(tracker: Tracker):
         st.markdown("---")
         dc1, dc2, dc3 = st.columns(3)
         csv_data = training_df.to_csv(index=False)
-        dc1.download_button("📥 Download CSV", csv_data, "ml_training_data.csv", "text/csv", use_container_width=True)
+        dc1.download_button("📥 Download CSV", csv_data, "ml_training_data.csv", "text/csv", use_container_width="stretch")
         json_data = training_df.to_json(orient='records', indent=2)
-        dc2.download_button("📥 Download JSON", json_data, "ml_training_data.json", "application/json", use_container_width=True)
+        dc2.download_button("📥 Download JSON", json_data, "ml_training_data.json", "application/json", use_container_width="stretch")
         
         # Show column list
         with dc3:
-            if st.button("📋 Show Columns", use_container_width=True):
+            if st.button("📋 Show Columns", use_container_width="stretch"):
                 st.session_state['show_ml_cols'] = not st.session_state.get('show_ml_cols', False)
         
         if st.session_state.get('show_ml_cols', False):
@@ -6366,6 +6448,7 @@ def validate_training_data(df: pd.DataFrame) -> Dict[str, Any]:
 
 
 def render_train_model_tab():
+    from xgboost import XGBRegressor
     """
     V20.2 STRICT: Training UI with NO legacy compatibility.
     
@@ -6661,7 +6744,7 @@ def main():
         st.markdown("### ⚙️ Settings")
         
         # Emergency: Reset caches (clears cached data in Streamlit)
-        if st.button("🗑️ Reset Cache", use_container_width=True):
+        if st.button("🗑️ Reset Cache", use_container_width="stretch"):
             try:
                 st.cache_data.clear()
             except Exception:
@@ -6719,152 +6802,244 @@ def main():
     # Tab 1: Analyzer
     with tab1:
         # Mobile-friendly stacked layout with expander for advanced options
-        all_players = players.get_players()
+        all_players = get_all_nba_players()
         player_names = sorted([p['full_name'] for p in all_players if p.get('is_active', True)])
         
-        # Primary inputs - always visible
-        col1, col2 = st.columns(2)
-        with col1:
-            player_in = st.selectbox("🏃 Player", player_names, index=None, placeholder="Search...")
-        with col2:
-            nba_teams = teams.get_teams()
-            team_opts = sorted([t['abbreviation'] for t in nba_teams])
-            try:
-                def_idx = team_opts.index('LAL')
-            except ValueError:
-                def_idx = 0
-            opp_in = st.selectbox("🎯 vs", team_opts, index=def_idx)
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            market = st.selectbox("📊 Market", ["PTS", "REB", "AST", "PRA", "3PM", "PA", "PR", "RA", "STL", "BLK"])
-        with col2:
-            line_in = st.number_input("🎯 Line", 0.5, 100.0, 25.5, 0.5)
-        with col3:
-            odds_in = st.number_input("💲 Odds", 1.01, 10.00, 1.85, 0.01)
-        
-        # Show injury reports for BOTH teams
-        if opp_in:
-            # Get player's team abbrev (we'll determine this from the analysis context)
-            player_team_abbrev = None
-            if player_in:
+        # 🚀 START FORM: Prevents reloading until "Run" is clicked
+        with st.form(key='analysis_form'):
+            
+            # Primary inputs
+            col1, col2 = st.columns(2)
+            with col1:
+                player_in = st.selectbox("🏃 Player", player_names, index=None, placeholder="Search...")
+            with col2:
+                nba_teams = teams.get_teams()
+                team_opts = sorted([t['abbreviation'] for t in nba_teams])
                 try:
-                    p_list = players.find_players_by_full_name(player_in)
-                    if p_list:
-                        p_id = p_list[0]['id']
-                        from nba_api.stats.endpoints import commonplayerinfo
-                        # Use top-level time import to avoid shadowing the module name in this function
-                        time.sleep(0.3)
-                        player_info = commonplayerinfo.CommonPlayerInfo(player_id=p_id).get_data_frames()[0]
-                        if 'TEAM_ABBREVIATION' in player_info.columns:
-                            player_team_abbrev = player_info['TEAM_ABBREVIATION'].iloc[0]
-                except:
-                    pass
+                    def_idx = team_opts.index('LAL')
+                except ValueError:
+                    def_idx = 0
+                opp_in = st.selectbox("🎯 vs", team_opts, index=def_idx)
             
-            inj_col1, inj_col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                market = st.selectbox("📊 Market", ["PTS", "REB", "AST", "PRA", "3PM", "PA", "PR", "RA", "STL", "BLK"])
+            with col2:
+                line_in = st.number_input("🎯 Line", 0.5, 100.0, 25.5, 0.5)
+            with col3:
+                odds_in = st.number_input("💲 Odds", 1.01, 10.00, 1.85, 0.01)
             
-            # Opponent injuries (raw observational data)
-            with inj_col1:
-                with st.expander(f"🏥 {opp_in} Injuries (Opponent)", expanded=False):
+            # Show injury reports (Updates on Submit)
+            if opp_in:
+                # Get player's team abbrev logic
+                player_team_abbrev = None
+                if player_in:
                     try:
-                        injuries = orchestrator.injury_manager.get_team_injury_report(opp_in)
-                        if injuries:
-                            for inj in injuries:
-                                status = inj.get('status', 'Unknown')
-                                emoji = {'OUT': '🔴', 'DOUBTFUL': '🟠', 'QUESTIONABLE': '🟡', 'DAY-TO-DAY': '🟡', 'PROBABLE': '🟢'}.get(status, '⚪')
-                                pos = inj.get('position', '')
-                                pos_str = f" [{pos}]" if pos else ""
-                                injury_desc = inj.get('injury', '')
-                                st.markdown(f"{emoji} **{inj.get('name', 'Unknown')}**{pos_str} — {status}" + (f" ({injury_desc})" if injury_desc else ""))
-                            st.caption(f"Source: {injuries[0].get('source', 'ESPN')}")
-                        else:
-                            st.info("No injuries reported")
-                    except Exception as e:
-                        st.caption(f"Could not fetch injuries: {e}")
-            
-            # Player's team injuries (raw observational data)
-            with inj_col2:
-                if player_team_abbrev and player_team_abbrev != opp_in:
-                    with st.expander(f"🏥 {player_team_abbrev} Injuries (Player's Team)", expanded=False):
+                        p_list = players.find_players_by_full_name(player_in)
+                        if p_list:
+                            p_id = p_list[0]['id']
+                            # Note: We can't use st.cache here easily inside form, 
+                            # but this runs only on submit now, so it's fine.
+                            from nba_api.stats.endpoints import commonplayerinfo
+                            # time.sleep(0.3) # Removed sleep for speed, add back if hitting rate limits
+                            player_info = commonplayerinfo.CommonPlayerInfo(player_id=p_id).get_data_frames()[0]
+                            if 'TEAM_ABBREVIATION' in player_info.columns:
+                                player_team_abbrev = player_info['TEAM_ABBREVIATION'].iloc[0]
+                    except:
+                        pass
+                
+                inj_col1, inj_col2 = st.columns(2)
+                
+                # Opponent injuries
+                with inj_col1:
+                    with st.expander(f"🏥 {opp_in} Injuries (Opponent)", expanded=False):
                         try:
-                            team_injuries = orchestrator.injury_manager.get_team_injury_report(player_team_abbrev)
-                            if team_injuries:
-                                for inj in team_injuries:
+                            injuries = orchestrator.injury_manager.get_team_injury_report(opp_in)
+                            if injuries:
+                                for inj in injuries:
                                     status = inj.get('status', 'Unknown')
                                     emoji = {'OUT': '🔴', 'DOUBTFUL': '🟠', 'QUESTIONABLE': '🟡', 'DAY-TO-DAY': '🟡', 'PROBABLE': '🟢'}.get(status, '⚪')
                                     pos = inj.get('position', '')
                                     pos_str = f" [{pos}]" if pos else ""
                                     injury_desc = inj.get('injury', '')
                                     st.markdown(f"{emoji} **{inj.get('name', 'Unknown')}**{pos_str} — {status}" + (f" ({injury_desc})" if injury_desc else ""))
-                                st.caption(f"Source: {team_injuries[0].get('source', 'ESPN')}")
+                                st.caption(f"Source: {injuries[0].get('source', 'ESPN')}")
                             else:
                                 st.info("No injuries reported")
                         except Exception as e:
                             st.caption(f"Could not fetch injuries: {e}")
-        
-        # Advanced options in expander
-        with st.expander("Advanced Options", expanded=False):
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                is_home = st.checkbox("Home", True)
-            with c2:
-                days_rest = st.selectbox("Rest", [0, 1, 2, 3], index=1,
-                                         format_func=lambda x: "B2B" if x == 0 else f"{x}d")
-            with c3:
-                spread = st.number_input("Spread", -25.0, 25.0, 0.0, 0.5)
-            with c4:
-                game_total = st.number_input("Total", 180.0, 280.0, 225.0, 0.5)
-            lookback = st.slider("Lookback Games", 5, 30, 15)
-        
-        is_b2b = days_rest == 0
-        
-        is_valid, error_msg = validate_inputs(line_in, odds_in)
-        if not is_valid: 
-            st.error(error_msg)
-        
-        if st.button("Run Analysis", type="primary", disabled=not player_in or not is_valid):
-            with st.spinner(f"Analyzing {player_in} vs {opp_in}..."):
-                result = orchestrator.run_analysis(
-                    player_name=player_in,
-                    opponent_name=opp_in,
-                    market=market,
-                    line=line_in,
-                    odds=odds_in,
-                    is_home=is_home,
-                    is_b2b=is_b2b,
-                    lookback=lookback,
-                    spread=spread,
-                    bankroll=bankroll,
-                    days_rest=days_rest,
-                    game_total=game_total
-                )
                 
-                if not result.success:
-                    st.error(result.error)
-                else: 
-                    st.session_state.analysis_result = result
+                # Player Team injuries
+                with inj_col2:
+                    if player_team_abbrev and player_team_abbrev != opp_in:
+                        with st.expander(f"🏥 {player_team_abbrev} Injuries (Player's Team)", expanded=False):
+                            try:
+                                team_injuries = orchestrator.injury_manager.get_team_injury_report(player_team_abbrev)
+                                if team_injuries:
+                                    for inj in team_injuries:
+                                        status = inj.get('status', 'Unknown')
+                                        emoji = {'OUT': '🔴', 'DOUBTFUL': '🟠', 'QUESTIONABLE': '🟡', 'DAY-TO-DAY': '🟡', 'PROBABLE': '🟢'}.get(status, '⚪')
+                                        pos = inj.get('position', '')
+                                        pos_str = f" [{pos}]" if pos else ""
+                                        injury_desc = inj.get('injury', '')
+                                        st.markdown(f"{emoji} **{inj.get('name', 'Unknown')}**{pos_str} — {status}" + (f" ({injury_desc})" if injury_desc else ""))
+                                    st.caption(f"Source: {team_injuries[0].get('source', 'ESPN')}")
+                                else:
+                                    st.info("No injuries reported")
+                            except Exception as e:
+                                st.caption(f"Could not fetch injuries: {e}")
+
+            # Advanced options
+            with st.expander("Advanced Options", expanded=False):
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    is_home = st.checkbox("Home", True)
+                with c2:
+                    days_rest = st.selectbox("Rest", [0, 1, 2, 3], index=1,
+                                           format_func=lambda x: "B2B" if x == 0 else f"{x}d")
+                with c3:
+                    spread = st.number_input("Spread", -25.0, 25.0, 0.0, 0.5)
+                with c4:
+                    game_total = st.number_input("Total", 180.0, 280.0, 225.0, 0.5)
+                lookback = st.slider("Lookback Games", 5, 30, 15)
+            
+            is_b2b = days_rest == 0
+            is_valid, error_msg = validate_inputs(line_in, odds_in)
+            
+            if not is_valid: 
+                st.error(error_msg)
+            
+            # 🚀 SUBMIT BUTTON
+            # This replaces the old st.button. It triggers the form submission.
+            submitted = st.form_submit_button("🚀 Run Analysis", type="primary", disabled=not is_valid)
+
+        # 🛑 LOGIC EXECUTION (Only runs when button is clicked)
+        if submitted:
+            if not player_in:
+                st.error("Please select a player.")
+            else:
+                with st.spinner(f"Analyzing {player_in} vs {opp_in}..."):
+                    result = orchestrator.run_analysis(
+                        player_name=player_in,
+                        opponent_name=opp_in,
+                        market=market,
+                        line=line_in,
+                        odds=odds_in,
+                        is_home=is_home,
+                        is_b2b=is_b2b,
+                        lookback=lookback,
+                        spread=spread,
+                        bankroll=bankroll,
+                        days_rest=days_rest,
+                        game_total=game_total
+                    )
+                    
+                    if not result.success:
+                        st.error(result.error)
+                    else: 
+                        st.session_state.analysis_result = result
         
-        # Display results
+        # Display results (Persists after reload because it checks session_state)
         result = st.session_state.analysis_result
         if result and result.success:
             st.markdown("---")
             
-            # V20.2: Always show result - EV is displayed in card, user decides
             # Main recommendation - Ticket Style Card
             render_ticket_card(result, bankroll, bankroll_enabled)
-        
-            # Action buttons
+
+            st.divider()
+    
+            with st.container(border=True):
+                c_ai_1, c_ai_2 = st.columns([3, 1])
+                with c_ai_1:
+                    st.subheader("🤖 AI Analyst")
+                    st.caption("Get a second opinion. compares the math (EV) vs. the tape (Game Logs).")
+                with c_ai_2:
+                    # Unique key ensures no conflict
+                    ask_ai = st.button("🧠 Consult Gemini", key="tab1_ask_ai", use_container_width="stretch")
+
+                if ask_ai:
+                    with st.spinner(f"Analyzing {result.player_name}'s history..."):
+                        team_str = "N/A"
+                        if result.game_logs is not None and not result.game_logs.empty:
+                            try:
+                                team_str = result.game_logs.iloc[-1]['MATCHUP'].split()[0]
+                            except: pass
+
+                        # EXTRACT ML FEATURES
+                        # This gives the AI the "Whole Picture" context
+                        feats = result.features
+                        
+                        prop_payload = {
+                            "player": result.player_name,
+                            "team": team_str,
+                            "market": result.market,
+                            "line": result.line,
+                            "signal": result.decision.recommended_side,
+                            "ev": result.decision.expected_value,
+                            "prob": result.decision.probability,
+                            
+                            # ✅ NEW: PASS THE EMA
+                            "ema": round(feats.ema, 1),
+                            "avg_min": round(feats.avg_minutes, 1),
+                            "opp_rank": round(feats.opponent_drtg_season, 1),
+                            "rest": feats.days_rest,
+                            "trend": "Heating Up" if feats.trend_5g > 0.5 else ("Cooling Down" if feats.trend_5g < -0.5 else "Flat")
+                        }
+
+                        # 2. RUN THE MINI-BACKTEST (The "Reality")
+                        # We fetch logs on the fly using your existing data loader
+                        p_list = players.find_players_by_full_name(result.player_name)
+                        if p_list:
+                            p_id = p_list[0]['id']
+                            # Fetch logs (Cached!)
+                            df_logs = orchestrator.data_loader.fetch_game_logs(p_id)
+                            
+                            if not df_logs.empty and result.market in df_logs.columns:
+                                # PROCESS LAST 30 GAMES (Instead of 15)
+                                l30 = df_logs.head(30).copy()
+                                
+                                # Calculate hit rate based on recommended side
+                                if result.decision.recommended_side == "OVER":
+                                    hits = (l30[result.market] > result.line).sum()
+                                else:
+                                    hits = (l30[result.market] < result.line).sum()
+                                    
+                                rate = (hits / len(l30)) * 100 if len(l30) > 0 else 0
+                                avg_diff = (l30[result.market] - result.line).mean()
+                                
+                                # Create CSV string (Use GAME_DATE to fix the KeyError)
+                                logs_csv = l30[['GAME_DATE', 'MATCHUP', 'MIN', result.market]].to_csv(index=False)
+                                
+                                # Pack the Backtest JSON with 30-game stats
+                                backtest_payload = {
+                                    "l30_rate": int(rate),
+                                    "avg_diff": avg_diff,
+                                    "l5_trend": l30[result.market].head(5).tolist(),
+                                    "logs_csv": logs_csv
+                                }
+
+                                # 3. GET THE INSIGHT
+                                insight = get_ai_second_opinion(prop_payload, backtest_payload)
+                                
+                                # 4. DISPLAY
+                                st.markdown("### 📝 Gemini's Verdict")
+                                st.markdown(insight)
+                                
+                            else:
+                                st.error("No recent game data found for this player.")
+                        else:
+                            st.error("Player ID not found.")
+            
             col_track, col_parlay = st.columns(2)
-            # Tag selection for bet source tracking
+            # Tag selection
             tag_options = ["Sniper", "Robot_Top_Pick", "Gut_Feel", "Live_Bet"]
-            # V20: Auto-tag based on EV only
             default_tag = "Sniper" if result.decision.expected_value > 0 else "Gut_Feel"
             selected_tag = st.selectbox("Bet Source Tag:", tag_options, 
-                index=tag_options.index(default_tag), key="bet_tag_select",
-                help="Tag for filtering training data - 'Sniper' = EV+ picks")
+                index=tag_options.index(default_tag), key="bet_tag_select")
             
             with col_track: 
-                if st.button("💾 Track", use_container_width=True):
+                if st.button("💾 Track", use_container_width="stretch"):
                     try:
                         features = result.features
                         # Build payload with static metadata
@@ -6892,9 +7067,8 @@ def main():
                         logger.error(f"Bet tracking failed: {e}")
             
             with col_parlay: 
-                # V19: Show parlay button if EV is positive
                 if result.decision.expected_value > 0:
-                    if st.button("Parlay", use_container_width=True):
+                    if st.button("Parlay", use_container_width="stretch"):
                         leg = {
                             'player': result.player_name,
                             'opponent': result.opponent_name,
@@ -6918,11 +7092,10 @@ def main():
                             st.session_state.parlay_builder.append(leg)
                             st.toast("Added!", icon="🎲")
                             st.rerun()
+                        pass 
                 else: 
-                    st.button("Parlay", disabled=True, use_container_width=True,
-                             help="Not suitable for parlay")
-        
-            # Details in expander to reduce clutter
+                     st.button("Parlay", disabled=True, use_container_width="stretch")
+
             with st.expander("Details & Chart", expanded=False):
                 render_distribution_chart(result)
     
@@ -7003,8 +7176,9 @@ def main():
     
     # Tab 6: Bets
     with tab6:
-        st.markdown("Bet Tracker")
+        st.markdown("### 📝 Bet Tracker")
         
+        # --- STATS & CHARTS (Keep existing logic) ---
         stats = tracker.get_stats()
         all_bets = tracker.get_bets()
         
@@ -7015,331 +7189,170 @@ def main():
             c3.metric("P/L", f"₱{stats['total_profit']:+,.0f}")
             c4.metric("Pending", stats['pending'])
             
-            # =========================================================================
-            # EQUITY CURVE - Cumulative Profit Chart
-            # =========================================================================
-            decided_bets = [b for b in all_bets if b.get('result') in ['Win', 'Loss']]
-            if len(decided_bets) >= 2:
-                # Sort by date
-                decided_bets.sort(key=lambda x: x.get('date', '2024-01-01'))
-                
-                # Calculate cumulative P/L (assuming 1 unit per bet, -110 odds)
-                cumulative = []
-                running_total = 0
-                for bet in decided_bets:
-                    if bet.get('result') == 'Win':
-                        running_total += 0.91  # Win at -110 odds
-                    else:
-                        running_total -= 1.0   # Lose 1 unit
-                    cumulative.append({
-                        'Bet #': len(cumulative) + 1,
-                        'Date': bet.get('date', '')[:10] if bet.get('date') else '',
-                        'Player': bet.get('player', '')[:15],
-                        'P/L': running_total
-                    })
-                
-                equity_df = pd.DataFrame(cumulative)
-                
-                # Create the chart
-                with st.expander("📈 Equity Curve", expanded=True):
-                    # Use matplotlib for a clean line chart
-                    fig, ax = plt.subplots(figsize=(10, 3))
-                    
-                    # Plot the line
-                    ax.plot(equity_df['Bet #'], equity_df['P/L'], linewidth=2.5, color='#00c853' if running_total >= 0 else '#f44336')
-                    ax.fill_between(equity_df['Bet #'], 0, equity_df['P/L'], 
-                                   where=(equity_df['P/L'] >= 0), alpha=0.3, color='#00c853', interpolate=True)
-                    ax.fill_between(equity_df['Bet #'], 0, equity_df['P/L'], 
-                                   where=(equity_df['P/L'] < 0), alpha=0.3, color='#f44336', interpolate=True)
-                    
-                    # Styling
-                    ax.axhline(y=0, color='white', linestyle='--', linewidth=0.8, alpha=0.5)
-                    ax.set_xlabel('Bet #', fontsize=10)
-                    ax.set_ylabel('Units', fontsize=10)
-                    ax.set_title(f'Cumulative P/L: {running_total:+.2f}u ({stats["wins"]}-{stats["losses"]})', fontsize=12, fontweight='bold')
-                    ax.grid(True, alpha=0.2)
-                    ax.spines['top'].set_visible(False)
-                    ax.spines['right'].set_visible(False)
-                    
-                    # Set y-axis limits with padding
-                    y_max = max(abs(equity_df['P/L'].min()), abs(equity_df['P/L'].max())) * 1.2
-                    ax.set_ylim(-max(y_max, 1), max(y_max, 1))
-                    
-                    plt.tight_layout()
-                    st.pyplot(fig)
-                    plt.close(fig)
-                    
-                    # Quick stats below chart
-                    eq_c1, eq_c2, eq_c3 = st.columns(3)
-                    peak = equity_df['P/L'].max()
-                    trough = equity_df['P/L'].min()
-                    max_dd = peak - trough if peak > trough else 0
-                    eq_c1.metric("Peak", f"+{peak:.2f}u" if peak > 0 else f"{peak:.2f}u")
-                    eq_c2.metric("Trough", f"{trough:.2f}u")
-                    eq_c3.metric("Max Drawdown", f"{max_dd:.2f}u")
-            
-            # =========================================================================
-            # V18: CLV ANALYSIS - The Best Predictor of Long-Term Edge
-            # =========================================================================
-            if stats.get('clv_count', 0) >= 5:
-                with st.expander("📊 CLV Analysis (Closing Line Value)", expanded=False):
-                    st.caption("**CLV = Best predictor of sharp betting.** +CLV means you beat the closing line.")
-                    
-                    clv1, clv2, clv3, clv4 = st.columns(4)
-                    
-                    avg_clv = stats.get('avg_clv', 0)
-                    clv_color = "normal" if avg_clv >= 0 else "inverse"
-                    clv1.metric("Avg CLV", f"{avg_clv:+.2f} pts", 
-                               delta=f"{stats.get('clv_positive_rate', 0):.0%} positive",
-                               delta_color=clv_color,
-                               help="Average line movement in your favor")
-                    
-                    clv2.metric("+CLV Win Rate", f"{stats.get('clv_positive_win_rate', 0):.0%}",
-                               delta=f"{stats.get('clv_positive_decided', 0)} bets",
-                               help="Win rate when you beat the closing line")
-                    
-                    clv3.metric("-CLV Win Rate", f"{stats.get('clv_negative_win_rate', 0):.0%}",
-                               delta=f"{stats.get('clv_negative_decided', 0)} bets",
-                               delta_color="inverse",
-                               help="Win rate when line moved against you")
-                    
-                    clv_edge = stats.get('clv_edge', 0)
-                    edge_emoji = "🎯" if clv_edge > 0.05 else ("⚠️" if clv_edge < 0 else "➖")
-                    clv4.metric(f"{edge_emoji} CLV Edge", f"{clv_edge:+.1%}",
-                               help="+CLV win rate minus -CLV win rate. Positive = you're sharp.")
-                    
-                    if clv_edge > 0.05:
-                        st.success("✅ **You're beating closing lines!** This is the #1 indicator of long-term profitability.")
-                    elif clv_edge < -0.05:
-                        st.warning("⚠️ **Negative CLV edge.** Consider waiting for better line movement or getting sharper entries.")
-            
-            # =========================================================================
-            # V18: GRADE PERFORMANCE ANALYSIS - Data-Driven Grade Evaluation
-            # =========================================================================
-            grade_stats = stats.get('grade_stats', {})
-            if grade_stats and len(grade_stats) >= 2:
-                with st.expander("📋 Grade Performance Analysis", expanded=False):
-                    st.caption("**Performance by bet grade.** Use this to calibrate grade thresholds.")
-                    
-                    # Create a DataFrame for display
-                    grade_rows = []
-                    for grade in ['A', 'B', 'C', 'D', 'F']:
-                        if grade in grade_stats:
-                            gs = grade_stats[grade]
-                            grade_rows.append({
-                                'Grade': grade,
-                                'Bets': gs['count'],
-                                'Wins': gs['wins'],
-                                'Win Rate': f"{gs['win_rate']:.1%}",
-                                'ROI': f"{gs['roi']:+.1%}",
-                                'Status': '✅ Profitable' if gs['roi'] > 0 else '❌ Losing'
-                            })
-                    
-                    if grade_rows:
-                        grade_df = pd.DataFrame(grade_rows)
-                        st.dataframe(grade_df, hide_index=True, use_container_width=True)
-                        
-                        # Recommendations based on data
-                        a_stats = grade_stats.get('A', {})
-                        b_stats = grade_stats.get('B', {})
-                        c_stats = grade_stats.get('C', {})
-                        
-                        if a_stats.get('roi', 0) < 0 and a_stats.get('count', 0) >= 10:
-                            st.warning("⚠️ **Grade A bets are losing.** Consider tightening A-grade EV threshold.")
-                        if c_stats.get('roi', 0) > 0.05 and c_stats.get('count', 0) >= 10:
-                            st.info("💡 **Grade C bets are profitable.** You might be too conservative with grading.")
-                        if b_stats.get('win_rate', 0) > a_stats.get('win_rate', 0) and a_stats.get('count', 0) >= 10:
-                            st.info("💡 **Grade B has higher win rate than A.** Check if high-EV bets are mispriced.")
-                    
-                    # V18: Threshold Optimization Button
-                    st.markdown("---")
-                    if st.button("🔧 Optimize Grade Thresholds", help="Analyze your bet history to find optimal EV thresholds"):
-                        with st.spinner("Analyzing bet history..."):
-                            opt_result = tracker.optimize_grade_thresholds()
-                        
-                        if opt_result.get('status') == 'insufficient_data':
-                            st.warning(opt_result.get('message'))
+            # Equity Curve (Optimized: Put inside expander to load lazily)
+            with st.expander("📈 Equity Curve", expanded=True):
+                decided_bets = [b for b in all_bets if b.get('result') in ['Win', 'Loss']]
+                if len(decided_bets) >= 2:
+                    decided_bets.sort(key=lambda x: x.get('date', '2024-01-01'))
+                    cumulative = []
+                    running_total = 0
+                    for bet in decided_bets:
+                        if bet.get('result') == 'Win':
+                            running_total += 0.91 # Standard -110 juice
                         else:
-                            st.markdown("**📊 Threshold Optimization Analysis**")
-                            
-                            # Show current vs optimal
-                            curr = opt_result.get('current_thresholds', {})
-                            optim = opt_result.get('optimal_thresholds', {})
-                            
-                            thresh_data = []
-                            for grade in ['A', 'B', 'C']:
-                                change = ""
-                                if optim[grade] != curr[grade]:
-                                    diff = (optim[grade] - curr[grade]) * 100
-                                    change = f"{'⬆️' if diff > 0 else '⬇️'} {abs(diff):.1f}%"
-                                thresh_data.append({
-                                    'Grade': grade,
-                                    'Current EV': f"{curr[grade]*100:.1f}%",
-                                    'Optimal EV': f"{optim[grade]*100:.1f}%",
-                                    'Change': change or '✓ OK'
-                                })
-                            
-                            st.dataframe(pd.DataFrame(thresh_data), hide_index=True)
-                            
-                            # Show recommendation
-                            st.info(f"💡 {opt_result.get('recommendation', 'No changes needed.')}")
-                            
-                            # Show performance at optimal thresholds
-                            opt_perf = opt_result.get('grade_performance', {})
-                            if opt_perf:
-                                st.caption("**Expected Performance at Optimal Thresholds:**")
-                                for grade, perf in opt_perf.items():
-                                    emoji = "🟢" if perf.get('roi', 0) > 0 else "🔴"
-                                    st.write(f"{emoji} Grade {grade}: {perf.get('count', 0)} bets, {perf.get('win_rate', 0):.1%} win rate, {perf.get('roi', 0):+.1f}% ROI")
-            
-            # Score Box Summary (if we have margin data)
-            if stats.get('margin_count', 0) > 0:
-                with st.expander("📦 Score Box Analysis", expanded=False):
-                    sb1, sb2, sb3, sb4 = st.columns(4)
-                    sb1.metric("Avg Margin", f"{stats['avg_margin']:+.1f}", 
-                              help="Average margin on decided bets (+ = favorable)")
-                    sb2.metric("Bad Beats", f"{stats['bad_beat_rate']:.0%}", 
-                              help="% of losses by ≤1.5 pts")
-                    sb3.metric("Bad Reads", f"{stats['bad_read_rate']:.0%}", 
-                              help="% of losses by 7.5+ pts")
-                    sb4.metric("Solid Wins", f"{stats.get('solid_win_rate', 0):.0%}", 
-                              help="% of wins by 3.5+ pts")
+                            running_total -= 1.0
+                        cumulative.append({'Bet #': len(cumulative)+1, 'P/L': running_total})
                     
-                    # Quality breakdown
-                    qc = stats.get('quality_counts', {})
-                    if any(qc.values()):
-                        st.caption("**Result Quality Breakdown:**")
-                        loss_cols = st.columns(4)
-                        loss_cols[0].write(f"💔 Bad Beat: {qc.get('bad_beat', 0)}")
-                        loss_cols[1].write(f"😤 Close Loss: {qc.get('close_loss', 0)}")
-                        loss_cols[2].write(f"📉 Clear Loss: {qc.get('clear_loss', 0)}")
-                        loss_cols[3].write(f"🚫 Bad Read: {qc.get('bad_read', 0)}")
-                        
-                        win_cols = st.columns(4)
-                        win_cols[0].write(f"😅 Sweat Win: {qc.get('sweat_win', 0)}")
-                        win_cols[1].write(f"✌️ Close Win: {qc.get('close_win', 0)}")
-                        win_cols[2].write(f"💪 Solid Win: {qc.get('solid_win', 0)}")
-                        win_cols[3].write(f"🔥 Blowout Win: {qc.get('blowout_win', 0)}")
+                    if cumulative:
+                        eq_df = pd.DataFrame(cumulative)
+                        st.line_chart(eq_df.set_index('Bet #')['P/L'], height=250, color="#00c853")
         
-        # Export and download controls
+        # --- EXPORT CONTROLS (Keep outside form) ---
         col_export, col_dl, col_clear = st.columns([2, 2, 1])
-        
         with col_export:
             exportable = tracker.get_exportable_count()
             if exportable > 0:
-                if st.button(f"📤 Export {exportable} to ML CSV", type="primary", key="export_ml_csv"):
+                if st.button(f"📤 Export {exportable} to ML CSV", type="primary", key="export_ml"):
                     count, path = tracker.export_bets_to_training_csv()
-                    st.success(f"✓ Exported {count} bets to {path}")
-                    st.rerun()
+                    st.success(f"Exported {count} bets!")
             else:
-                st.button("📤 Export to ML CSV", disabled=True, 
-                         help="No new completed bets with scores to export")
+                st.button("📤 Export", disabled=True, help="No new completed bets")
         
         with col_dl:
             if TRACKER_FILE.exists():
                 with open(TRACKER_FILE, "r") as f:
-                    st.download_button("📥 Download JSON", f.read(), "nba_bet_history.json", "application/json", key="dl_bet_history")
+                    st.download_button("📥 JSON Backup", f.read(), "history.json", "application/json")
         
-        with col_clear: 
-            if st.button("🗑️ Clear All", type="secondary", key="clear_bets"):
+        with col_clear:
+            if st.button("🗑️ Clear All", key="clear_all"):
                 tracker.clear_history()
                 st.rerun()
-        
+
         st.divider()
         
+        # --- FILTERS (Keep live, no form) ---
         if all_bets: 
-            # Tag filter for training data purification
-            filter_col1, filter_col2 = st.columns(2)
-            with filter_col1:
+            f_col1, f_col2, f_col3 = st.columns([2, 2, 1])
+            with f_col1:
                 filter_opts = ["Pending", "Win", "Loss", "Push"]
-                selected_filters = st.multiselect("Filter by Result:", options=filter_opts, default=["Pending", "Win", "Loss"])
-            with filter_col2:
-                tag_opts = list(set(b.get('tag', 'legacy') for b in all_bets))
-                tag_opts.sort()
-                selected_tags = st.multiselect("Filter by Tag:", options=tag_opts, default=tag_opts,
-                                              help="Filter training data: 'Sniper' = disciplined bets only")
+                selected_filters = st.multiselect("Filter Result:", filter_opts, default=["Pending", "Win", "Loss"])
+            with f_col2:
+                all_tags = list(set(b.get('tag', 'legacy') for b in all_bets))
+                selected_tags = st.multiselect("Filter Tag:", all_tags, default=all_tags)
+            with f_col3:
+                # 🚀 PAGINATION: Prevents rendering 500 widgets at once
+                view_limit = st.selectbox("Show Last:", [10, 20, 50, "All"], index=1)
             
+            # Apply Filters
             filtered_bets = [b for b in all_bets 
-                            if b.get('result', 'Pending') in selected_filters 
-                            and b.get('tag', 'legacy') in selected_tags]
+                             if b.get('result', 'Pending') in selected_filters 
+                             and b.get('tag', 'legacy') in selected_tags]
             
-            sort_map = {'Pending': 1, 'Win': 2, 'Loss': 3, 'Push': 4}
+            # Sort: Pending first, then by ID (newest first)
+            sort_map = {'Pending': 0, 'Win': 1, 'Loss': 2, 'Push': 3}
             filtered_bets.sort(key=lambda x: (sort_map.get(x.get('result', 'Pending'), 99), -x.get('id', 0)))
             
-            if not filtered_bets: 
-                st.info("No bets match these filters.")
+            # Apply Limit
+            total_count = len(filtered_bets)
+            if view_limit != "All":
+                filtered_bets = filtered_bets[:int(view_limit)]
             
-            for bet in filtered_bets:
-                with st.container(border=True):
-                    bet_res = bet.get('result', 'Pending')
-                    bet_tag = bet.get('tag', 'legacy')
-                    tag_emoji = {'Sniper': '🎯', 'Robot_Top_Pick': '🤖', 'Gut_Feel': '🎲', 'Live_Bet': '⚡'}.get(bet_tag, '📋')
-                    icon = {"Win": "✅", "Loss": "❌", "Push": "🔄"}.get(bet_res, "⏳")
-                    color = {"Win": "green", "Loss": "red", "Push": "blue"}.get(bet_res, "gray")
+            if not filtered_bets: 
+                st.info("No bets found.")
+            else:
+                st.caption(f"Showing {len(filtered_bets)} of {total_count} bets")
+
+                # --- 🚀 BATCH UPDATE FORM ---
+                # This form wraps the entire list. No reloads until you click Save.
+                with st.form(key="batch_bet_editor"):
                     
-                    # Compact header line with tag
-                    st.markdown(f"{icon} {tag_emoji} :{color}[**{bet['player']}**] {bet['side']} {bet['line']} ({bet['market']})")
-                    st.caption(f"vs {bet.get('opponent')} | Proj: {bet.get('proj', 0):.1f} | EV: {bet.get('ev', 0):+.1%} | {bet.get('date', 'N/A')} | Tag: {bet_tag}")
+                    # Header
+                    c1, c2, c3, c4, c5 = st.columns([3, 1.2, 1, 1, 0.5])
+                    c1.caption("Bet Details")
+                    c2.caption("Result")
+                    c3.caption("Actual")
+                    c4.caption("Closing")
+                    c5.caption("Del")
+
+                    for bet in filtered_bets:
+                        b_id = bet['id']
+                        bet_res = bet.get('result', 'Pending')
+                        
+                        # Use container for visual grouping
+                        with st.container(border=True):
+                            c1, c2, c3, c4, c5 = st.columns([3, 1.2, 1, 1, 0.5])
+                            
+                            with c1:
+                                # Visual Info (Read Only)
+                                color = {"Win": "green", "Loss": "red", "Push": "blue"}.get(bet_res, "gray")
+                                icon = {"Win": "✅", "Loss": "❌", "Push": "🔄"}.get(bet_res, "⏳")
+                                st.markdown(f"**{bet['player']}** {bet['market']}")
+                                st.caption(f"{icon} :{color}[{bet['side']} {bet['line']}] vs {bet['opponent']} ({bet.get('ev',0):.1%})")
+
+                            with c2:
+                                # Result Selectbox
+                                opts = ["Pending", "Win", "Loss", "Push"]
+                                try:
+                                    idx = opts.index(bet_res)
+                                except:
+                                    idx = 0
+                                st.selectbox("Res", opts, index=idx, key=f"s_{b_id}", label_visibility="collapsed")
+                            
+                            with c3:
+                                # Actual Value
+                                st.number_input("Act", value=float(bet.get('actual_value', 0)), step=1.0, key=f"av_{b_id}", label_visibility="collapsed")
+                            
+                            with c4:
+                                # Closing Line
+                                st.number_input("Clv", value=float(bet.get('closing_line', bet['line'])), step=0.5, key=f"cl_{b_id}", label_visibility="collapsed")
+                            
+                            with c5:
+                                # Delete Checkbox (Replaces slow delete button)
+                                st.checkbox("🗑️", key=f"del_{b_id}", label_visibility="collapsed")
+
+                            # Score Box Logic (Visual feedback)
+                            if bet.get('margin') is not None:
+                                m = bet['margin']
+                                mc = 'green' if m > 0 else 'red'
+                                st.caption(f":{mc}[Margin: {m:+.1f}] | {bet.get('result_quality','').replace('_',' ')}")
+
+                    # 🚀 ONE BUTTON TO RULE THEM ALL
+                    st.divider()
+                    submitted = st.form_submit_button("💾 Save Changes", type="primary", use_container_width="stretch")
+
+                # --- HANDLE UPDATES ---
+                if submitted:
+                    changes = 0
+                    for bet in filtered_bets:
+                        b_id = bet['id']
+                        
+                        # 1. Handle Deletion
+                        if st.session_state.get(f"del_{b_id}"):
+                            tracker.delete_bet(b_id)
+                            changes += 1
+                            continue # Skip update if deleted
+                        
+                        # 2. Handle Updates
+                        new_res = st.session_state.get(f"s_{b_id}")
+                        new_act = st.session_state.get(f"av_{b_id}")
+                        new_cl = st.session_state.get(f"cl_{b_id}")
+                        
+                        # Only update if changed
+                        old_res = bet.get('result', 'Pending')
+                        old_act = float(bet.get('actual_value', 0) or 0)
+                        old_cl = float(bet.get('closing_line', 0) or 0)
+                        
+                        if (new_res != old_res) or (abs(new_act - old_act) > 0.01) or (abs(new_cl - old_cl) > 0.01):
+                            tracker.update_result(b_id, new_res, new_cl, new_act)
+                            changes += 1
                     
-                    # Column labels row
-                    lbl1, lbl2, lbl3, lbl4 = st.columns([1.5, 1.5, 1.5, 0.5])
-                    lbl1.caption("**Result**")
-                    lbl2.caption("**Actual Score**")
-                    lbl3.caption("**Closing Line**")
-                    lbl4.caption("")
-                    
-                    # Controls row - Result, Actual Value, Closing Line
-                    c1, c2, c3, c4 = st.columns([1.5, 1.5, 1.5, 0.5])
-                    opts = ["Pending", "Win", "Loss", "Push"]
-                    curr_idx = opts.index(bet_res) if bet_res in opts else 0
-                    new = c1.selectbox("Result", opts, index=curr_idx, key=f"s_{bet['id']}", label_visibility="collapsed")
-                    
-                    # Actual value input for score box tracking
-                    current_actual = bet.get('actual_value', bet.get('line', 0))
-                    actual_value = c2.number_input("Actual Score", value=float(current_actual), step=0.5,
-                                                   key=f"av_{bet['id']}", label_visibility="collapsed",
-                                                   placeholder="Player's stat",
-                                                   help="Player's actual stat value (e.g., 25 points)")
-                    
-                    current_closing = bet.get('closing_line', bet.get('line', 0))
-                    closing_line = c3.number_input("Closing Line", value=float(current_closing), step=0.5, 
-                                                   key=f"cl_{bet['id']}", label_visibility="collapsed",
-                                                   placeholder="Final line",
-                                                   help="The line at game start (for CLV tracking)")
-                    
-                    # Check for any changes
-                    value_changed = (actual_value != current_actual) and new != "Pending"
-                    result_changed = new != bet_res
-                    close_changed = (closing_line != current_closing) and new != "Pending"
-                    
-                    if result_changed or value_changed or close_changed:
-                        tracker.update_result(
-                            bet['id'], 
-                            new, 
-                            closing_line if new != "Pending" else None,
-                            actual_value if new != "Pending" else None
-                        )
+                    if changes > 0:
+                        st.success(f"Updated {changes} bets!")
                         st.rerun()
-                    
-                    if c4.button("🗑️", key=f"d_{bet['id']}"):
-                        tracker.delete_bet(bet['id'])
-                        st.rerun()
-                    
-                    # Show score box info if available
-                    if bet.get('margin') is not None:
-                        margin = bet['margin']
-                        margin_pct = bet.get('margin_pct', 0)
-                        quality = bet.get('result_quality', 'unknown')
-                        quality_emoji = {
-                            'bad_beat': '💔', 'close_loss': '😤', 'clear_loss': '📉', 'bad_read': '🚫',
-                            'sweat_win': '😅', 'close_win': '✌️', 'solid_win': '💪', 'blowout_win': '🔥',
-                            'push': '🔄'
-                        }.get(quality, '❓')
-                        margin_color = 'green' if margin > 0 else ('red' if margin < 0 else 'gray')
-                        # Show both raw margin and percentage (standardized across stat types)
-                        st.caption(f"{quality_emoji} :{margin_color}[Margin: {margin:+.1f} ({margin_pct:+.1f}%)] | Quality: {quality.replace('_', ' ').title()}")
+                    else:
+                        st.info("No changes detected.")
         else:
-            st.info("No bets tracked yet. Run an analysis and click 'Track' to save a bet.")
+            st.info("Tracker is empty.")
     
     # Tab 7: Parlays
     with tab7:
