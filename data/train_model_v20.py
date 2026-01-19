@@ -127,6 +127,8 @@ FEATURE_COLS_V20 = [
     'feat_cv',# 🚀 V20.4 NEW: ADD THESE TWO LINES 🚀
     'feat_usage_rate',
     'feat_h2h_avg',
+    'feat_season_avg',
+    'feat_l10_avg',
 ]
 
 # V20 STRICT: No column aliases. No legacy migration.
@@ -135,37 +137,37 @@ FEATURE_COLS_V20 = [
 # Market-specific hyperparameters (Option C tuning)
 MARKET_HYPERPARAMS = {
     'scoring': {
-        # PTS: High volume, normally distributed
-        'n_estimators': 500,
-        'learning_rate': 0.05,
-        'max_depth': 4,
+        # PTS: High variance, needs depth to distinguish "Slump" vs "Bad Luck"
+        'n_estimators': 1000,      # Doubled: More iterations to find patterns
+        'learning_rate': 0.02,     # Slower: Prevents overreacting to one bad game
+        'max_depth': 6,            # Deeper: Allows 3-step logic (Avg -> Trend -> Minutes)
         'subsample': 0.8,
         'colsample_bytree': 0.8,
         'min_child_weight': 3,
     },
     'counting': {
-        # REB, AST: Medium volume counting stats
-        'n_estimators': 500,
-        'learning_rate': 0.05,
-        'max_depth': 4,
+        # REB, AST: Heavily dependent on Minutes/Usage correlations
+        'n_estimators': 800,       # Increased
+        'learning_rate': 0.03,     # Slower
+        'max_depth': 5,            # Deeper (was 4)
         'subsample': 0.8,
         'colsample_bytree': 0.8,
         'min_child_weight': 3,
     },
     'combo': {
-        # PRA, PR, PA, RA: Sum of stats, higher variance
-        'n_estimators': 600,
-        'learning_rate': 0.04,
-        'max_depth': 5,
+        # PRA: The most stable market, can handle the most complexity
+        'n_estimators': 1200,      # High iteration count for precision
+        'learning_rate': 0.02,     # Very precise learning
+        'max_depth': 6,            # Deep trees to capture multi-stat correlations
         'subsample': 0.8,
         'colsample_bytree': 0.8,
         'min_child_weight': 2,
     },
     'universal': {
-        # Fallback for all markets
-        'n_estimators': 500,
-        'learning_rate': 0.05,
-        'max_depth': 4,
+        # Robust fallback
+        'n_estimators': 800,
+        'learning_rate': 0.03,
+        'max_depth': 5,
         'subsample': 0.8,
         'colsample_bytree': 0.8,
         'min_child_weight': 3,

@@ -1,5 +1,5 @@
 import streamlit as st
-import google.generativeai as genai
+from groq import Groq
 import pandas as pd
 import numpy as np
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, leaguedashplayerstats, leaguegamelog
@@ -185,44 +185,85 @@ def get_all_nba_players():
     return players.get_players()
 
 @st.cache_resource
-def get_ai_model():
-    if "GEMINI_API_KEY" in st.secrets:
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        return genai.GenerativeModel('gemini-2.5-flash')
+def get_groq_client():
+    """Initialize Groq client securely."""
+    if "GROQ_API_KEY" in st.secrets:
+        return Groq(api_key=st.secrets["GROQ_API_KEY"])
     return None
 
 def get_ai_second_opinion(prop_analysis, backtest_json):
-    model = get_ai_model()
-    if not model: return "⚠️ Missing API Key."
+    """
+    Get a second opinion from Groq (Llama 3.3 70B) - FAST & FREE.
+    Now enhanced with V20.4 Context (Usage, H2H, Season/L10 Split).
+    """
+    client = get_groq_client()
+    if not client: 
+        return "⚠️ Missing GROQ_API_KEY in secrets."
 
+    # --- V20.4 DATA PREP ---
+    season_avg = float(prop_analysis.get('feat_season_avg', 0) or 0)
+    l10_avg = float(prop_analysis.get('feat_l10_avg', 0) or 0)
+    h2h = float(prop_analysis.get('feat_h2h_avg', -1) or -1)
+    
+    # 🔧 FIX: Smart Usage Scaling
+    # The raw data is "Possessions Per Minute" (e.g., 0.64).
+    # We need "Usage Percentage" (e.g., 30%).
+    usage_raw = float(prop_analysis.get('feat_usage_rate', 0) or 0)
+    
+    if usage_raw < 5.0: 
+        # Convert 0.64 -> 30.7% (Approx based on 100 pace)
+        usage_pct = (usage_raw / 2.083) * 100 
+    else:
+        # Already a percentage
+        usage_pct = usage_raw
+
+    # Construct the Prompt
     prompt = f"""
     Act as a skeptical professional sports bettor. Compare this Model Prediction vs. Historical Reality.
 
     **🤖 PART 1: THE MODEL (The Setup)**
-    - Player: {prop_analysis['player']}
-    - Market: {prop_analysis['market']} {prop_analysis['line']}
-    - Signal: {prop_analysis['signal']} (EV: {prop_analysis['ev']}%)
-    - **Trend Stats:** EMA: {prop_analysis['ema']} | L5 Slope: {prop_analysis['trend']}
+    - Player: {prop_analysis.get('player', 'Unknown')}
+    - Market: {prop_analysis.get('market', 'Unknown')} {prop_analysis.get('line', '0')}
+    - Signal: {prop_analysis.get('signal', 'Neutral')} (EV: {prop_analysis.get('ev', 0)}%)
+    - **Trend Stats:** EMA: {prop_analysis.get('ema', 0)} | L5 Slope: {prop_analysis.get('trend', 0)}
 
-    **📉 PART 2: THE REALITY (Last 30 Games)**
-    - Hit Rate (L30): {backtest_json['l30_rate']}%
-    - Avg vs Line: {backtest_json['avg_diff']:+.1f}
-    - Last 5 Raw: {backtest_json['l5_trend']}
+    **🧠 PART 2: ADVANCED CONTEXT (The "Why")**
+    - **Form Check:** Season Avg ({season_avg:.1f}) vs L10 Avg ({l10_avg:.1f})
+      *(If L10 < Season, player is cooling off. If L10 > Season, player is heating up)*
+    - **Usage Rate:** {usage_pct:.1f}% (Est. USG%)
+    - **Matchup History:** Avg vs this Opponent: {f"{h2h:.1f}" if h2h > 0 else "N/A"}
+
+    **📉 PART 3: THE REALITY (Last 30 Games)**
+    - Hit Rate (L30): {backtest_json.get('l30_rate', 0)}%
+    - Avg vs Line: {backtest_json.get('avg_diff', 0):+.1f}
     - Recent Logs:
-    {backtest_json['logs_csv']}
+    {backtest_json.get('logs_csv', 'No logs available')}
 
     **🎯 YOUR TASK:**
-    1. **Volatility Check:** Compare the smooth EMA ({prop_analysis['ema']}) vs the raw Last 5 games. Is the EMA misleading because of a recent blowout or injury?
-    2. **Pattern Match:** Does the log show inconsistency that the math missed?
-    3. **Verdict:** AGREE or DISAGREE.
+    1. **"Sticky EMA" Check:** Look at Season Avg vs L10 Avg. Is the EMA misleading because recent form has changed?
+    2. **Usage/Role:** Does the Usage Rate ({usage_pct:.1f}%) support the line?
+    3. **Matchup:** Does the H2H history suggest he owns this team?
+    4. **Verdict:** AGREE or DISAGREE with the model. Be concise.
     """
     
     try:
-        response = model.generate_content(prompt, generation_config={"temperature": 0.3})
-        return response.text
+        # Call Groq API
+        completion = client.chat.completions.create(
+            # "llama-3.3-70b-versatile" is the best free model on Groq right now
+            model="llama-3.3-70b-versatile", 
+            messages=[
+                {"role": "system", "content": "You are a sharp, skeptical sports bettor who hates losing money. Be concise."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3, # Keep it analytical, not creative
+            max_tokens=450   # Slightly increased for deeper analysis
+        )
+        
+        return completion.choices[0].message.content
+        
     except Exception as e:
-        return f"AI Error: {str(e)}"
-
+        return f"Groq Error: {str(e)}"
+    
 class ResultQuality(Enum):
     """
     Result quality categories for ML training.
@@ -370,7 +411,10 @@ class FeatureVector:
     # === V20.4 NEW: ADVANCED CONTEXT ===
     feat_usage_rate: float = -1.0   # Rolling usage intensity
     feat_h2h_avg: float = -1.0      # Avg vs this opponent
-    
+    feat_season_avg: float = 0.0  # True baseline
+    feat_l10_avg: float = 0.0
+
+
     # === MARKET IDENTITY (one-hot encoded) ===
     market_scoring: int = 0  # PTS
     market_counting: int = 0 # REB, AST  
@@ -1359,6 +1403,21 @@ class FeatureEngineer:
         if len(df) == 0 or stat_col not in df.columns:
             raise ValueError(f"Cannot calculate features: missing data for {stat_col}")
         
+        season_avg = 0.0
+        if len(df) > 0:
+            try:
+                season_avg = df[stat_col].mean()
+            except Exception:
+                season_avg = 0.0
+
+        l10_avg = 0.0
+        l10_subset = df.tail(10)
+        if len(l10_subset) > 0:
+            try:
+                l10_avg = l10_subset[stat_col].mean()
+            except Exception:
+                l10_avg = 0.0
+        
         recent = df.tail(lookback).copy()
         if len(recent) == 0:
             raise ValueError("No recent games available for analysis")
@@ -1471,7 +1530,9 @@ class FeatureEngineer:
             'min_volatility': min_volatility,
             'foul_rate': foul_rate,
             'cv': cv,
-            'usage_rate': float(usage_rate)
+            'usage_rate': float(usage_rate),
+            'season_avg': float(season_avg),
+            'l10_avg': float(l10_avg)
         }
     
     def _calculate_ts_pct(self, df: pd.DataFrame, lookback: int = 15) -> Tuple[float, float]:
@@ -1523,32 +1584,12 @@ class FeatureEngineer:
         market: str,
         days_rest: int = 1,
         game_total: float = 0.0,
-        player_team_id: int = None,  # V20.2: For team pace lookup
-        player_team_abbrev: str = None,  # V20.3: For injury-based absence features
-        data_loader: 'DataLoader' = None  # V20.3: For PPG lookups
+        player_team_id: int = None,
+        player_team_abbrev: str = None,
+        data_loader: 'DataLoader' = None
     ) -> FeatureVector: 
         """
         Build pure empirical feature vector for ML models.
-        
-        V20.3 EMPIRICAL: 24 raw observables known before tip-off.
-        
-        NO MULTIPLIERS. NO HEURISTICS. Let ML learn all relationships.
-        
-        V20.2 Features:
-        - opponent_pace: Opponent's pace factor
-        - team_pace: Player's team pace factor
-        - trend_5g: Slope of last 5 games
-        - home_avg: Player's home game average
-        - away_avg: Player's away game average
-        
-        V20.3 NEW (Absence-aware from injury reports):
-        - team_out_ppg: PPG of teammates listed as OUT/DOUBTFUL
-        - team_out_count: Count of teammates out
-        - opp_out_ppg: PPG of opponents listed as OUT/DOUBTFUL
-        - opp_out_count: Count of opponents out
-        
-        Note: During training, absence features come from game logs (ground truth).
-        For live predictions, injury reports are used as proxy (-1 if unavailable).
         """
         
         # Initialize data quality tracker
@@ -1557,13 +1598,12 @@ class FeatureEngineer:
         # === CORE STATISTICAL FEATURES (raw from game logs) ===
         stats = self.calculate_statistical_features(df, stat_col, lookback, data_quality)
         
-        # === OPPONENT DEFENSIVE RATING (raw season-to-date statistic) ===
-        opponent_drtg_season = avg_def  # Default to league average
-        opponent_pace = 100.0  # Default pace
-        team_pace = 100.0  # Default pace
+        # === OPPONENT DEFENSIVE RATING ===
+        opponent_drtg_season = avg_def
+        opponent_pace = 100.0
+        team_pace = 100.0
         
         if len(team_stats) > 0:
-            # Opponent stats
             if opponent_id in team_stats.index:
                 opp = team_stats.loc[opponent_id]
                 opponent_drtg_season = opp.get('DEF_RATING', avg_def)
@@ -1572,13 +1612,12 @@ class FeatureEngineer:
                     opponent_pace = opp_pace_val
                 else:
                     data_quality.used_default_pace = True
-                    data_quality.add_warning("Using default opponent pace (PACE column missing)")
+                    data_quality.add_warning("Using default opponent pace")
             else:
                 data_quality.used_default_def_rating = True
                 data_quality.used_default_pace = True
-                data_quality.add_warning(f"Opponent {opponent_id} not in team_stats - using defaults")
+                data_quality.add_warning(f"Opponent {opponent_id} not in team_stats")
             
-            # Player's team stats (V20.2 NEW)
             if player_team_id and player_team_id in team_stats.index:
                 player_team = team_stats.loc[player_team_id]
                 team_pace_val = player_team.get('PACE', None)
@@ -1586,23 +1625,22 @@ class FeatureEngineer:
                     team_pace = team_pace_val
                 else:
                     data_quality.used_default_pace = True
-                    data_quality.add_warning("Using default team pace (PACE column missing)")
+                    data_quality.add_warning("Using default team pace")
             elif player_team_id:
                 data_quality.used_default_pace = True
-                data_quality.add_warning(f"Player team {player_team_id} not in team_stats - using default pace")
+                data_quality.add_warning(f"Player team {player_team_id} not in team_stats")
         
         if len(team_stats) == 0:
             data_quality.missing_team_stats = True
             data_quality.used_default_def_rating = True
             data_quality.used_default_pace = True
-            data_quality.add_warning("Team stats unavailable - using defaults for DRTG and pace")
+            data_quality.add_warning("Team stats unavailable")
         
-        # === DAYS REST (raw integer, not a computed factor) ===
+        # === DAYS REST ===
         actual_days_rest = days_rest if days_rest >= 0 else (0 if is_b2b else 1)
         
-        # === V20.3 NEW: ABSENCE FEATURES FROM INJURY REPORT ===
-        # For live predictions, use injury report as proxy for who will be out
-        team_out_ppg = -1.0  # Sentinel: unknown
+        # === ABSENCE FEATURES ===
+        team_out_ppg = -1.0
         team_out_count = -1
         opp_out_ppg = -1.0
         opp_out_count = -1
@@ -1619,8 +1657,7 @@ class FeatureEngineer:
             opp_out_ppg = absence_features['opp_out_ppg']
             opp_out_count = absence_features['opp_out_count']
         
-        # === V20.3 NEW: TRUE-SHOOTING% (TS%) FEATURES ===
-        # Safe admissible metric derived from raw game logs using rolling sums
+        # === TRUE-SHOOTING% FEATURES ===
         feat_ts_pct = -1.0
         feat_ts_pct_delta = -1.0
         try:
@@ -1632,38 +1669,30 @@ class FeatureEngineer:
             elif season_ts != -1.0:
                 feat_ts_pct_delta = 0.0
         except Exception:
-            # Non-fatal: keep sentinel values
             feat_ts_pct = feat_ts_pct
             feat_ts_pct_delta = feat_ts_pct_delta
         
-        # === V20.4 NEW: HEAD-TO-HEAD HISTORY ===
+        # === HEAD-TO-HEAD HISTORY ===
         h2h_avg = -1.0
         try:
-            # Filter for games against this opponent
-            # We use the 'MATCHUP' column which contains "vs. BOS" or "@ BOS"
             if opponent_abbrev and 'MATCHUP' in df.columns:
-                # Look for abbreviation in matchup string
                 h2h_games = df[df['MATCHUP'].str.contains(opponent_abbrev, case=False, na=False)]
-                
                 if len(h2h_games) > 0:
-                    # Calculate average of the target stat (e.g., PTS)
                     h2h_avg = h2h_games[stat_col].mean()
                 else:
-                    # No history? Default to season EMA
                     h2h_avg = stats['ema']
         except Exception:
             h2h_avg = stats['ema']
 
-    
         # === BUILD FEATURE VECTOR ===
         return FeatureVector(
-            # Identifiers (not used in ML)
+            # Identifiers
             player_id=player_id,
             player_name=player_name,
             opponent_abbrev=opponent_abbrev,
             market=market,
             
-            # Raw observables only - NO MULTIPLIERS
+            # Raw observables
             line=line,
             avg_minutes=stats['avg_minutes'],
             ema=stats['ema'],
@@ -1676,42 +1705,39 @@ class FeatureEngineer:
             is_b2b=is_b2b or actual_days_rest == 0,
             games_played=stats['games_played'],
             
-            # V20.2: Pace context
+            # Context
             opponent_pace=opponent_pace,
             team_pace=team_pace,
-            
-            # V20.2: Momentum & splits
             trend_5g=stats['trend_5g'],
             home_avg=stats['home_avg'],
             away_avg=stats['away_avg'],
             
-            # V20.3 NEW: True-Shooting features
+            # New Features
             feat_ts_pct=feat_ts_pct,
             feat_ts_pct_delta=feat_ts_pct_delta,
-            
-            # V20.3 NEW: Absence-aware features (from injury report)
             team_out_ppg=team_out_ppg,
             team_out_count=team_out_count,
             opp_out_ppg=opp_out_ppg,
             opp_out_count=opp_out_count,
-            
-            # V20.3 NEW: Behavior & Risk features (stat-derived)
             feat_min_volatility=stats.get('min_volatility', 0.0),
             feat_foul_rate=stats.get('foul_rate', 0.0),
             feat_cv=stats.get('cv', 0.0),
             
-            # Market identity (one-hot encoded)
+            # Market Identity
             market_scoring=1 if market == 'PTS' else 0,
             market_counting=1 if market in ['REB', 'AST'] else 0,
             market_combo=1 if market in ['PRA', 'PR', 'PA', 'RA'] else 0,
             market_rare=1 if market in ['3PM', 'STL', 'BLK'] else 0,
             
-            # Data quality
             data_quality=data_quality,
             
-            # 🚀 V20.4 NEW FEATURES (The Missing Link)
+            # V20.4 NEW FEATURES
             feat_usage_rate=stats.get('usage_rate', 0.0),
-            feat_h2h_avg=h2h_avg
+            feat_h2h_avg=h2h_avg,
+            
+            # 🚀 ADDED NEW FEATURES HERE 🚀
+            feat_season_avg=stats.get('season_avg', 0.0),
+            feat_l10_avg=stats.get('l10_avg', 0.0)
         )
 
 @dataclass
@@ -1937,6 +1963,8 @@ class ModelEngine:
             # 🚀 V20.4 NEW: ADD THESE LINES TO FIX THE WARNINGS
             'feat_usage_rate': float(features.feat_usage_rate),
             'feat_h2h_avg': float(features.feat_h2h_avg),
+            'feat_season_avg': float(features.feat_season_avg),
+            'feat_l10_avg': float(features.feat_l10_avg),
         }
         
         # Extract values in the exact order expected by the model
@@ -2559,6 +2587,8 @@ class Backtester:
             # 🚀 V20.4 NEW: ADD THESE LINES (Currently missing in your file)
             'feat_usage_rate': features.feat_usage_rate,
             'feat_h2h_avg': features.feat_h2h_avg,
+            'feat_season_avg': features.feat_season_avg,
+            'feat_l10_avg': features.feat_l10_avg,
             
             # Absence features
             'team_out_ppg': features.team_out_ppg,
@@ -3002,9 +3032,11 @@ class Backtester:
                     'team_out_count': frozen_snapshot['team_out_count'],
                     'opp_out_ppg': frozen_snapshot['opp_out_ppg'],
                     'opp_out_count': frozen_snapshot['opp_out_count'],
-                    # 🚀 [MISSING PART] ADD THIS HERE:
+                    # 🚀 V20.4 NEW: Ensure ALL these are present
                     'feat_usage_rate': frozen_snapshot.get('feat_usage_rate', -1.0),
                     'feat_h2h_avg': frozen_snapshot.get('feat_h2h_avg', -1.0),
+                    'feat_season_avg': frozen_snapshot.get('feat_season_avg', 0.0),
+                    'feat_l10_avg': frozen_snapshot.get('feat_l10_avg', 0.0),
                     # Market identity (one-hot encoded)
                     'market_scoring': frozen_snapshot['market_scoring'],
                     'market_counting': frozen_snapshot['market_counting'],
@@ -3266,7 +3298,9 @@ TRAINING_FEATURE_COLUMNS = [
     'feat_foul_rate',
     'feat_cv',
     'feat_usage_rate',
-    'feat_h2h_avg'
+    'feat_h2h_avg',
+    'feat_season_avg',
+    'feat_l10_avg'
 ]
 
 # Canonical export schema used for writing ML training CSVs (single source of truth)
@@ -5047,6 +5081,8 @@ class Tracker:
             # 🚀 V20.4 NEW: ADD THESE LINES
             'feat_usage_rate': float(bet.get('feat_usage_rate', -1.0)),
             'feat_h2h_avg': float(bet.get('feat_h2h_avg', -1.0)),
+            'feat_season_avg': float(bet.get('feat_season_avg', 0.0)),
+            'feat_l10_avg': float(bet.get('feat_l10_avg', 0.0)),
         }
 
         # Market identity features
@@ -7077,11 +7113,11 @@ def main():
             with st.container(border=True):
                 c_ai_1, c_ai_2 = st.columns([3, 1])
                 with c_ai_1:
-                    st.subheader("🤖 AI Analyst")
+                    st.subheader("AI Analyst")
                     st.caption("Get a second opinion. compares the math (EV) vs. the tape (Game Logs).")
                 with c_ai_2:
                     # Unique key ensures no conflict
-                    ask_ai = st.button("🧠 Consult Gemini", key="tab1_ask_ai", use_container_width="stretch")
+                    ask_ai = st.button("Consult groq", key="tab1_ask_ai", use_container_width="stretch")
 
                 if ask_ai:
                     with st.spinner(f"Analyzing {result.player_name}'s history..."):
@@ -7109,7 +7145,11 @@ def main():
                             "avg_min": round(feats.avg_minutes, 1),
                             "opp_rank": round(feats.opponent_drtg_season, 1),
                             "rest": feats.days_rest,
-                            "trend": "Heating Up" if feats.trend_5g > 0.5 else ("Cooling Down" if feats.trend_5g < -0.5 else "Flat")
+                            "trend": "Heating Up" if feats.trend_5g > 0.5 else ("Cooling Down" if feats.trend_5g < -0.5 else "Flat"),
+                            "feat_usage_rate": getattr(feats, 'feat_usage_rate', 0.0),
+                            "feat_season_avg": getattr(feats, 'feat_season_avg', 0.0),
+                            "feat_l10_avg": getattr(feats, 'feat_l10_avg', 0.0),
+                            "feat_h2h_avg": getattr(feats, 'feat_h2h_avg', -1.0)
                         }
 
                         # 2. RUN THE MINI-BACKTEST (The "Reality")
@@ -7148,7 +7188,7 @@ def main():
                                 insight = get_ai_second_opinion(prop_payload, backtest_payload)
                                 
                                 # 4. DISPLAY
-                                st.markdown("### 📝 Gemini's Verdict")
+                                st.markdown("### groqs's Verdict")
                                 st.markdown(insight)
                                 
                             else:
