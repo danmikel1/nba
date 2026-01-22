@@ -21,7 +21,14 @@ try:
     
     # Check your new babies
     print("\n🆕 NEW FEATURE RANKINGS:")
-    print(df_imp[df_imp['feature'].isin(['feat_usage_rate', 'feat_h2h_avg'])])
+    new_features = [
+        'feat_usage_rate', 
+        'feat_h2h_avg', 
+        'feat_eff_per_min',   # <--- Added
+        'feat_fatigue_load',  # <--- Added
+        'feat_form_gap'       # <--- Added
+    ]
+    print(df_imp[df_imp['feature'].isin(new_features)])
 
 except Exception as e:
     print(f"Error checking importance: {e}")

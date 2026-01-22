@@ -190,77 +190,130 @@ def get_groq_client():
     if "GROQ_API_KEY" in st.secrets:
         return Groq(api_key=st.secrets["GROQ_API_KEY"])
     return None
-
-def get_ai_second_opinion(prop_analysis, backtest_json):
+    
+def get_ai_second_opinion(prop_analysis, backtest_json, history_context=None):
     """
-    Get a second opinion from Groq (Llama 3.3 70B) - FAST & FREE.
-    Now enhanced with V20.4 Context (Usage, H2H, Season/L10 Split).
+    Get a second opinion from Groq (Llama 3.3 70B) with FULL CONTEXT + MODEL HISTORY.
     """
     client = get_groq_client()
     if not client: 
         return "⚠️ Missing GROQ_API_KEY in secrets."
 
-    # --- V20.4 DATA PREP ---
+    # --- 1. SAFE DATA PREP (Prevent NoneType Crashes) ---
+    
+    # Feature Defaults
     season_avg = float(prop_analysis.get('feat_season_avg', 0) or 0)
     l10_avg = float(prop_analysis.get('feat_l10_avg', 0) or 0)
     h2h = float(prop_analysis.get('feat_h2h_avg', -1) or -1)
+    missing_production = float(prop_analysis.get('teammates_out_ppg', 0) or 0)
     
-    # 🔧 FIX: Smart Usage Scaling
-    # The raw data is "Possessions Per Minute" (e.g., 0.64).
-    # We need "Usage Percentage" (e.g., 30%).
+    # Usage Formatting
     usage_raw = float(prop_analysis.get('feat_usage_rate', 0) or 0)
+    usage_pct = (usage_raw / 2.083) * 100 if usage_raw < 5.0 else usage_raw
+
+    # Backtest Defaults (Handle Missing/Empty Data)
+    l30_rate = backtest_json.get('l30_rate', 'N/A')
     
-    if usage_raw < 5.0: 
-        # Convert 0.64 -> 30.7% (Approx based on 100 pace)
-        usage_pct = (usage_raw / 2.083) * 100 
+    # Safe Format for Avg Diff
+    avg_diff_val = backtest_json.get('avg_diff')
+    if avg_diff_val is not None and isinstance(avg_diff_val, (int, float)):
+        avg_diff_str = f"{avg_diff_val:+.1f}"
     else:
-        # Already a percentage
-        usage_pct = usage_raw
+        avg_diff_str = "N/A"
+        
+    # EV/Prob Formatting
+    ev_val = prop_analysis.get('ev', 0)
+    prob_val = prop_analysis.get('prob', 0)
+    ev_str = f"{ev_val:.1%}" if ev_val is not None else "N/A"
+    prob_str = f"{prob_val:.1%}" if prob_val is not None else "N/A"
 
-    # Construct the Prompt
+    # 🚀 NEW: INTUITIVE EDGE CALCULATION
+    # Positive Edge always means "Good/Safe". Negative means "Bad/Tight".
+    try:
+        proj = float(prop_analysis.get('projected', 0))
+        line = float(prop_analysis.get('line', 0))
+        signal = prop_analysis.get('signal', 'OVER') # Default to OVER if missing
+        
+        if signal == 'OVER':
+            edge = proj - line # e.g. 17.0 - 14.5 = +2.5 (Good)
+        else: # UNDER
+            edge = line - proj # e.g. 14.5 - 11.0 = +3.5 (Good)
+            
+        edge_str = f"{edge:+.1f}"
+    except:
+        edge_str = "N/A"
+
+    # --- 2. CONSTRUCT HISTORY SECTION ---
+    history_section = "**🤖 MODEL TRACK RECORD: No Data**"
+    if history_context:
+        history_section = f"""
+    **🤖 MODEL TRACK RECORD (Specific to {prop_analysis.get('player')} {prop_analysis.get('market')})**
+    * **Record:** {history_context.get('record', 'N/A')} ({history_context.get('win_rate', 'N/A')}%)
+    * **Sample Size:** {history_context.get('count', 0)} tracked bets
+    * **Recent Form:** {history_context.get('last_5', 'N/A')}
+    * **Reality Check:** This is how the model *actually* performs on this specific player.
+    """
+
+    # 🆕 EXTRACT BUCKET DATA
+    bucket_name = backtest_json.get('bucket_name', 'N/A')
+    bucket_wr = backtest_json.get('bucket_wr', 'N/A')
+    bucket_count = backtest_json.get('bucket_count', 0)
+    
+    bucket_section = ""
+    if bucket_name != "N/A":
+        bucket_section = f"""
+    **🎯 CALIBRATION CHECK (The "Trust" Factor)**
+    * **Current Confidence:** {prop_analysis.get('prob'):.1%}
+    * **Historical Accuracy:** When the model is in the **{bucket_name}** range, it wins **{bucket_wr}%** of the time ({bucket_count} bets).
+    * **Implication:** Does the model's confidence match its actual performance?
+    """
+
+    # --- 3. BUILD PROMPT ---
     prompt = f"""
-    Act as a skeptical professional sports bettor. Compare this Model Prediction vs. Historical Reality.
+    Act as a sharp NBA capper. Analyze this prop bet.
 
-    **🤖 PART 1: THE MODEL (The Setup)**
-    - Player: {prop_analysis.get('player', 'Unknown')}
-    - Market: {prop_analysis.get('market', 'Unknown')} {prop_analysis.get('line', '0')}
-    - Signal: {prop_analysis.get('signal', 'Neutral')} (EV: {prop_analysis.get('ev', 0)}%)
-    - **Trend Stats:** EMA: {prop_analysis.get('ema', 0)} | L5 Slope: {prop_analysis.get('trend', 0)}
+    **🏀 THE BET**
+    * **Player:** {prop_analysis.get('player')} ({prop_analysis.get('team')})
+    * **Market:** {prop_analysis.get('market')} {prop_analysis.get('line')}
+    * **Signal:** {prop_analysis.get('signal')} (EV: {prop_analysis.get('ev'):.1%}, Prob: {prop_analysis.get('prob'):.1%})
+    * **Projected:** {prop_analysis.get('projected')} (Edge: {edge_str})
+    * **Note:** A Positive Edge (+) means we have a safety cushion. A Negative Edge (-) means the projection is fighting the line.
+    
+    {history_section}
+    {bucket_section}
 
-    **🧠 PART 2: ADVANCED CONTEXT (The "Why")**
-    - **Form Check:** Season Avg ({season_avg:.1f}) vs L10 Avg ({l10_avg:.1f})
-      *(If L10 < Season, player is cooling off. If L10 > Season, player is heating up)*
-    - **Usage Rate:** {usage_pct:.1f}% (Est. USG%)
-    - **Matchup History:** Avg vs this Opponent: {f"{h2h:.1f}" if h2h > 0 else "N/A"}
+    **🏟️ GAME ENVIRONMENT**
+    * **Spread:** {prop_analysis.get('spread')}
+    * **Total:** {prop_analysis.get('total')}
+    * **Rest:** {prop_analysis.get('rest')} days
+    * **Opponent Rank:** {prop_analysis.get('opp_rank')}
 
-    **📉 PART 3: THE REALITY (Last 30 Games)**
-    - Hit Rate (L30): {backtest_json.get('l30_rate', 0)}%
-    - Avg vs Line: {backtest_json.get('avg_diff', 0):+.1f}
-    - Recent Logs:
-    {backtest_json.get('logs_csv', 'No logs available')}
+    **📈 PLAYER FORM**
+    * **Season Avg:** {season_avg:.1f}
+    * **L10 Avg:** {l10_avg:.1f} ({prop_analysis.get('trend')})
+    * **Est. Usage:** {usage_pct:.1f}%
 
-    **🎯 YOUR TASK:**
-    1. **"Sticky EMA" Check:** Look at Season Avg vs L10 Avg. Is the EMA misleading because recent form has changed?
-    2. **Usage/Role:** Does the Usage Rate ({usage_pct:.1f}%) support the line?
-    3. **Matchup:** Does the H2H history suggest he owns this team?
-    4. **Verdict:** AGREE or DISAGREE with the model. Be concise.
+    **📉 L30 TRENDS**
+    * **Hit Rate:** {backtest_json.get('l30_rate')}%
+    * **Avg Margin:** {backtest_json.get('avg_diff', 0):+.1f}
+
+    **🧠 ANALYSIS TASKS:**
+    1.  **Calibration Check:** Look at the "Calibration Check" section. If the Bucket Win Rate is high (e.g., >60%), TRUST the signal. If low, DOUBT it.
+    2.  **Edge Check:** Do we have a positive safety cushion?
+    3.  **Verdict:** AGREE or DISAGREE.
     """
     
     try:
-        # Call Groq API
         completion = client.chat.completions.create(
-            # "llama-3.3-70b-versatile" is the best free model on Groq right now
             model="llama-3.3-70b-versatile", 
             messages=[
-                {"role": "system", "content": "You are a sharp, skeptical sports bettor who hates losing money. Be concise."},
+                {"role": "system", "content": "You are a professional sports bettor. Be concise, analytical, and ignore 'coach speak'. Focus on math and usage."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.3, # Keep it analytical, not creative
-            max_tokens=450   # Slightly increased for deeper analysis
+            temperature=0.3,
+            max_tokens=600
         )
-        
         return completion.choices[0].message.content
-        
     except Exception as e:
         return f"Groq Error: {str(e)}"
     
@@ -413,13 +466,15 @@ class FeatureVector:
     feat_h2h_avg: float = -1.0      # Avg vs this opponent
     feat_season_avg: float = 0.0  # True baseline
     feat_l10_avg: float = 0.0
+    feat_eff_per_min: float = 0.0
+    feat_fatigue_load: float = 0.0  # (Minutes / Rest) interaction
+    feat_form_gap: float = 0.0      # (Recent - Season) delta
 
 
     # === MARKET IDENTITY (one-hot encoded) ===
     market_scoring: int = 0  # PTS
     market_counting: int = 0 # REB, AST  
     market_combo: int = 0    # PRA, PR, PA, RA
-    market_rare: int = 0     # 3PM, STL, BLK
 
     # === BEHAVIOR & RISK FEATURES ===
     # Rolling std dev of minutes (risk)
@@ -435,52 +490,85 @@ class FeatureVector:
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for ML pipeline."""
         return asdict(self)
-    
-    def to_ml_array(self) -> np.ndarray:
+
+    @classmethod
+    def get_feature_names(cls) -> List[str]:
+        """Return canonical training feature column names.
+
+        Ordering strategy:
+        1. Keep a stable legacy observable ordering first (prefixed with 'feat_')
+        2. Followed by all remaining dataclass fields (in declaration order) converted to 'feat_' names
+        This ensures fields like 'team_out_count' (non-feat name) are included automatically.
         """
-        Convert to numpy array for ML models.
-        V20.3: 24 raw observable features (was 20 in V20.2).
-        """
-        numeric_features = [
-            # Original 15 features
-            self.avg_minutes,
-            self.ema,
-            self.std,
-            self.opponent_drtg_season,
-            self.line,
-            self.spread,
-            self.game_total,
-            float(self.days_rest),
-            float(self.is_home),
-            float(self.is_b2b),
-            float(self.games_played),
-            # V20.2: 5 additional features
-            self.opponent_pace,
-            self.team_pace,
-            self.trend_5g,
-            self.home_avg,
-            self.away_avg,
-            # V20.3 NEW: TS% features
-            self.feat_ts_pct,
-            self.feat_ts_pct_delta,
-            # V20.3 NEW: 4 absence-aware features
-            self.team_out_ppg,
-            float(self.team_out_count),
-            self.opp_out_ppg,
-            float(self.opp_out_count),
-            # Market identity (4)
-            float(self.market_scoring),
-            float(self.market_counting),
-            float(self.market_combo),
-            float(self.market_rare),
-            # V20.3 NEW: Behavior & Risk features (added to end of feature vector)
-            float(self.feat_min_volatility),
-            float(self.feat_foul_rate),
-            float(self.feat_cv),
-            float(self.feat_usage_rate),
-            float(self.feat_h2h_avg),
+        from dataclasses import fields
+        identifiers = {'player_id', 'player_name', 'opponent_abbrev', 'market', 'data_quality'}
+
+        # Canonical legacy observable order to preserve historical column layout
+        legacy = [
+            'avg_minutes', 'ema', 'std', 'opponent_drtg_season', 'line', 'spread',
+            'game_total', 'days_rest', 'is_home', 'is_b2b', 'games_played',
+            'opponent_pace', 'team_pace', 'trend_5g', 'home_avg', 'away_avg'
         ]
-        return np.array(numeric_features)
+
+        # All dataclass field names in declaration order (excluding identifiers)
+        all_attrs = [f.name for f in fields(cls) if f.name not in identifiers]
+
+        ordered: List[str] = []
+        for name in legacy:
+            if name in all_attrs and name not in ordered:
+                ordered.append(name)
+
+        # Append remaining attributes preserving declaration order
+        for name in all_attrs:
+            if name not in ordered:
+                ordered.append(name)
+
+        # Map to canonical 'feat_' column names (leave existing 'feat_' names intact)
+        feat_columns: List[str] = []
+        for name in ordered:
+            feat_columns.append(name if name.startswith('feat_') else f'feat_{name}')
+
+        return feat_columns
+
+    @property
+    def feat_fields(self) -> List[str]:
+        """Instance-level canonical ML column names (with 'feat_' prefix)."""
+        return self.__class__.get_feature_names()
+
+    def to_ml_array(self) -> np.ndarray:
+        """Convert feature values to a numeric numpy array using canonical feature list.
+
+        Ordering is exactly `get_feature_names()` to guarantee alignment with CSV/training.
+        """
+        feature_names = self.__class__.get_feature_names()
+        arr: List[float] = []
+
+        for col in feature_names:
+            # Derive attribute name (strip 'feat_' prefix for legacy mapped fields)
+            attr = col[len('feat_'):]
+            raw = getattr(self, attr, None) if hasattr(self, attr) else getattr(self, col, None)
+
+            # Determine sentinel
+            if col.endswith('_count'):
+                sentinel = -1
+            elif col in ('feat_is_home', 'feat_is_b2b'):
+                sentinel = 0
+            else:
+                sentinel = -1.0
+
+            if raw is None:
+                arr.append(float(sentinel))
+                continue
+
+            try:
+                if isinstance(raw, bool):
+                    arr.append(1.0 if raw else 0.0)
+                else:
+                    arr.append(float(raw))
+            except Exception:
+                arr.append(float(sentinel))
+
+        return np.array(arr)
 
 
 @dataclass
@@ -685,8 +773,8 @@ def safe_clean_for_arrow(df: pd.DataFrame) -> pd.DataFrame:
 
     # 2. Fix Integer Columns (handles 1.0 -> 1, "5" -> 5)
     int_targets = [
-        'market_scoring', 'market_counting', 'market_combo', 'market_rare',
-        'feat_market_scoring', 'feat_market_counting', 'feat_market_combo', 'feat_market_rare',
+        'market_scoring', 'market_counting', 'market_combo',
+        'feat_market_scoring', 'feat_market_counting', 'feat_market_combo',
         'feat_team_out_count', 'feat_opp_out_count', 'feat_games_played'
     ]
     for col in int_targets:
@@ -1685,13 +1773,36 @@ class FeatureEngineer:
             h2h_avg = stats['ema']
 
         # === BUILD FEATURE VECTOR ===
+        # Compute efficiency per minute (avoid divide-by-zero; require meaningful minutes)
+        try:
+            avg_minutes_local = float(stats.get('avg_minutes', 0.0) or 0.0)
+            ema_local = float(stats.get('ema', 0.0) or 0.0)
+            eff_per_min = ema_local / avg_minutes_local if avg_minutes_local > 5.0 else 0.0
+        except Exception:
+            eff_per_min = 0.0
+
+        # Derived features (new formulas per spec)
+        try:
+            # Fatigue load: smoother inverse of rest days
+            fatigue_load = avg_minutes_local / (actual_days_rest + 0.5)
+        except Exception:
+            fatigue_load = 0.0
+
+        try:
+            season_avg = float(stats.get('season_avg', 0.0) or 0.0)
+            l10_avg = float(stats.get('l10_avg', 0.0) or 0.0)
+            # Form gap: relative gap normalized by season average (avoid division by zero)
+            form_gap = (l10_avg - season_avg) / max(1.0, season_avg) if season_avg is not None else 0.0
+        except Exception:
+            form_gap = 0.0
+
         return FeatureVector(
             # Identifiers
             player_id=player_id,
             player_name=player_name,
             opponent_abbrev=opponent_abbrev,
             market=market,
-            
+
             # Raw observables
             line=line,
             avg_minutes=stats['avg_minutes'],
@@ -1704,14 +1815,14 @@ class FeatureEngineer:
             is_home=is_home,
             is_b2b=is_b2b or actual_days_rest == 0,
             games_played=stats['games_played'],
-            
+
             # Context
             opponent_pace=opponent_pace,
             team_pace=team_pace,
             trend_5g=stats['trend_5g'],
             home_avg=stats['home_avg'],
             away_avg=stats['away_avg'],
-            
+
             # New Features
             feat_ts_pct=feat_ts_pct,
             feat_ts_pct_delta=feat_ts_pct_delta,
@@ -1722,22 +1833,26 @@ class FeatureEngineer:
             feat_min_volatility=stats.get('min_volatility', 0.0),
             feat_foul_rate=stats.get('foul_rate', 0.0),
             feat_cv=stats.get('cv', 0.0),
-            
+
             # Market Identity
             market_scoring=1 if market == 'PTS' else 0,
             market_counting=1 if market in ['REB', 'AST'] else 0,
             market_combo=1 if market in ['PRA', 'PR', 'PA', 'RA'] else 0,
-            market_rare=1 if market in ['3PM', 'STL', 'BLK'] else 0,
-            
+
             data_quality=data_quality,
-            
+
             # V20.4 NEW FEATURES
             feat_usage_rate=stats.get('usage_rate', 0.0),
             feat_h2h_avg=h2h_avg,
-            
+
             # 🚀 ADDED NEW FEATURES HERE 🚀
-            feat_season_avg=stats.get('season_avg', 0.0),
-            feat_l10_avg=stats.get('l10_avg', 0.0)
+            feat_season_avg=season_avg,
+            feat_l10_avg=l10_avg,
+            feat_fatigue_load=fatigue_load,
+            feat_form_gap=form_gap,
+
+            # 🚀 NEW: Efficiency per minute
+            feat_eff_per_min=eff_per_min
         )
 
 @dataclass
@@ -1954,7 +2069,6 @@ class ModelEngine:
             'feat_market_scoring': float(features.market_scoring),
             'feat_market_counting': float(features.market_counting),
             'feat_market_combo': float(features.market_combo),
-            'feat_market_rare': float(features.market_rare),
             # V20.3 NEW: Behavior & Risk features
             'feat_min_volatility': float(features.feat_min_volatility),
             'feat_foul_rate': float(features.feat_foul_rate),
@@ -1965,6 +2079,11 @@ class ModelEngine:
             'feat_h2h_avg': float(features.feat_h2h_avg),
             'feat_season_avg': float(features.feat_season_avg),
             'feat_l10_avg': float(features.feat_l10_avg),
+            # Backcompat/missing feature fallbacks (silence older model warnings)
+            'feat_eff_per_min': float(getattr(features, 'feat_eff_per_min', 0.0)),
+            'feat_fatigue_load': float(getattr(features, 'feat_fatigue_load', 0.0)),
+            'feat_form_gap': float(getattr(features, 'feat_form_gap', 0.0)),
+            'feat_market_rare': float(getattr(features, 'market_rare', 0.0)),
         }
         
         # Extract values in the exact order expected by the model
@@ -2555,54 +2674,58 @@ class Backtester:
     ) -> Dict[str, Any]:
         """
         Create a frozen snapshot of features at prediction time.
+
+        The snapshot includes both legacy non-prefixed attribute names (for backward
+        compatibility) and canonical `feat_`-prefixed names used for ML training.
         """
-        return {
+        snap: Dict[str, Any] = {
             'snapshot_date': prediction_date.strftime('%Y-%m-%d'),
             'snapshot_season': self._get_season_for_date(prediction_date),
-            # Core features
-            'avg_minutes': features.avg_minutes,
-            'ema': features.ema,
-            'std': features.std,
-            'opponent_drtg_season': features.opponent_drtg_season,
-            'line': features.line,
-            'spread': features.spread,
-            'game_total': features.game_total,
-            'days_rest': features.days_rest,
-            'is_home': int(features.is_home),
-            'is_b2b': int(features.is_b2b),
-            'games_played': features.games_played,
-            # V20.2 Features
-            'opponent_pace': features.opponent_pace,
-            'team_pace': features.team_pace,
-            'trend_5g': features.trend_5g,
-            'home_avg': features.home_avg,
-            'away_avg': features.away_avg,
-            # V20.3 Features
-            'feat_ts_pct': features.feat_ts_pct,
-            'feat_ts_pct_delta': features.feat_ts_pct_delta,
-            'feat_min_volatility': features.feat_min_volatility,
-            'feat_foul_rate': features.feat_foul_rate,
-            'feat_cv': features.feat_cv,
-            
-            # 🚀 V20.4 NEW: ADD THESE LINES (Currently missing in your file)
-            'feat_usage_rate': features.feat_usage_rate,
-            'feat_h2h_avg': features.feat_h2h_avg,
-            'feat_season_avg': features.feat_season_avg,
-            'feat_l10_avg': features.feat_l10_avg,
-            
-            # Absence features
-            'team_out_ppg': features.team_out_ppg,
-            'team_out_count': features.team_out_count,
-            'opp_out_ppg': features.opp_out_ppg,
-            'opp_out_count': features.opp_out_count,
-            # Market identity
-            'market_scoring': features.market_scoring,
-            'market_counting': features.market_counting,
-            'market_combo': features.market_combo,
-            'market_rare': features.market_rare,
-            # Audit
-            'had_warnings': len(features.data_quality.warnings) > 0 if features.data_quality else False
         }
+
+        # Populate canonical ML features dynamically
+        for col in TRAINING_FEATURE_COLUMNS:
+            # derive attribute candidate names
+            attr = col[len('feat_'):]
+            candidates = [attr, col]
+            raw_val = None
+            for cand in candidates:
+                if hasattr(features, cand):
+                    raw_val = getattr(features, cand)
+                    break
+
+            # Coerce with sensible sentinels
+            if raw_val is None:
+                if col.endswith('_count'):
+                    val = -1
+                elif col in ('feat_is_home', 'feat_is_b2b'):
+                    val = 0
+                else:
+                    val = -1.0
+            else:
+                try:
+                    if col.endswith('_count'):
+                        val = int(raw_val)
+                    elif col in ('feat_is_home', 'feat_is_b2b'):
+                        val = 1 if bool(raw_val) else 0
+                    else:
+                        val = float(raw_val)
+                except Exception:
+                    if col.endswith('_count'):
+                        val = -1
+                    elif col in ('feat_is_home', 'feat_is_b2b'):
+                        val = 0
+                    else:
+                        val = -1.0
+                    logger.debug(f"Failed to coerce feature '{col}' in snapshot; using sentinel {val}")
+
+            # Store both canonical (feat_) and legacy (attr) names for backward compatibility
+            snap[col] = val
+            snap[attr] = val
+
+        # Audit field
+        snap['had_warnings'] = len(features.data_quality.warnings) > 0 if features.data_quality else False
+        return snap
     
     def _generate_synthetic_clv(self, ev: float, prob: float, line: float, hit: bool) -> float:
         """
@@ -3001,53 +3124,12 @@ class Backtester:
                 # NOT the potentially-mutated features object
                 # V20: Raw observables only (no usage_mult, rest_factor)
                 # =========================================================
-                feature_dict = {
-                    'avg_minutes': frozen_snapshot['avg_minutes'],
-                    'opponent_drtg_season': frozen_snapshot['opponent_drtg_season'],
-                    'line': frozen_snapshot['line'],
-                    'ema': frozen_snapshot['ema'],
-                    'std': frozen_snapshot['std'],
-                    'is_home': frozen_snapshot['is_home'],
-                    'spread': frozen_snapshot['spread'],
-                    'game_total': frozen_snapshot['game_total'],
-                    'games_played': frozen_snapshot['games_played'],
-                    'days_rest': frozen_snapshot['days_rest'],
-                    'is_b2b': frozen_snapshot['is_b2b'],
-                    # V20.2: Pace context
-                    'opponent_pace': frozen_snapshot['opponent_pace'],
-                    'team_pace': frozen_snapshot['team_pace'],
-                    # V20.2: Momentum & splits
-                    'trend_5g': frozen_snapshot['trend_5g'],
-                    'home_avg': frozen_snapshot['home_avg'],
-                    'away_avg': frozen_snapshot['away_avg'],
-                    # V20.3 NEW: True-Shooting features
-                    'feat_ts_pct': frozen_snapshot.get('feat_ts_pct', -1.0),
-                    'feat_ts_pct_delta': frozen_snapshot.get('feat_ts_pct_delta', -1.0),
-                    # V20.3 NEW: Behavior & Risk features
-                    'feat_min_volatility': frozen_snapshot.get('feat_min_volatility', -1.0),
-                    'feat_foul_rate': frozen_snapshot.get('feat_foul_rate', -1.0),
-                    'feat_cv': frozen_snapshot.get('feat_cv', -1.0),
-                    # V20.3 NEW: Absence-aware features
-                    'team_out_ppg': frozen_snapshot['team_out_ppg'],
-                    'team_out_count': frozen_snapshot['team_out_count'],
-                    'opp_out_ppg': frozen_snapshot['opp_out_ppg'],
-                    'opp_out_count': frozen_snapshot['opp_out_count'],
-                    # 🚀 V20.4 NEW: Ensure ALL these are present
-                    'feat_usage_rate': frozen_snapshot.get('feat_usage_rate', -1.0),
-                    'feat_h2h_avg': frozen_snapshot.get('feat_h2h_avg', -1.0),
-                    'feat_season_avg': frozen_snapshot.get('feat_season_avg', 0.0),
-                    'feat_l10_avg': frozen_snapshot.get('feat_l10_avg', 0.0),
-                    # Market identity (one-hot encoded)
-                    'market_scoring': frozen_snapshot['market_scoring'],
-                    'market_counting': frozen_snapshot['market_counting'],
-                    'market_combo': frozen_snapshot['market_combo'],
-                    'market_rare': frozen_snapshot['market_rare'],
-                    # Temporal audit trail
-                    '_snapshot_date': frozen_snapshot['snapshot_date'],
-                    '_snapshot_season': frozen_snapshot['snapshot_season'],
-                    # V20.3: Data quality flag for filtering
-                    '_had_warnings': frozen_snapshot['had_warnings'],
-                }
+                feature_dict = frozen_snapshot.copy()
+                
+                # Ensure internal audit keys match expected schema (prefixed with _)
+                feature_dict['_snapshot_date'] = frozen_snapshot.get('snapshot_date')
+                feature_dict['_snapshot_season'] = frozen_snapshot.get('snapshot_season')
+                feature_dict['_had_warnings'] = frozen_snapshot.get('had_warnings', False)
                 
                 results.append(BacktestResult(
                     date=target_game['GAME_DATE'].strftime('%Y-%m-%d'),
@@ -3249,59 +3331,13 @@ MARKET_GROUPS = {
     'scoring': ['PTS'],           # High volume, high variance
     'counting': ['REB', 'AST'],   # Medium volume counting stats
     'combo': ['PRA', 'PR', 'PA', 'RA'],  # Combined markets
-    'rare': ['3PM', 'STL', 'BLK'] # Low count, Poisson-like
 }
 
 # Canonical feature list used for model training (exact order - canonical numeric features)
 # V20.3: Base V20 features plus absence-awareness and TS%
-TRAINING_FEATURE_COLUMNS = [
-    # V20.3 EMPIRICAL: Pure raw observables only.
-    # Order MUST match FeatureVector.to_ml_array() exactly.
-    # Statistical baseline (3)
-    'feat_avg_minutes',
-    'feat_ema',
-    'feat_std',
-    # Opponent context (1)
-    'feat_opponent_drtg_season',
-    # Line and game context (3)
-    'feat_line',
-    'feat_spread',
-    'feat_game_total',
-    # Rest observables (3) - raw values, not multipliers
-    'feat_days_rest',
-    'feat_is_home',
-    'feat_is_b2b',
-    # Sample size (1)
-    'feat_games_played',
-    # V20.2: Pace context (2)
-    'feat_opponent_pace',
-    'feat_team_pace',
-    # V20.2: Momentum & splits (3)
-    'feat_trend_5g',
-    'feat_home_avg',
-    'feat_away_avg',
-    # V20.3 NEW: True Shooting (2)
-    'feat_ts_pct',
-    'feat_ts_pct_delta',
-    # V20.3 NEW: Absence-aware (4)
-    'feat_team_out_ppg',
-    'feat_team_out_count',
-    'feat_opp_out_ppg',
-    'feat_opp_out_count',
-    # Market identity (4)
-    'feat_market_scoring',
-    'feat_market_counting',
-    'feat_market_combo',
-    'feat_market_rare',
-    # V20.3 NEW: Behavior & Risk features
-    'feat_min_volatility',
-    'feat_foul_rate',
-    'feat_cv',
-    'feat_usage_rate',
-    'feat_h2h_avg',
-    'feat_season_avg',
-    'feat_l10_avg'
-]
+# NOTE: Generated dynamically from the FeatureVector dataclass to keep a single
+# source of truth for feature additions/removals.
+TRAINING_FEATURE_COLUMNS = FeatureVector.get_feature_names()
 
 # Canonical export schema used for writing ML training CSVs (single source of truth)
 ML_EXPORT_METADATA = [
@@ -3322,8 +3358,7 @@ def get_market_group_features(market: str) -> Dict[str, int]:
     features = {
         'feat_market_scoring': 0,
         'feat_market_counting': 0,
-        'feat_market_combo': 0,
-        'feat_market_rare': 0
+        'feat_market_combo': 0
     }
     for group_name, markets in MARKET_GROUPS.items():
         if market in markets:
@@ -4245,7 +4280,7 @@ def generate_ml_data_streamlit():
                         if col in df.columns:
                             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(bool)
 
-                    int_cols = ['market_scoring', 'market_counting', 'market_combo', 'market_rare', 'hit']
+                    int_cols = ['market_scoring', 'market_counting', 'market_combo', 'hit']
                     for col in int_cols:
                         if col in df.columns:
                             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
@@ -4560,6 +4595,15 @@ class Tracker:
         """
         # V20: Simple EV classification for legacy compatibility
         return 'EV+' if ev > 0 else 'EV-'
+
+    def _ml_column_sentinel(self, col: str):
+        """Return a sensible sentinel value for a given ML column name."""
+        if col.endswith('_count'):
+            return -1
+        if col in ('feat_is_home', 'feat_is_b2b'):
+            return 0
+        # Default sentinel for floats
+        return -1.0
 
     def log_bet(self, bet_data: Dict):
         """Alias for save_bet to prevent 'AttributeError'."""
@@ -5023,7 +5067,7 @@ class Tracker:
         result = bet.get('result', '')
         hit_flag = 1 if result == 'Win' else 0
 
-        # Build the canonical row
+        # Build the canonical row (Base Metadata)
         row: Dict[str, Any] = {
             'date': date_iso,
             'player': bet.get('player', ''),
@@ -5043,80 +5087,88 @@ class Tracker:
             'result_quality': bet.get('result_quality', 'legacy'),
             'tag': bet.get('tag', 'legacy'),
             'grade': self._calculate_grade(bet.get('ev', bet.get('predicted_ev', 0)), bet.get('win_prob', bet.get('predicted_prob', 0.5))),
-
-            # V20.3 Required Features (canonical names)
-            'feat_avg_minutes': float(bet.get('feat_avg_minutes', bet.get('avg_minutes', 0) or 0)),
-            'feat_ema': float(bet.get('feat_ema', 0) or 0),
-            'feat_std': float(bet.get('feat_std', 0) or 0),
-            'feat_opponent_drtg_season': float(bet.get('feat_opponent_drtg_season', bet.get('feat_opp_drtg_season', 0) or 0)),
-            'feat_line': float(bet.get('line', 0) or 0),
-            'feat_spread': float(bet.get('feat_spread', 0) or 0),
-            'feat_game_total': float(bet.get('feat_game_total', 0) or 0),
-            'feat_days_rest': int(bet.get('feat_days_rest', 0) or 0),
-            'feat_is_home': 1 if bet.get('feat_is_home', False) else 0,
-            'feat_is_b2b': 1 if bet.get('feat_is_b2b', False) else 0,
-            'feat_games_played': int(bet.get('feat_games_played', 0) or 0),
-
-            # V20.2: Pace and trend features
-            'feat_opponent_pace': float(bet.get('feat_opponent_pace')),
-            'feat_team_pace': float(bet.get('feat_team_pace')),
-            'feat_trend_5g': float(bet.get('feat_trend_5g')),
-            'feat_home_avg': float(bet.get('feat_home_avg')),
-            'feat_away_avg': float(bet.get('feat_away_avg')),
-
-            # V20.3: True-Shooting features
-            'feat_ts_pct': float(bet.get('feat_ts_pct', -1.0)),
-            'feat_ts_pct_delta': float(bet.get('feat_ts_pct_delta', -1.0)),
-
-            # V20.3 NEW: Absence-aware features
-            'feat_team_out_ppg': float(bet.get('feat_team_out_ppg', -1.0)),
-            'feat_team_out_count': int(bet.get('feat_team_out_count', -1) or -1),
-            'feat_opp_out_ppg': float(bet.get('feat_opp_out_ppg', -1.0)),
-            'feat_opp_out_count': int(bet.get('feat_opp_out_count', -1) or -1),
-
-            'feat_min_volatility': float(bet.get('feat_min_volatility', -1.0)),
-            'feat_foul_rate': float(bet.get('feat_foul_rate', -1.0)),
-            'feat_cv': float(bet.get('feat_cv', -1.0)),
-            
-            # 🚀 V20.4 NEW: ADD THESE LINES
-            'feat_usage_rate': float(bet.get('feat_usage_rate', -1.0)),
-            'feat_h2h_avg': float(bet.get('feat_h2h_avg', -1.0)),
-            'feat_season_avg': float(bet.get('feat_season_avg', 0.0)),
-            'feat_l10_avg': float(bet.get('feat_l10_avg', 0.0)),
         }
 
-        # Market identity features
+        # Populate canonical ML features dynamically from TRAINING_FEATURE_COLUMNS
+        for col in TRAINING_FEATURE_COLUMNS:
+            # Prefer explicit 'feat_' keys in bet, but fall back to legacy attr name
+            attr = col[len('feat_'):]
+            raw = None
+            for key in (col, attr):
+                if key in bet:
+                    raw = bet.get(key)
+                    break
+
+            # 🚀 LAZY BACKFILL for feat_eff_per_min
+            # If the feature is missing or sentinel (-1.0), try to calculate it on-the-fly
+            if col == 'feat_eff_per_min' and (raw is None or raw == -1.0):
+                try:
+                    # Grab raw ingredients from the old record
+                    ema = float(bet.get('ema', bet.get('feat_ema', 0.0)) or 0.0)
+                    mins = float(bet.get('avg_minutes', bet.get('feat_avg_minutes', 0.0)) or 0.0)
+                    
+                    if mins > 5.0:
+                        raw = ema / mins  # Calculate Efficiency
+                    else:
+                        raw = 0.0
+                except Exception:
+                    raw = 0.0
+
+            # 🚀 LAZY BACKFILL for feat_fatigue_load
+            # Compute as avg_minutes / (days_rest + 0.5) when missing
+            if col == 'feat_fatigue_load' and (raw is None or raw == -1.0):
+                try:
+                    mins = float(bet.get('avg_minutes', bet.get('feat_avg_minutes', 0.0)) or 0.0)
+                    days = float(bet.get('days_rest', bet.get('feat_days_rest', 1)) or 1.0)
+                    raw = mins / (days + 0.5)
+                except Exception:
+                    raw = 0.0
+
+            # 🚀 LAZY BACKFILL for feat_form_gap
+            # Compute as (l10_avg - season_avg) / max(1.0, season_avg)
+            if col == 'feat_form_gap' and (raw is None or raw == -1.0):
+                try:
+                    l10 = bet.get('feat_l10_avg', bet.get('l10_avg', None))
+                    season = bet.get('feat_season_avg', bet.get('season_avg', None))
+                    if l10 is not None and season is not None:
+                        season_val = float(season) if season is not None else 0.0
+                        raw = (float(l10) - season_val) / max(1.0, season_val)
+                    else:
+                        # Fallback: use ema relative gap when l10 missing
+                        ema = bet.get('ema', bet.get('feat_ema', None))
+                        if ema is not None and season is not None:
+                            season_val = float(season) if season is not None else 0.0
+                            raw = (float(ema) - season_val) / max(1.0, season_val)
+                        else:
+                            raw = 0.0
+                except Exception:
+                    raw = 0.0
+
+            # If still missing, use sentinel
+            if raw is None:
+                row[col] = self._ml_column_sentinel(col)
+                continue
+
+            # Coerce types safely
+            try:
+                if col.endswith('_count'):
+                    val = int(raw or -1)
+                elif col in ('feat_is_home', 'feat_is_b2b'):
+                    val = 1 if bool(raw) else 0
+                elif col.startswith('feat_market_'):
+                    val = int(raw)
+                else:
+                    val = float(raw)
+            except Exception:
+                val = self._ml_column_sentinel(col)
+                # logger.debug(f"Failed to coerce feature '{col}' from bet; using sentinel {val}")
+
+            row[col] = val
+
+        # Market identity features (ensure canonical one-hot is consistent with declared market)
         row.update(get_market_group_features(bet.get('market', 'PTS')))
 
         return row
-
-    def _ml_column_sentinel(self, col: str):
-        """Return an appropriate sentinel for a given ML export column.
-        - Metadata strings -> ''
-        - Numeric metadata -> -1.0
-        - Integer counters -> -1
-        - Float features -> -1.0
-        - One-hot / boolean features -> 0
-        """
-        # Numeric metadata
-        numeric_meta = {'line', 'predicted_prob', 'predicted_ev', 'projected_value', 'actual_value', 'margin', 'margin_pct'}
-        if col in ML_EXPORT_METADATA:
-            if col in numeric_meta:
-                return -1.0
-            if col == 'hit':
-                return -1
-            return ''
-
-        # Feature columns
-        if col.startswith('feat_'):
-            if col.endswith('_count'):
-                return -1
-            if col in ('feat_is_home', 'feat_is_b2b', 'feat_market_scoring', 'feat_market_counting', 'feat_market_combo', 'feat_market_rare'):
-                return 0
-            return -1.0
-
-        # Fallback
-        return ''
 
     def _migrate_ml_csv_schema_if_needed(self, output_path: Path) -> None:
         """Migrate an existing ML CSV in-place to include any missing columns from
@@ -6538,7 +6590,7 @@ def validate_training_data(df: pd.DataFrame) -> Dict[str, Any]:
         'feat_market_scoring': (0, 1),          # Binary
         'feat_market_counting': (0, 1),         # Binary
         'feat_market_combo': (0, 1),            # Binary
-        'feat_market_rare': (0, 1),             # Binary
+
         # V20.2: Pace and trend features
         'feat_opponent_pace': (90, 115),        # Possessions per game
         'feat_team_pace': (90, 115),            # Possessions per game
@@ -6927,7 +6979,7 @@ def main():
         st.session_state.bankroll_enabled = bankroll_enabled
         
         if bankroll_enabled:
-            bankroll = st.number_input("💰 Bankroll (₱)", 100, 1000000, 600)
+            bankroll = st.number_input("💰 Bankroll (₱)", 100, 1000000, 500)
             
             # Unit Calculator (1 unit = 1%)
             unit_size = bankroll * 0.01
@@ -7120,81 +7172,190 @@ def main():
                     ask_ai = st.button("Consult groq", key="tab1_ask_ai", use_container_width="stretch")
 
                 if ask_ai:
-                    with st.spinner(f"Analyzing {result.player_name}'s history..."):
-                        team_str = "N/A"
-                        if result.game_logs is not None and not result.game_logs.empty:
+                        with st.spinner(f"Analyzing {result.player_name}..."):
+                            # 1. PREPARE CONTEXT
+                            team_str = "N/A"
+                            if result.game_logs is not None and not result.game_logs.empty:
+                                try:
+                                    team_str = result.game_logs.iloc[-1]['MATCHUP'].split()[0]
+                                except: pass
+
+                            feats = result.features
+                            is_home = feats.is_home
+                            loc_avg = feats.home_avg if is_home else feats.away_avg
+                            loc_type = "Home" if is_home else "Away"
+                            
+                            # ---------------------------------------------------------
+                            # 🚀 FIX: FORCE AI TO SEE THE "SMART" NUMBER (23.2)
+                            # ---------------------------------------------------------
+                            final_proj = None
+                            
+                            # 1. Check the PROJECTION Object (Correct Location)
+                            # This is where the card gets its "23.2"
+                            if hasattr(result, 'projection') and hasattr(result.projection, 'final_projection'):
+                                final_proj = result.projection.final_projection
+                            
+                            # 2. Check Decision/Result (Backups)
+                            if final_proj is None:
+                                if hasattr(result.decision, 'final_projection'):
+                                    final_proj = result.decision.final_projection
+                                elif hasattr(result, 'projected_value'):
+                                    final_proj = result.projected_value
+                                
+                            # 3. Fallback to EMA (Only if everything else fails)
+                            if final_proj is None:
+                                final_proj = feats.ema
+
+                            # Calculate the Gap (Cushion)
+                            gap = float(result.line) - float(final_proj)
+                            if result.decision.recommended_side == 'OVER':
+                                gap = -gap 
+
+                            # ---------------------------------------------------------
+                            # PAYLOAD WITH CORRECTED NUMBERS
+                            # ---------------------------------------------------------
+                            prop_payload = {
+                                "player": result.player_name,
+                                "team": team_str,
+                                "market": result.market,
+                                "line": result.line,
+                                "signal": result.decision.recommended_side,
+                                "ev": result.decision.expected_value,
+                                "prob": result.decision.probability,
+                                
+                                # ✅ NOW THIS WILL MATCH THE CARD (23.2)
+                                "projected": round(final_proj, 1), 
+                                "gap": round(gap, 1),
+                                
+                                "ema": round(feats.ema, 1),
+                                "opp_rank": round(feats.opponent_drtg_season, 1),
+                                "rest": feats.days_rest,
+                                "trend": "Heating Up" if feats.trend_5g > 0.5 else ("Cooling Down" if feats.trend_5g < -0.5 else "Flat"),
+                                "spread": feats.spread,
+                                "total": feats.game_total,
+                                "teammates_out_ppg": getattr(feats, 'team_out_ppg', 0),
+                                "loc_type": loc_type,
+                                "loc_avg": round(loc_avg, 1),
+                                "feat_usage_rate": getattr(feats, 'feat_usage_rate', 0.0),
+                                "feat_season_avg": getattr(feats, 'feat_season_avg', 0.0),
+                                "feat_l10_avg": getattr(feats, 'feat_l10_avg', 0.0),
+                                "feat_h2h_avg": getattr(feats, 'feat_h2h_avg', -1.0)
+                            }
+
+                            # 2. RUN LIVE BACKTEST (Robust Settings)
+                            status_text = st.empty()
+                            status_text.text("Running Simulation (Matching CSV + Buckets)...")
+                            
+                            history_context = None
+                            backtest_payload = {}
+                            
                             try:
-                                team_str = result.game_logs.iloc[-1]['MATCHUP'].split()[0]
-                            except: pass
-
-                        # EXTRACT ML FEATURES
-                        # This gives the AI the "Whole Picture" context
-                        feats = result.features
-                        
-                        prop_payload = {
-                            "player": result.player_name,
-                            "team": team_str,
-                            "market": result.market,
-                            "line": result.line,
-                            "signal": result.decision.recommended_side,
-                            "ev": result.decision.expected_value,
-                            "prob": result.decision.probability,
-                            
-                            # ✅ NEW: PASS THE EMA
-                            "ema": round(feats.ema, 1),
-                            "avg_min": round(feats.avg_minutes, 1),
-                            "opp_rank": round(feats.opponent_drtg_season, 1),
-                            "rest": feats.days_rest,
-                            "trend": "Heating Up" if feats.trend_5g > 0.5 else ("Cooling Down" if feats.trend_5g < -0.5 else "Flat"),
-                            "feat_usage_rate": getattr(feats, 'feat_usage_rate', 0.0),
-                            "feat_season_avg": getattr(feats, 'feat_season_avg', 0.0),
-                            "feat_l10_avg": getattr(feats, 'feat_l10_avg', 0.0),
-                            "feat_h2h_avg": getattr(feats, 'feat_h2h_avg', -1.0)
-                        }
-
-                        # 2. RUN THE MINI-BACKTEST (The "Reality")
-                        # We fetch logs on the fly using your existing data loader
-                        p_list = players.find_players_by_full_name(result.player_name)
-                        if p_list:
-                            p_id = p_list[0]['id']
-                            # Fetch logs (Cached!)
-                            df_logs = orchestrator.data_loader.fetch_game_logs(p_id)
-                            
-                            if not df_logs.empty and result.market in df_logs.columns:
-                                # PROCESS LAST 30 GAMES (Instead of 15)
-                                l30 = df_logs.head(30).copy()
+                                # Canonicalize Name
+                                p_list = players.find_players_by_full_name(result.player_name)
+                                canonical_name = p_list[0]['full_name'] if p_list else result.player_name
+                                p_id = p_list[0]['id'] if p_list else None
                                 
-                                # Calculate hit rate based on recommended side
-                                if result.decision.recommended_side == "OVER":
-                                    hits = (l30[result.market] > result.line).sum()
-                                else:
-                                    hits = (l30[result.market] < result.line).sum()
+                                # A. Scientific Backtest
+                                bt_summary = orchestrator.run_backtest(
+                                    player_name=canonical_name,
+                                    market=result.market,
+                                    lookback=25,    
+                                    test_days=45    
+                                )
+                                
+                                res_df = getattr(bt_summary, 'results', None) if bt_summary else None
+
+                                # B. Fallback
+                                if (res_df is None or res_df.empty) and p_id:
+                                    status_text.text("Scientific Backtest incomplete. Running Manual Fallback...")
+                                    raw_logs = orchestrator.data_loader.fetch_game_logs(p_id)
+                                    if not raw_logs.empty:
+                                        mkt = result.market
+                                        if mkt not in raw_logs.columns:
+                                            if mkt == 'PRA': raw_logs['PRA'] = raw_logs.get('PTS',0) + raw_logs.get('REB',0) + raw_logs.get('AST',0)
+                                            elif mkt == 'PA': raw_logs['PA'] = raw_logs.get('PTS',0) + raw_logs.get('AST',0)
+                                            elif mkt == 'PR': raw_logs['PR'] = raw_logs.get('PTS',0) + raw_logs.get('REB',0)
+                                            elif mkt == 'RA': raw_logs['RA'] = raw_logs.get('REB',0) + raw_logs.get('AST',0)
+                                        
+                                        if mkt in raw_logs.columns:
+                                            raw_logs = raw_logs.sort_values('GAME_DATE', ascending=False).head(30)
+                                            raw_logs['hit'] = raw_logs.apply(
+                                                lambda x: 1 if (result.decision.recommended_side == 'OVER' and x[mkt] > result.line) or 
+                                                             (result.decision.recommended_side == 'UNDER' and x[mkt] <= result.line) else 0, axis=1
+                                            )
+                                            raw_logs['margin'] = raw_logs[mkt] - result.line
+                                            if result.decision.recommended_side == 'UNDER': raw_logs['margin'] = -raw_logs['margin']
+                                            
+                                            res_df = pd.DataFrame({
+                                                'date': raw_logs['GAME_DATE'], 'market': mkt, 'line': result.line,
+                                                'pred': result.decision.recommended_side, 'actual': raw_logs[mkt],
+                                                'hit': raw_logs['hit'], 'margin': raw_logs['margin']
+                                            })
+
+                                # C. Calibration (Buckets)
+                                bucket_name = "N/A"
+                                bucket_wr = "N/A"
+                                bucket_count = 0
+                                if bt_summary and hasattr(bt_summary, 'calibration_by_bucket'):
+                                    prob_pct = result.decision.probability * 100
+                                    found_bucket = None
+                                    if 50 <= prob_pct < 55: found_bucket = "50-55%"
+                                    elif 55 <= prob_pct < 60: found_bucket = "55-60%"
+                                    elif 60 <= prob_pct < 65: found_bucket = "60-65%"
+                                    elif 65 <= prob_pct < 70: found_bucket = "65-70%"
+                                    elif 70 <= prob_pct < 75: found_bucket = "70-75%"
+                                    elif prob_pct >= 75: found_bucket = "75-100%"
                                     
-                                rate = (hits / len(l30)) * 100 if len(l30) > 0 else 0
-                                avg_diff = (l30[result.market] - result.line).mean()
-                                
-                                # Create CSV string (Use GAME_DATE to fix the KeyError)
-                                logs_csv = l30[['GAME_DATE', 'MATCHUP', 'MIN', result.market]].to_csv(index=False)
-                                
-                                # Pack the Backtest JSON with 30-game stats
-                                backtest_payload = {
-                                    "l30_rate": int(rate),
-                                    "avg_diff": avg_diff,
-                                    "l5_trend": l30[result.market].head(5).tolist(),
-                                    "logs_csv": logs_csv
-                                }
+                                    if found_bucket and found_bucket in bt_summary.calibration_by_bucket:
+                                        b_data = bt_summary.calibration_by_bucket[found_bucket]
+                                        bucket_name = found_bucket
+                                        try:
+                                            bucket_wr = round(b_data['actual'] * 100, 1)
+                                            bucket_count = b_data['count']
+                                        except: pass
 
-                                # 3. GET THE INSIGHT
-                                insight = get_ai_second_opinion(prop_payload, backtest_payload)
+                                # D. Format Output
+                                if res_df is not None and not res_df.empty:
+                                    res_df = res_df.sort_values('date', ascending=False)
+                                    wins = res_df[res_df['hit'] == 1].shape[0]
+                                    total = len(res_df)
+                                    win_rate = (wins / total) * 100
+                                    
+                                    last_5_str = []
+                                    for _, row in res_df.head(5).iterrows():
+                                        icon = "✅" if row['hit'] == 1 else "❌"
+                                        m_val = row.get('margin', 0)
+                                        last_5_str.append(f"{icon}({m_val:+.1f})")
+
+                                    history_context = {
+                                        'record': f"{wins}-{total-wins}",
+                                        'win_rate': round(win_rate, 1),
+                                        'count': total,
+                                        'last_5': ", ".join(last_5_str)
+                                    }
+                                    
+                                    csv_cols = [c for c in ['date', 'market', 'line', 'pred', 'actual', 'margin'] if c in res_df.columns]
+                                    logs_csv = res_df[csv_cols].head(10).to_csv(index=False)
+                                    
+                                    backtest_payload = {
+                                        "l30_rate": int(win_rate),
+                                        "avg_diff": res_df['margin'].mean(),
+                                        "logs_csv": logs_csv,
+                                        "bucket_name": bucket_name,
+                                        "bucket_wr": bucket_wr,
+                                        "bucket_count": bucket_count
+                                    }
+                                    status_text.empty()
+                                else:
+                                    status_text.warning(f"No game data found for {result.player_name}")
+
+                            except Exception as e:
+                                st.error(f"Analysis Error: {e}")
                                 
-                                # 4. DISPLAY
-                                st.markdown("### groqs's Verdict")
-                                st.markdown(insight)
-                                
-                            else:
-                                st.error("No recent game data found for this player.")
-                        else:
-                            st.error("Player ID not found.")
+                            # 3. GET OPINION
+                            insight = get_ai_second_opinion(prop_payload, backtest_payload, history_context=history_context)
+                            st.markdown("### 🤖 groq's Verdict")
+                            st.markdown(insight)
             
             col_track, col_parlay = st.columns(2)
             # Tag selection
