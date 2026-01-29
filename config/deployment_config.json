@@ -1,0 +1,32 @@
+{
+  "model_version": "v2.1.0_context_aware_candidate1_local",
+  "last_updated": "2026-01-30",
+  "variance_model": {
+    "type": "xgboost",
+    "artifact_path": "data/variance_sweep_models/variance_model_feat_std_feat_min_volatility_feat_cv_feat_usage_rate_feat_days_rest_feat_spread_feat_game_total.pkl",
+    "features": [
+      "feat_std",
+      "feat_min_volatility",
+      "feat_cv",
+      "feat_usage_rate",
+      "feat_days_rest",
+      "feat_spread",
+      "feat_game_total"
+    ],
+    "hyperparameters": {
+      "n_estimators": 200,
+      "max_depth": 3,
+      "learning_rate": 0.1,
+      "reg_lambda": 5.0
+    }
+  },
+  "risk_engine": {
+    "sigma_multiplier": 1.2,
+    "kelly_fraction": 0.10,
+    "max_portfolio_exposure": 0.20
+  },
+  "filters": {
+    "min_confidence": 0.60,
+    "min_roi": 0.02
+  }
+}
