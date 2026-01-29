@@ -104,6 +104,9 @@ def test_efficiency_per_min_calculation():
 def test_new_derived_features_present():
     assert 'feat_fatigue_load' in TRAINING_FEATURE_COLUMNS
     assert 'feat_form_gap' in TRAINING_FEATURE_COLUMNS
+    assert 'feat_hit_rate_l10' in TRAINING_FEATURE_COLUMNS
+    assert 'feat_hit_rate_l20' in TRAINING_FEATURE_COLUMNS
+    assert 'feat_opp_rank_vs_pos' in TRAINING_FEATURE_COLUMNS
 
 
 def test_build_feature_vector_computes_derived_features():
