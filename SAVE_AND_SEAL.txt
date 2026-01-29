@@ -1,0 +1,18 @@
+Save & Seal checkpoint
+
+date: 2026-01-30
+branch: promote/candidate1-local
+model_artifact_path: models/variance/candidate1_context_aware.pkl
+model_sha256: 936AD14ED9B1562A013DA23549DC038DE8D3105E5CB773D975856B0F4B8D928E
+config: config/deployment_config.json (sigma_multiplier=1.2)
+regression_test: tests/test_backtest_population.py
+promoted_copy (sweep): data/variance_sweep_models/variance_model_feat_std_feat_min_volatility_feat_cv_feat_usage_rate_feat_days_rest_feat_spread_feat_game_total.pkl
+
+Local rollback (one-liners):
+- Restore model copy: Copy-Item data\variance_sweep_models\<orig> models\variance\candidate1_context_aware.pkl -Force
+- Revert branch to main: git checkout main; git reset --hard origin/main
+- Remove checkpoint branch: git branch -D promote/candidate1-local
+
+To push this checkpoint to remote (optional):
+- git push origin promote/candidate1-local
+- git push origin v20260130-candidate1-local
