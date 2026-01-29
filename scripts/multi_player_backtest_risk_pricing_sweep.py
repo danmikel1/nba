@@ -156,7 +156,7 @@ def run(top_n: int = 25, test_days: int = 30):
                     ev_threshold=params['ev_threshold'],
                     fractional_kelly=params['fractional_kelly'],
                     default_sigma=params['default_sigma'],
-                    sigma_multiplier=params.get('sigma_multiplier', 1.0),
+                    sigma_multiplier=params.get('sigma_multiplier', 1.6),
                     z_score_threshold=params['z_score_threshold'],
                     require_abs_z=params['require_abs_z']
                 )
