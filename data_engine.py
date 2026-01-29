@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from nba_api.stats.endpoints import leaguegamelog
+from nba_api.stats.endpoints import leaguegamelog, commonplayerinfo, leaguedashteamstats
 import os
 import time
 import logging
@@ -34,6 +34,103 @@ class DataEngine:
             'PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV',
             'FGA', 'FG3M', 'FTA', 'PF', 'MIN_FLOAT'
         ]
+
+        # Cache league defense stats for DvP calculations
+        self.league_defense_df = self._fetch_league_defense_stats()
+
+    def _fetch_league_defense_stats(self) -> pd.DataFrame:
+        """
+        Fetch and cache league defense stats for DvP calculations.
+        
+        Returns:
+            pd.DataFrame: League defense stats with rankings.
+        """
+        try:
+            # Fetch league defense stats
+            team_stats = leaguedashteamstats.LeagueDashTeamStats(
+                season=self.season,
+                per_mode_detailed='PerGame',
+                measure_type_detailed_defense='Opponent'
+            )
+            df = team_stats.get_data_frames()[0]
+            
+            if df.empty:
+                logger.warning(f"No league defense stats found for season {self.season}")
+                return pd.DataFrame()
+            
+            logger.info(f"Cached league defense stats for {len(df)} teams with {len(df.columns)} columns")
+            return df
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch league defense stats: {e}")
+            return pd.DataFrame()
+
+    def _get_real_position(self, player_id: int) -> str:
+        """
+        Get the real position for a player using commonplayerinfo endpoint.
+        
+        Returns normalized position code: PG, SG, SF, PF, or C.
+        """
+        try:
+            # Fetch player info
+            player_info = commonplayerinfo.CommonPlayerInfo(player_id=player_id)
+            df = player_info.get_data_frames()[0]
+            
+            if df.empty:
+                logger.warning(f"No player info found for ID {player_id}")
+                return 'SF'  # Fallback
+            
+            position_str = df.iloc[0].get('POSITION', '')
+            
+            # Normalize using the mapping
+            mapping = {
+                'Guard': 'PG', 
+                'Guard-Forward': 'SG', 
+                'Forward-Guard': 'SF',
+                'Forward': 'PF', 
+                'Forward-Center': 'PF', 
+                'Center-Forward': 'C',
+                'Center': 'C'
+            }
+            
+            normalized = mapping.get(position_str, 'SF')  # Default to SF if not found
+            logger.debug(f"Player {player_id} position: {position_str} -> {normalized}")
+            return normalized
+            
+        except Exception as e:
+            logger.warning(f"Failed to get position for player {player_id}: {e}")
+            return 'SF'  # Fallback
+
+    def _get_dvp_rank(self, opponent_id: int, position_code: str) -> int:
+        """
+        Get Defense vs. Position rank for an opponent team using cached league stats.
+        
+        Returns feat_opp_rank_vs_pos (1=Best Defense, 30=Worst Defense).
+        """
+        if self.league_defense_df.empty:
+            logger.warning("League defense stats not available")
+            return 15  # Neutral rank
+        
+        # Find the opponent team
+        opp_row = self.league_defense_df[self.league_defense_df['TEAM_ID'] == opponent_id]
+        if opp_row.empty:
+            logger.warning(f"Opponent team {opponent_id} not found in league defense stats")
+            return 15
+        
+        # Get rank based on position
+        if position_code in ['PG', 'SG']:
+            rank_col = 'OPP_AST_RANK'
+        elif position_code in ['C', 'PF']:
+            rank_col = 'OPP_REB_RANK'
+        else:  # SF
+            rank_col = 'OPP_PTS_RANK'
+        
+        if rank_col in opp_row.columns:
+            rank = opp_row[rank_col].iloc[0]
+            return int(rank)
+        else:
+            logger.warning(f"Rank column {rank_col} not found in league defense stats")
+            return 15
 
     def _get_cache_path(self, season: str) -> Path:
         """Get the path for the season's parquet cache file."""
@@ -182,6 +279,37 @@ class DataEngine:
             filtered_df = filtered_df.sort_values('GAME_DATE')
 
         return filtered_df.reset_index(drop=True)
+
+    def fetch_player_data(self, player_id: int, opponent_id: int, market: str, line: float, season: str = None, player_position: str = None) -> dict:
+        """
+        Fetch player data and calculate position and DvP features.
+        
+        Args:
+            player_id: NBA player ID
+            opponent_id: Opponent team ID
+            market: Stat market (PTS, REB, AST, PRA, etc.)
+            line: The betting line
+            season: Target season
+            player_position: Optional pre-fetched/overridden position code (PG/SG/SF/PF/C)
+            
+        Returns:
+            dict: Features dictionary with position and DvP
+        """
+        target_season = season if season else self.season
+        
+        # Use provided position if available to avoid extra API calls
+        if player_position is None:
+            player_position = self._get_real_position(player_id)
+        else:
+            logger.debug(f"Using preloaded position for player {player_id}: {player_position}")
+        
+        # Get DvP rank
+        dvp_rank = self._get_dvp_rank(opponent_id, player_position)
+        
+        return {
+            'player_position': player_position,
+            'feat_opp_rank_vs_pos': dvp_rank
+        }
 
     def force_refresh(self, season: str = None):
         """Manually trigger an API update for a season."""

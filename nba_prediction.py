@@ -23,6 +23,7 @@ from scipy import stats  # V19: For CDF-based probability calculation
 import requests
 from bs4 import BeautifulSoup
 from data_engine import DataEngine
+from trading_engine import TradingEngine
 warnings.filterwarnings('ignore')
 
 # =============================================================================
@@ -197,7 +198,7 @@ def get_ai_second_opinion(prop_analysis, backtest_json, history_context=None):
     """
     client = get_groq_client()
     if not client: 
-        return "⚠️ Missing GROQ_API_KEY in secrets."
+        return " Missing GROQ_API_KEY in secrets."
 
     # --- 1. SAFE DATA PREP (Prevent NoneType Crashes) ---
     
@@ -227,7 +228,7 @@ def get_ai_second_opinion(prop_analysis, backtest_json, history_context=None):
     ev_str = f"{ev_val:.1%}" if ev_val is not None else "N/A"
     prob_str = f"{prob_val:.1%}" if prob_val is not None else "N/A"
 
-    # 🚀 NEW: INTUITIVE EDGE CALCULATION
+    #  NEW: INTUITIVE EDGE CALCULATION
     # Positive Edge always means "Good/Safe". Negative means "Bad/Tight".
     try:
         proj = float(prop_analysis.get('projected', 0))
@@ -244,17 +245,17 @@ def get_ai_second_opinion(prop_analysis, backtest_json, history_context=None):
         edge_str = "N/A"
 
     # --- 2. CONSTRUCT HISTORY SECTION ---
-    history_section = "**🤖 MODEL TRACK RECORD: No Data**"
+    history_section = "** MODEL TRACK RECORD: No Data**"
     if history_context:
         history_section = f"""
-    **🤖 MODEL TRACK RECORD (Specific to {prop_analysis.get('player')} {prop_analysis.get('market')})**
+    ** MODEL TRACK RECORD (Specific to {prop_analysis.get('player')} {prop_analysis.get('market')})**
     * **Record:** {history_context.get('record', 'N/A')} ({history_context.get('win_rate', 'N/A')}%)
     * **Sample Size:** {history_context.get('count', 0)} tracked bets
     * **Recent Form:** {history_context.get('last_5', 'N/A')}
     * **Reality Check:** This is how the model *actually* performs on this specific player.
     """
 
-    # 🆕 EXTRACT BUCKET DATA
+    #  EXTRACT BUCKET DATA
     bucket_name = backtest_json.get('bucket_name', 'N/A')
     bucket_wr = backtest_json.get('bucket_wr', 'N/A')
     bucket_count = backtest_json.get('bucket_count', 0)
@@ -262,7 +263,7 @@ def get_ai_second_opinion(prop_analysis, backtest_json, history_context=None):
     bucket_section = ""
     if bucket_name != "N/A":
         bucket_section = f"""
-    **🎯 CALIBRATION CHECK (The "Trust" Factor)**
+    ** CALIBRATION CHECK (The "Trust" Factor)**
     * **Current Confidence:** {prop_analysis.get('prob'):.1%}
     * **Historical Accuracy:** When the model is in the **{bucket_name}** range, it wins **{bucket_wr}%** of the time ({bucket_count} bets).
     * **Implication:** Does the model's confidence match its actual performance?
@@ -272,7 +273,7 @@ def get_ai_second_opinion(prop_analysis, backtest_json, history_context=None):
     prompt = f"""
     Act as a sharp NBA capper. Analyze this prop bet.
 
-    **🏀 THE BET**
+    ** THE BET**
     * **Player:** {prop_analysis.get('player')} ({prop_analysis.get('team')})
     * **Market:** {prop_analysis.get('market')} {prop_analysis.get('line')}
     * **Signal:** {prop_analysis.get('signal')} (EV: {prop_analysis.get('ev'):.1%}, Prob: {prop_analysis.get('prob'):.1%})
@@ -282,22 +283,22 @@ def get_ai_second_opinion(prop_analysis, backtest_json, history_context=None):
     {history_section}
     {bucket_section}
 
-    **🏟️ GAME ENVIRONMENT**
+    ** GAME ENVIRONMENT**
     * **Spread:** {prop_analysis.get('spread')}
     * **Total:** {prop_analysis.get('total')}
     * **Rest:** {prop_analysis.get('rest')} days
     * **Opponent Rank:** {prop_analysis.get('opp_rank')}
 
-    **📈 PLAYER FORM**
+    ** PLAYER FORM**
     * **Season Avg:** {season_avg:.1f}
     * **L10 Avg:** {l10_avg:.1f} ({prop_analysis.get('trend')})
     * **Est. Usage:** {usage_pct:.1f}%
 
-    **📉 L30 TRENDS**
+    ** L30 TRENDS**
     * **Hit Rate:** {backtest_json.get('l30_rate')}%
     * **Avg Margin:** {backtest_json.get('avg_diff', 0):+.1f}
 
-    **🧠 ANALYSIS TASKS:**
+    ** ANALYSIS TASKS:**
     1.  **Calibration Check:** Look at the "Calibration Check" section. If the Bucket Win Rate is high (e.g., >60%), TRUST the signal. If low, DOUBT it.
     2.  **Edge Check:** Do we have a positive safety cushion?
     3.  **Verdict:** AGREE or DISAGREE.
@@ -470,6 +471,13 @@ class FeatureVector:
     feat_fatigue_load: float = 0.0  # (Minutes / Rest) interaction
     feat_form_gap: float = 0.0      # (Recent - Season) delta
 
+    # === V20.5 NEW: HIT RATE FEATURES ===
+    feat_hit_rate_l10: float = 0.0  # % of last 10 games over line
+    feat_hit_rate_l20: float = 0.0  # % of last 20 games over line
+
+    # === V20.5 NEW: DEFENSE VS POSITION ===
+    feat_opp_rank_vs_pos: int = 15   # 1=Best defense, 30=Worst defense
+
 
     # === MARKET IDENTITY (one-hot encoded) ===
     market_scoring: int = 0  # PTS
@@ -578,7 +586,7 @@ class Projection:
     
     Outputs only empirically meaningful values:
     - predicted_mean: E[stat] from regression model
-    - predicted_std: σ[stat] uncertainty
+    - predicted_std: [stat] uncertainty
     - ml_prob: P(Over) from CDF
     """
     base_projection: float
@@ -613,7 +621,7 @@ class BetDecision:
     probability: float     # P(winning the recommended side)
     expected_value: float  # EV at given odds
     predicted_mean: float  # E[stat] from model
-    predicted_std: float   # σ[stat] uncertainty
+    predicted_std: float   # [stat] uncertainty
     kelly_stake: float     # Suggested stake (EV-based)
     kelly_fraction: float  # Stake as fraction of bankroll
 
@@ -828,7 +836,7 @@ class DataLoader:
         current_process = multiprocessing.current_process()
         if current_process.name != 'MainProcess':
             error_msg = (
-                f"🚨 API CALL BLOCKED IN WORKER PROCESS! 🚨\n"
+                f" API CALL BLOCKED IN WORKER PROCESS! \n"
                 f"  Process: {current_process.name}\n"
                 f"  Description: {description}\n"
                 f"  This indicates data was not properly pre-loaded.\n"
@@ -852,11 +860,11 @@ class DataLoader:
                 if "timed out" in error_str or "timeout" in error_str or "429" in error_str or "read timeout" in error_str:
                     cooldown_count += 1
                     if cooldown_count >= MAX_COOLDOWNS:
-                        logger.error(f"🛑 {MAX_COOLDOWNS} consecutive timeouts. API is blocked. Failing fast.")
+                        logger.error(f" {MAX_COOLDOWNS} consecutive timeouts. API is blocked. Failing fast.")
                         raise DataLoaderError(f"{description} failed: API rate limited after {cooldown_count} timeouts")
                     # Exponential backoff: 30s, 60s, 90s, 120s
                     wait_time = 30 * cooldown_count
-                    logger.warning(f"⚠️ API Cooldown {cooldown_count}/{MAX_COOLDOWNS}. Waiting {wait_time}s...")
+                    logger.warning(f" API Cooldown {cooldown_count}/{MAX_COOLDOWNS}. Waiting {wait_time}s...")
                     time.sleep(wait_time)
                 else:
                     # Standard error (e.g. JSON decode), short wait
@@ -895,41 +903,8 @@ class DataLoader:
     
     @_conditional_cache(ttl=CONFIG.CACHE_TTL_PLAYER_IDS)
     def get_player_position(_self, player_id:  int) -> str:
-        """Fetch player's primary position."""
-        try:
-            def api_call():
-                return commonplayerinfo.CommonPlayerInfo(player_id=player_id).get_data_frames()[0]
-            
-            df = _self._api_call_with_retry(api_call, f"Get position for player {player_id}")
-            
-            if df is None or len(df) == 0:
-                return 'SF'
-            
-            position = df['POSITION'].iloc[0] if 'POSITION' in df.columns else ''
-            position = str(position).upper().strip()
-            
-            position_map = {
-                'GUARD': 'PG', 'POINT GUARD': 'PG', 'G': 'PG', 'PG':  'PG',
-                'SHOOTING GUARD': 'SG', 'SG': 'SG', 'G-F': 'SG',
-                'FORWARD': 'SF', 'SMALL FORWARD': 'SF', 'SF':  'SF', 'F': 'SF', 'F-G': 'SF',
-                'POWER FORWARD': 'PF', 'PF': 'PF', 'F-C': 'PF',
-                'CENTER': 'C', 'C': 'C', 'C-F': 'C',
-            }
-            
-            for key, val in position_map. items():
-                if key in position: 
-                    return val
-            
-            if '-' in position: 
-                first_pos = position.split('-')[0].strip()
-                for key, val in position_map.items():
-                    if key in first_pos: 
-                        return val
-            
-            return 'SF'
-        except Exception as e: 
-            logger.error(f"Failed to get player position: {e}")
-            return 'SF'
+        """Fetch player's primary position using DataEngine."""
+        return _self.data_engine._get_real_position(player_id)
     
     @_conditional_cache(ttl=CONFIG.CACHE_TTL_GAME_LOGS)
     def fetch_game_logs(_self, player_id: int, season: str = None) -> pd.DataFrame:
@@ -1073,14 +1048,132 @@ class DataLoader:
         
         all_stats = {}
         for season in seasons:
-            logger.info(f"📥 Fetching team stats for {season}...")
+            logger.info(f" Fetching team stats for {season}...")
             time.sleep(self.config.API_DELAY)  # Rate limit protection
             stats_df, avg_pace, avg_def = self.fetch_team_stats(season)
             all_stats[season] = (stats_df, avg_pace, avg_def)
-            logger.info(f"  ✓ {season}: {len(stats_df)} teams, pace={avg_pace:.1f}, drtg={avg_def:.1f}")
+            logger.info(f"   {season}: {len(stats_df)} teams, pace={avg_pace:.1f}, drtg={avg_def:.1f}")
         
         return all_stats
-    
+
+    def fetch_player_positions(self, seasons: List[str] = None, player_ids: List[int] = None, force_refresh: bool = False) -> Dict[int, str]:
+        """
+        Bulk-fetch player positions using a combination of static metadata and
+        the `leaguedashplayerstats` endpoint per season. Optionally, will run
+        per-player lookups (parallel threads) for only the provided `player_ids`.
+        Results are cached to disk at DATA_DIR/player_positions.json to avoid
+        repeated API calls.
+
+        Returns:
+            Dict[player_id:int -> position:str]  # position in {PG, SG, SF, PF, C}
+        """
+        cache_path = DATA_DIR / 'player_positions.json'
+
+        # Load from cache unless force_refresh
+        if not force_refresh and cache_path.exists():
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as fh:
+                    raw = json.load(fh)
+                # keys are strings in JSON - convert back to ints
+                cached = {int(k): v for k, v in raw.get('positions', {}).items()}
+                logger.info(f"Loaded player positions cache ({len(cached)} entries)")
+            except Exception as e:
+                logger.warning(f"Failed to read player positions cache: {e}")
+                cached = {}
+        else:
+            cached = {}
+
+        positions: Dict[int, str] = dict(cached)  # start with cache
+
+        # 1) Static player metadata (instant, no API)
+        static_count = 0
+        try:
+            for p in players.get_players():
+                pid = p.get('id')
+                pos = (p.get('position') or '').strip()
+                # Normalize common short codes
+                if pos == 'G':
+                    norm = 'PG'
+                elif pos == 'F':
+                    norm = 'PF'
+                elif pos in ('PG', 'SG', 'SF', 'PF', 'C'):
+                    norm = pos
+                else:
+                    norm = ''
+                if pid and norm and pid not in positions:
+                    positions[pid] = norm
+                    static_count += 1
+        except Exception as e:
+            logger.warning(f"Failed to build static positions map: {e}")
+
+        # 2) Augment with per-season league player stats (one call per season)
+        if seasons is None:
+            seasons = list(CONFIG.TRAINING_SEASONS)
+
+        per_season_count = 0
+        for season in seasons:
+            try:
+                logger.info(f"Fetching league player stats for positions (season={season})...")
+                df = leaguedashplayerstats.LeagueDashPlayerStats(season=season, per_mode_detailed='PerGame').get_data_frames()[0]
+
+                # Accept a variety of possible column names for position
+                pos_cols = [c for c in df.columns if c.upper() in ('PLAYER_POSITION','POSITION','PLAYER_POS','POSITION_SHORT','POS')]
+                if 'PLAYER_ID' in df.columns and pos_cols:
+                    col = pos_cols[0]
+                    for _, row in df[['PLAYER_ID', col]].iterrows():
+                        pid = int(row['PLAYER_ID'])
+                        raw_pos = (row.get(col) or '').strip()
+                        if raw_pos == 'G':
+                            norm = 'PG'
+                        elif raw_pos == 'F':
+                            norm = 'PF'
+                        elif raw_pos in ('PG', 'SG', 'SF', 'PF', 'C'):
+                            norm = raw_pos
+                        else:
+                            norm = ''
+                        if norm:
+                            positions[pid] = norm
+                            per_season_count += 1
+                else:
+                    logger.warning(f"Unexpected columns in player stats for {season}: {df.columns.tolist()[:10]}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch league player stats for {season}: {e}")
+                # continue to next season
+
+        # 3) For any requested player_ids still missing, do limited parallel per-player lookups
+        if player_ids:
+            missing = [pid for pid in player_ids if pid not in positions]
+            if missing:
+                logger.info(f"Fetching individual positions for {len(missing)} players (parallel)...")
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                def _get_pos(pid):
+                    try:
+                        return pid, self.get_player_position(pid)
+                    except Exception as e:
+                        logger.warning(f"Failed to get position for player {pid}: {e}")
+                        return pid, 'SF'
+
+                max_workers = min(16, max(2, len(missing)))
+                with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                    futures = {ex.submit(_get_pos, pid): pid for pid in missing}
+                    for fut in as_completed(futures):
+                        pid, pos = fut.result()
+                        positions[pid] = pos
+
+        # Persist to disk (only if we found anything meaningful)
+        try:
+            if positions:
+                out = {'time': datetime.now().isoformat(), 'positions': {str(k): v for k, v in positions.items()}}
+                with open(cache_path, 'w', encoding='utf-8') as fh:
+                    json.dump(out, fh, indent=2)
+                logger.info(f"Saved player positions cache ({len(positions)} entries) -> {cache_path}")
+        except Exception as e:
+            logger.warning(f"Failed to write player positions cache: {e}")
+
+        logger.info(f"Positions: static={static_count}, per_season={per_season_count}, total_cached={len(positions)}")
+        return positions
+
     def fetch_opponent_stats(self, season: str = None) -> pd.DataFrame:
         """Fetch opponent (defensive) stats for position defense calculation."""
         if season is None:
@@ -1674,7 +1767,8 @@ class FeatureEngineer:
         game_total: float = 0.0,
         player_team_id: int = None,
         player_team_abbrev: str = None,
-        data_loader: 'DataLoader' = None
+        data_loader: 'DataLoader' = None,
+        player_position: str = None
     ) -> FeatureVector: 
         """
         Build pure empirical feature vector for ML models.
@@ -1796,6 +1890,60 @@ class FeatureEngineer:
         except Exception:
             form_gap = 0.0
 
+        # === NEW FEATURES: Hit Rates and DvP ===
+        # Get additional features from DataEngine
+        player_data = {}
+        if data_loader and hasattr(data_loader, 'data_engine'):
+            try:
+                player_data = data_loader.data_engine.fetch_player_data(
+                    player_id=player_id,
+                    opponent_id=opponent_id,
+                    market=market,
+                    line=line,
+                    season=self.config.CURRENT_SEASON,
+                    player_position=player_position
+                )
+            except Exception as e:
+                logger.warning(f"Failed to fetch additional player data: {e}")
+                player_data = {}
+
+        # Calculate hit rates from historical data
+        try:
+            if df.empty:
+                feat_hit_rate_l10 = 0.0
+                feat_hit_rate_l20 = 0.0
+            else:
+                # Sort by date descending
+                temp_df = df.sort_values('GAME_DATE', ascending=False)
+                
+                # Calculate ACTUAL_VALUE
+                if market == 'PRA':
+                    temp_df['ACTUAL_VALUE'] = temp_df['PTS'] + temp_df['REB'] + temp_df['AST']
+                elif market == 'PR':
+                    temp_df['ACTUAL_VALUE'] = temp_df['PTS'] + temp_df['REB']
+                elif market == 'PA':
+                    temp_df['ACTUAL_VALUE'] = temp_df['PTS'] + temp_df['AST']
+                elif market == 'RA':
+                    temp_df['ACTUAL_VALUE'] = temp_df['REB'] + temp_df['AST']
+                else:
+                    # Single stat markets
+                    temp_df['ACTUAL_VALUE'] = temp_df[market]
+                
+                # Hit rates
+                last_10 = temp_df.head(10)
+                hits_10 = sum(1 for _, game in last_10.iterrows() if game['ACTUAL_VALUE'] > line)
+                feat_hit_rate_l10 = hits_10 / float(len(last_10)) if len(last_10) > 0 else 0.0
+                
+                last_20 = temp_df.head(20)
+                hits_20 = sum(1 for _, game in last_20.iterrows() if game['ACTUAL_VALUE'] > line)
+                feat_hit_rate_l20 = hits_20 / float(len(last_20)) if len(last_20) > 0 else 0.0
+        except Exception as e:
+            logger.warning(f"Failed to calculate hit rates: {e}")
+            feat_hit_rate_l10 = 0.0
+            feat_hit_rate_l20 = 0.0
+
+        feat_opp_rank_vs_pos = player_data.get('feat_opp_rank_vs_pos', 15)
+
         return FeatureVector(
             # Identifiers
             player_id=player_id,
@@ -1845,14 +1993,21 @@ class FeatureEngineer:
             feat_usage_rate=stats.get('usage_rate', 0.0),
             feat_h2h_avg=h2h_avg,
 
-            # 🚀 ADDED NEW FEATURES HERE 🚀
+            #  ADDED NEW FEATURES HERE 
             feat_season_avg=season_avg,
             feat_l10_avg=l10_avg,
             feat_fatigue_load=fatigue_load,
             feat_form_gap=form_gap,
 
-            # 🚀 NEW: Efficiency per minute
-            feat_eff_per_min=eff_per_min
+            #  NEW: Efficiency per minute
+            feat_eff_per_min=eff_per_min,
+
+            #  NEW: Hit Rate Features
+            feat_hit_rate_l10=feat_hit_rate_l10,
+            feat_hit_rate_l20=feat_hit_rate_l20,
+
+            #  NEW: Defense vs. Position
+            feat_opp_rank_vs_pos=feat_opp_rank_vs_pos
         )
 
 @dataclass
@@ -1902,8 +2057,8 @@ class ModelEngine:
     
     Key Architecture:
     - XGBRegressor predicts expected stat value E[stat]
-    - Variance model predicts σ[stat] (uncertainty)
-    - Probability via CDF: P(Over) = 1 - Φ((line - μ) / σ)
+    - Variance model predicts [stat] (uncertainty)
+    - Probability via CDF: P(Over) = 1 - ((line - ) / )
     - Calibration curves correct probability biases
     - Ablation mode logs feature importance
     
@@ -1962,12 +2117,12 @@ class ModelEngine:
                     logger.warning(f"Failed to load {group} model: {e}")
         
         if loaded_count > 0:
-            logger.info(f"🤖 ML COMMITMENT: Loaded {loaded_count} regression models")
+            logger.info(f" ML COMMITMENT: Loaded {loaded_count} regression models")
             if self.model_features:
                 logger.info(f"   Model expects {len(self.model_features)} features")
         else:
             # V19 COMMITMENT: Warn loudly if no models found
-            logger.error("⚠️ NO ML MODELS FOUND - Run data/train_model_v19.py first!")
+            logger.error(" NO ML MODELS FOUND - Run data/train_model_v19.py first!")
             if self.config.ML_REQUIRE_MODEL:
                 logger.error("   Predictions will FAIL until models are trained.")
         
@@ -1982,7 +2137,7 @@ class ModelEngine:
                         self.variance_model = joblib.load(var_path)
                     if hasattr(self.ml_model, 'feature_names_in_'):
                         self.model_features = list(self.ml_model.feature_names_in_)
-                    logger.info("🤖 Loaded legacy universal ML model")
+                    logger.info(" Loaded legacy universal ML model")
                 except Exception as e:
                     logger.error(f"Failed to load ML model: {e}")
     
@@ -2008,9 +2163,9 @@ class ModelEngine:
                     logger.warning(f"Failed to load {group} calibrator: {e}")
         
         if loaded_count > 0:
-            logger.info(f"📊 Loaded {loaded_count} calibration curves")
+            logger.info(f" Loaded {loaded_count} calibration curves")
         else:
-            logger.info("📊 No calibration curves found (using raw probabilities)")
+            logger.info(" No calibration curves found (using raw probabilities)")
 
     def _get_model_for_market(self, market: str) -> Tuple[Any, Any, List[str]]:
         """
@@ -2074,11 +2229,15 @@ class ModelEngine:
             'feat_foul_rate': float(features.feat_foul_rate),
             'feat_cv': float(features.feat_cv),
             
-            # 🚀 V20.4 NEW: ADD THESE LINES TO FIX THE WARNINGS
-            'feat_usage_rate': float(features.feat_usage_rate),
-            'feat_h2h_avg': float(features.feat_h2h_avg),
-            'feat_season_avg': float(features.feat_season_avg),
-            'feat_l10_avg': float(features.feat_l10_avg),
+            #  V20.4 NEW: ADD THESE LINES TO FIX THE WARNINGS
+            'feat_usage_rate': float(getattr(features, 'feat_usage_rate', 0.0)),
+            'feat_h2h_avg': float(getattr(features, 'feat_h2h_avg', 0.0)),
+            'feat_season_avg': float(getattr(features, 'feat_season_avg', 0.0)),
+            'feat_l10_avg': float(getattr(features, 'feat_l10_avg', 0.0)),
+            # V20.5 NEW: Hit-rate & DvP features (added to silence model warnings)
+            'feat_hit_rate_l10': float(getattr(features, 'feat_hit_rate_l10', 0.0)),
+            'feat_hit_rate_l20': float(getattr(features, 'feat_hit_rate_l20', 0.0)),
+            'feat_opp_rank_vs_pos': float(getattr(features, 'feat_opp_rank_vs_pos', 15.0)),
             # Backcompat/missing feature fallbacks (silence older model warnings)
             'feat_eff_per_min': float(getattr(features, 'feat_eff_per_min', 0.0)),
             'feat_fatigue_load': float(getattr(features, 'feat_fatigue_load', 0.0)),
@@ -2103,7 +2262,7 @@ class ModelEngine:
         V19 REGRESSION: Get predicted stat value and convert to P(Over) via CDF.
         
         The model predicts E[stat], then we calculate:
-        P(Over) = 1 - Φ((line - predicted_mean) / predicted_std)
+        P(Over) = 1 - ((line - predicted_mean) / predicted_std)
         
         Returns: P(Over) probability (for compatibility with existing code)
         """
@@ -2129,16 +2288,41 @@ class ModelEngine:
             # V19 REGRESSION: Predict expected stat value
             predicted_mean = float(mean_model.predict(X)[0])
             
-            # Get variance estimate
+            # Get variance estimate (use variance-model's feature subset if it differs)
             if var_model is not None:
-                # Use variance model if available
-                predicted_std = float(np.sqrt(max(0.1, var_model.predict(X)[0])))
+                # Discover variance-model feature names when available
+                var_feature_names = None
+                if hasattr(var_model, 'feature_names_in_'):
+                    var_feature_names = list(var_model.feature_names_in_)
+                else:
+                    try:
+                        var_feature_names = var_model.get_booster().feature_names
+                    except Exception:
+                        var_feature_names = None
+
+                # If var model expects a different subset, extract that subset
+                if var_feature_names and expected_features and set(var_feature_names) != set(expected_features):
+                    logger.debug(f"Selecting {len(var_feature_names)} features for variance model (market={market})")
+                    X_var = self._extract_features_for_model(features, var_feature_names).reshape(1, -1)
+                else:
+                    X_var = X
+
+                try:
+                    pred_log_var = var_model.predict(X_var)[0]
+                    # Convert back to variance space: var = expm1(pred_log_var)
+                    pred_var = float(np.expm1(pred_log_var))
+                    pred_var = max(1e-6, pred_var)
+                except Exception as e:
+                    logger.warning(f"Variance model predict failed (market={market}): {e}; falling back to empirical std")
+                    emp_std = features.std if (features.std is not None and features.std > 0) else 1.0
+                    pred_var = emp_std ** 2
+                predicted_std = float(np.sqrt(pred_var))
             else:
                 # V20: Use player's empirical std only - no fabricated minimums
-                predicted_std = features.std if features.std > 0 else 1.0
+                predicted_std = features.std if (features.std is not None and features.std > 0) else 1.0
             
             # Calculate P(Over) using normal CDF
-            # P(X > line) = 1 - Φ((line - μ) / σ)
+            # P(X > line) = 1 - ((line - ) / )
             line = features.line
             if predicted_std > 0:
                 z_score = (line - predicted_mean) / predicted_std
@@ -2162,7 +2346,7 @@ class ModelEngine:
         
         Returns dict with:
         - predicted_value: E[stat] from model
-        - predicted_std: σ[stat] (uncertainty)
+        - predicted_std: [stat] (uncertainty)
         - p_over: P(stat > line)
         - p_under: P(stat <= line)
         - confidence_interval: (5th percentile, 95th percentile)
@@ -2206,13 +2390,35 @@ class ModelEngine:
             predicted_mean = float(mean_model.predict(X)[0])
             result['predicted_value'] = predicted_mean
             
-            # Get variance
+            # Get variance (respect variance-model feature subset if present)
             if var_model is not None:
-                predicted_var = float(max(0.1, var_model.predict(X)[0]))
-                predicted_std = np.sqrt(predicted_var)
+                var_feature_names = None
+                if hasattr(var_model, 'feature_names_in_'):
+                    var_feature_names = list(var_model.feature_names_in_)
+                else:
+                    try:
+                        var_feature_names = var_model.get_booster().feature_names
+                    except Exception:
+                        var_feature_names = None
+
+                if var_feature_names and expected_features and set(var_feature_names) != set(expected_features):
+                    logger.debug(f"Using variance-model feature subset ({len(var_feature_names)}) for market {market}")
+                    X_var = self._extract_features_for_model(features, var_feature_names).reshape(1, -1)
+                else:
+                    X_var = X
+
+                try:
+                    pred_log_var = var_model.predict(X_var)[0]
+                    pred_var = float(np.expm1(pred_log_var))
+                    pred_var = max(1e-6, pred_var)
+                except Exception as e:
+                    logger.warning(f"Variance prediction failed for market {market}: {e}; falling back to empirical std")
+                    emp_std = features.std if (features.std is not None and features.std > 0) else 1.0
+                    pred_var = emp_std ** 2
+                predicted_std = float(np.sqrt(pred_var))
             else:
                 # V20: Use player's empirical std only - no fabricated minimums
-                predicted_std = features.std if features.std > 0 else 1.0
+                predicted_std = features.std if (features.std is not None and features.std > 0) else 1.0
             result['predicted_std'] = predicted_std
             
             # Calculate probabilities
@@ -2281,7 +2487,7 @@ class ModelEngine:
         If model is unavailable, raises MLModelRequiredError.
         
         The ML model predicts E[stat] directly, which is the projection.
-        Probability calculations use CDF: P(Over) = 1 - Φ((line - μ) / σ)
+        Probability calculations use CDF: P(Over) = 1 - ((line - ) / )
         
         Calibration curves are applied when available to improve probability accuracy.
         """
@@ -2322,15 +2528,19 @@ class ModelEngine:
         
         # Get confidence interval
         ci_low, ci_high = regression['confidence_interval']
-        ci = (ci_low if ci_low is not None else adjusted_proj - ml_std * 1.645,
-              ci_high if ci_high is not None else adjusted_proj + ml_std * 1.645)
+        # Defensive predicted std: fall back to features.std or 1.0 if missing
+        ml_std_safe = ml_std if (ml_std is not None and ml_std > 0) else (features.std if (features.std is not None and features.std > 0) else 1.0)
+        ci = (
+            ci_low if ci_low is not None else max(0, adjusted_proj - ml_std_safe * 1.645),
+            ci_high if ci_high is not None else adjusted_proj + ml_std_safe * 1.645
+        )
         
         return ProjectionResult(
             base_projection=float(ml_proj),
             final_projection=float(adjusted_proj),
             confidence_interval=ci,
             adjustments={
-                'predicted_std': ml_std,
+                'predicted_std': float(ml_std_safe),
                 'model_type': 'regression',
                 'calibration_applied': self.config.ML_CALIBRATION_ENABLED,
             },
@@ -2396,7 +2606,7 @@ class SimulationEngine:
     V20 EMPIRICAL: Pure CDF-based probability calculation.
     
     DESIGN PRINCIPLES (per refactor directive):
-    - Pure CDF calculation: P(Over) = 1 - Φ((line - μ) / σ)
+    - Pure CDF calculation: P(Over) = 1 - ((line - ) / )
     - NO mixture models (belief-based)
     - NO variance adjustments based on spread/rest (heuristics)
     - NO probability caps (let ML calibration handle this)
@@ -2425,7 +2635,7 @@ class SimulationEngine:
         """
         V20 EMPIRICAL: Pure CDF probability calculation.
         
-        Formula: P(Over) = 1 - Φ((line - μ) / σ)
+        Formula: P(Over) = 1 - ((line - ) / )
         
         NO ADJUSTMENTS. The ML model's mean and std predictions are used as-is.
         If the model is uncertain, that's reflected in a larger std.
@@ -2572,7 +2782,7 @@ class DecisionPolicy:
         REMOVED: Grade system, narratives, rollover scores, confidence warnings
         OUTPUT: EV, Predicted Mean, Std Dev, Win Probability
         
-        Formula: P(Over) = 1 - Φ((line - μ) / σ)
+        Formula: P(Over) = 1 - ((line - ) / )
         """
         # 1. Get CDF-computed probability from simulation
         prob_over_cdf = simulation.over_prob
@@ -2658,7 +2868,7 @@ class Backtester:
     def _get_season_for_date(self, game_date: pd.Timestamp) -> str:
         """
         Determine NBA season string for a given date.
-        NBA season runs Oct-Jun. Oct 2024 → "2024-25", Jan 2025 → "2024-25"
+        NBA season runs Oct-Jun. Oct 2024  "2024-25", Jan 2025  "2024-25"
         
         V20: Used for METADATA only, not for decay calculations.
         """
@@ -2740,11 +2950,11 @@ class Backtester:
         Returns CLV in points (e.g., +0.5 means line moved 0.5 toward your bet)
         """
         # Base CLV from EV signal (sharp money moves lines)
-        # EV of +5% → expect ~0.3 pts CLV, EV of -5% → expect ~-0.3 pts CLV
+        # EV of +5%  expect ~0.3 pts CLV, EV of -5%  expect ~-0.3 pts CLV
         ev_component = ev * 6.0  # Scale EV to reasonable CLV range
         
-        # Probability component (high confidence → market likely agrees)
-        prob_component = (prob - 0.5) * 1.0  # 60% prob → +0.1, 40% → -0.1
+        # Probability component (high confidence  market likely agrees)
+        prob_component = (prob - 0.5) * 1.0  # 60% prob  +0.1, 40%  -0.1
         
         # Outcome component (winners had sharper reads on average)
         outcome_component = 0.2 if hit else -0.1
@@ -2771,7 +2981,7 @@ class Backtester:
         market: str,
         lookback: int = 15,
         test_days: int = 30,
-        line_offset: float = 0.0,  # Test at actual average ± offset
+        line_offset: float = 0.0,  # Test at actual average  offset
         fixed_spread: float = 0.0,
         progress_callback=None,
         preloaded_df: pd.DataFrame = None,  # Optional: use pre-loaded game logs
@@ -3010,7 +3220,7 @@ class Backtester:
                     synthetic_spread = -((net_rtg_diff + home_adj) / 2.5)  # Scale to points
                     
                     # Calculate Synthetic Total
-                    # Total ≈ (PlayerTeam_Pace + OppTeam_Pace) * 1.15
+                    # Total  (PlayerTeam_Pace + OppTeam_Pace) * 1.15
                     # 1.15 is a rough scaling factor to convert pace to expected points
                     synthetic_total = (player_pace + opp_pace) * 1.15
                     
@@ -3074,27 +3284,28 @@ class Backtester:
                     days_rest=days_rest,
                     game_total=backtest_game_total,
                     player_team_id=player_team_id,
-                    # FIX: Set to None to prevent workers from hitting ESPN
+                    # Pass worker-local data_loader (safe - uses cached DataEngine)
                     player_team_abbrev=None,  
-                    data_loader=None
+                    data_loader=self.data_loader,
+                    player_position=player_position
                 )
-                
+
                 # V20.3: Inject absence features into feature vector
                 features.team_out_ppg = absence_features['team_out_ppg']
                 features.team_out_count = absence_features['team_out_count']
                 features.opp_out_ppg = absence_features['opp_out_ppg']
                 features.opp_out_count = absence_features['opp_out_count']
-                
+
                 # =========================================================
                 # TEMPORAL INTEGRITY: FREEZE FEATURE SNAPSHOT
                 # Capture EXACTLY what was known at prediction time
                 # This is our audit trail for walk-forward integrity
                 # =========================================================
                 frozen_snapshot = self._freeze_feature_snapshot(features, prediction_date)
-                
+
                 # Generate projection
                 projection = self.model_engine.generate_projection(features)
-                
+
                 # V19: Use CDF-based probability (deterministic, no Monte Carlo)
                 simulation = self.simulation_engine.compute_cdf_probability(
                     mean=projection.final_projection,
@@ -3103,7 +3314,7 @@ class Backtester:
                     market=market,
                     features=features
                 )
-                
+
                 # Make decision
                 decision = self.decision_policy.make_decision(
                     features=features,
@@ -3113,24 +3324,24 @@ class Backtester:
                     odds=1.91,  # Standard -110 odds
                     bankroll=1000
                 )
-                
+
                 # Get actual result
                 actual_value = target_game[market]
                 hit = (decision.recommended_side == "OVER" and actual_value > line) or \
                       (decision.recommended_side == "UNDER" and actual_value <= line)
-                
+
                 # =========================================================
                 # V19 TEMPORAL INTEGRITY: Use FROZEN snapshot for features
                 # NOT the potentially-mutated features object
                 # V20: Raw observables only (no usage_mult, rest_factor)
                 # =========================================================
                 feature_dict = frozen_snapshot.copy()
-                
+
                 # Ensure internal audit keys match expected schema (prefixed with _)
                 feature_dict['_snapshot_date'] = frozen_snapshot.get('snapshot_date')
                 feature_dict['_snapshot_season'] = frozen_snapshot.get('snapshot_season')
                 feature_dict['_had_warnings'] = frozen_snapshot.get('had_warnings', False)
-                
+
                 results.append(BacktestResult(
                     date=target_game['GAME_DATE'].strftime('%Y-%m-%d'),
                     player_name=player_name,
@@ -3463,7 +3674,7 @@ def get_top_active_players(limit: int = 50, min_games: int = 10) -> List[Dict]:
             logger.warning("leaguedashplayerstats returned no data")
             return []
         
-        logger.info(f"  ✓ Fetched {len(df)} players from NBA API in 1 request")
+        logger.info(f"   Fetched {len(df)} players from NBA API in 1 request")
         
     except Exception as e:
         logger.error(f"Failed to fetch player stats: {e}")
@@ -3516,7 +3727,7 @@ def get_top_active_players(limit: int = 50, min_games: int = 10) -> List[Dict]:
     
     # Log division breakdown
     for division in NBA_DIVISIONS.keys():
-        logger.info(f"  ✓ {division}: {division_counts[division]} players")
+        logger.info(f"   {division}: {division_counts[division]} players")
     
     # Sort by games played (descending) and return top N
     player_list.sort(key=lambda x: x['games'], reverse=True)
@@ -3555,11 +3766,11 @@ class BulkGameLogLoader:
         seasons = seasons or list(self.config.TRAINING_SEASONS)
         total_seasons = len(seasons)
         
-        logger.info(f"📥 Loading {total_seasons} seasons of data for ML training...")
+        logger.info(f" Loading {total_seasons} seasons of data for ML training...")
         
         for i, season in enumerate(seasons):
             try:
-                logger.info(f"📥 Fetching ALL game logs for {season} (API call {i+1}/{total_seasons})...")
+                logger.info(f" Fetching ALL game logs for {season} (API call {i+1}/{total_seasons})...")
                 time.sleep(self.config.API_DELAY * 2)
                 
                 logs = leaguegamelog.LeagueGameLog(season=season, player_or_team_abbreviation='P', timeout=120)
@@ -3569,14 +3780,14 @@ class BulkGameLogLoader:
                     df['SEASON'] = season
                     all_logs.append(df)
                     self._seasons_loaded.append(season)
-                    logger.info(f"  ✓ {season}: {len(df):,} game log entries")
+                    logger.info(f"   {season}: {len(df):,} game log entries")
                 else:
-                    logger.warning(f"  ✗ {season}: No data returned")
+                    logger.warning(f"   {season}: No data returned")
                     
                 if progress_callback: progress_callback((i + 1) / total_seasons * 0.3)
                     
             except Exception as e:
-                logger.error(f"  ✗ Failed to fetch {season} logs: {e}")
+                logger.error(f"   Failed to fetch {season} logs: {e}")
                 if season == self.config.CURRENT_SEASON: return False
         
         if not all_logs: return False
@@ -3652,7 +3863,7 @@ class BulkGameLogLoader:
             for player_id, player_df in df.groupby('PLAYER_ID'):
                 self._cache[player_id] = player_df.reset_index(drop=True)
 
-        logger.info(f"  ✓ Organized data for {len(self._cache):,} unique players (with computed stats)")
+        logger.info(f"   Organized data for {len(self._cache):,} unique players (with computed stats)")
 
     def _build_optimization_indexes(self):
         """
@@ -3906,7 +4117,7 @@ def _backtest_worker_task(args: Tuple) -> Optional[pd.DataFrame]:
     worker_id = os.getpid()
     
     # [LOG 1] STARTING TASK
-    logger.info(f"🔄 [Worker {worker_id}] STARTING Task {task_idx}/{total_tasks}: {player_name} ({market})")
+    logger.info(f" [Worker {worker_id}] STARTING Task {task_idx}/{total_tasks}: {player_name} ({market})")
     
     try:
         # Reconstruct player DataFrame from dict (Tiny, just one player)
@@ -3945,14 +4156,14 @@ def _backtest_worker_task(args: Tuple) -> Optional[pd.DataFrame]:
         if summary is not None and len(summary.results_df) > 0:
             result_df = summary.results_df.copy()
             result_df['player_id'] = player_id
-            logger.info(f"✅ [Worker {worker_id}] FINISHED Task {task_idx}/{total_tasks}: Generated {len(result_df)} samples")
+            logger.info(f" [Worker {worker_id}] FINISHED Task {task_idx}/{total_tasks}: Generated {len(result_df)} samples")
             return result_df
         
-        logger.info(f"⚠️ [Worker {worker_id}] FINISHED Task {task_idx}/{total_tasks}: No results generated")
+        logger.info(f" [Worker {worker_id}] FINISHED Task {task_idx}/{total_tasks}: No results generated")
         return None
         
     except Exception as e:
-        logger.error(f"❌ [Worker {worker_id}] CRASHED Task {task_idx}/{total_tasks} ({player_name}): {e}")
+        logger.error(f" [Worker {worker_id}] CRASHED Task {task_idx}/{total_tasks} ({player_name}): {e}")
         import traceback
         logger.error(traceback.format_exc())
         return None
@@ -3989,10 +4200,10 @@ def generate_ml_training_data(
     if progress_callback: progress_callback(0.05)
     
     if not bulk_loader.load_all_game_logs(progress_callback):
-        logger.error("🛑 Failed to bulk load game logs. Aborting.")
+        logger.error(" Failed to bulk load game logs. Aborting.")
         return pd.DataFrame()
     
-    logger.info(f"✅ Bulk data loaded: {bulk_loader.player_count:,} players available offline")
+    logger.info(f" Bulk data loaded: {bulk_loader.player_count:,} players available offline")
     if progress_callback: progress_callback(0.35)
     
     # =========================================================================
@@ -4006,7 +4217,7 @@ def generate_ml_training_data(
     )
     
     if len(top_players) == 0:
-        logger.error("🛑 No players found in bulk data with sufficient games")
+        logger.error(" No players found in bulk data with sufficient games")
         return pd.DataFrame()
 
     logger.info(f"Pre-fetching team stats for {len(config.TRAINING_SEASONS)} seasons...")
@@ -4019,10 +4230,35 @@ def generate_ml_training_data(
         team_stats_serialized[season] = (records, avg_pace, avg_def)
 
     # Serialize bulk logs for init
-    logger.info("📦 Serializing bulk data for workers (One-time cost)...")
+    logger.info(" Serializing bulk data for workers (One-time cost)...")
     bulk_cache_serialized = {}
     for pid, pdf in bulk_loader._cache.items():
         bulk_cache_serialized[pid] = pdf.to_dict('records')
+
+    # === Prefetch player positions using bulk season calls + cache ===
+    logger.info("Prefetching player positions for selected players (bulk + cache)...")
+    preloaded_positions = {}
+
+    # Attempt to load a consolidated positions map (static + per-season stats)
+    try:
+        top_ids = [p['id'] for p in top_players]
+        pos_map = data_loader.fetch_player_positions(list(config.TRAINING_SEASONS), player_ids=top_ids)
+    except Exception as e:
+        logger.warning(f"Failed to fetch consolidated player positions: {e}")
+        pos_map = {}
+
+    found = 0
+    for p in top_players:
+        pid = p['id']
+        pos = pos_map.get(pid)
+        if not pos:
+            logger.debug(f"Position missing for player {pid}, defaulting to 'SF'")
+            pos = 'SF'
+        else:
+            found += 1
+        preloaded_positions[pid] = pos
+
+    logger.info(f"Prefetched positions for {found}/{len(top_players)} players from bulk cache/map")
 
     # =========================================================================
     # STEP 3: Build Lightweight Task List
@@ -4042,8 +4278,8 @@ def generate_ml_training_data(
         # We still pass specific player data, but NOT the full bulk loader
         player_df_dict = player_df.to_dict('records')
         
-        # Position optimization (Default to SF to skip API)
-        position = 'SF' 
+        # Use preloaded position (avoid API in workers)
+        position = preloaded_positions.get(player_id, 'SF')
         
         for market in markets:
             task_idx = len(tasks) + 1
@@ -4056,7 +4292,7 @@ def generate_ml_training_data(
     total_tasks = len(tasks)
     tasks = [(t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], total_tasks) for t in tasks]
     
-    logger.info(f"🎯 Prepared {total_tasks} tasks. Starting execution...")
+    logger.info(f" Prepared {total_tasks} tasks. Starting execution...")
     
     if total_tasks == 0:
         return pd.DataFrame()
@@ -4065,7 +4301,7 @@ def generate_ml_training_data(
     # STEP 4: Execute with Initializer (The Speed Fix)
     # =========================================================================
     max_workers = max(1, os.cpu_count() - 1)
-    logger.info(f"🚀 Launching {max_workers} workers with shared memory init...")
+    logger.info(f" Launching {max_workers} workers with shared memory init...")
     
     all_results = []
     completed = 0
@@ -4079,7 +4315,7 @@ def generate_ml_training_data(
     # =========================================================================
     if _IN_MAIN_PROCESS:
         try:
-            logger.info(f"🚀 Launching {max_workers} workers with shared memory init...")
+            logger.info(f" Launching {max_workers} workers with shared memory init...")
             # Pass the heavy data ONCE via initializer
             with ProcessPoolExecutor(
                 max_workers=max_workers,
@@ -4217,14 +4453,14 @@ def generate_ml_training_data(
             except: pass
         raise
 
-    logger.info(f"✓ ML training data saved to {output_path}")
+    logger.info(f" ML training data saved to {output_path}")
     if progress_callback: progress_callback(1.0)
 
     return final_df
 
 def generate_ml_data_streamlit():
     """Streamlit UI wrapper for ML data generation (No Form = No Redirect)."""
-    st.markdown("### 🤖 Generate ML Training Data")
+    st.markdown("###  Generate ML Training Data")
     
     st.info(f"""
     **V20.3 OPTIMIZED**: Only **8 API calls** total, regardless of player count!
@@ -4236,7 +4472,7 @@ def generate_ml_data_streamlit():
     - **Temporal Fix**: Each game uses its season's actual DRTG/Pace
     """)
     
-    # ❌ REMOVED st.form wrapper to prevent tab reset
+    #  REMOVED st.form wrapper to prevent tab reset
     
     col1, col2 = st.columns(2)
     with col1:
@@ -4254,8 +4490,8 @@ def generate_ml_data_streamlit():
         )
         output_file = st.text_input("Output Filename", "ml_training_data.csv", key="gen_file")
     
-    # 🚀 STANDARD BUTTON (No Form Submit event)
-    if st.button("🚀 Generate Dataset", type="primary"):
+    #  STANDARD BUTTON (No Form Submit event)
+    if st.button(" Generate Dataset", type="primary"):
         progress_bar = st.progress(0)
         status_text = st.empty()
         
@@ -4273,7 +4509,7 @@ def generate_ml_data_streamlit():
             )
             
             if len(df) > 0:
-                # 🛡️ CLEAN IMMEDIATELY
+                #  CLEAN IMMEDIATELY
                 try:
                     bool_cols = ['feat_is_home', 'feat_is_b2b']
                     for col in bool_cols:
@@ -4292,18 +4528,18 @@ def generate_ml_data_streamlit():
                 st.session_state['last_ml_training_data'] = df
                 st.session_state['last_ml_output_file'] = output_file
                 
-                # ✅ NO RERUN call here. Just let it flow to the display block below.
+                #  NO RERUN call here. Just let it flow to the display block below.
                 
             else:
                 st.error("Failed to generate training data. Check logs for errors.")
 
-    # 📊 RESULTS DISPLAY
+    #  RESULTS DISPLAY
     # This runs immediately after the button click logic finishes
     if 'last_ml_training_data' in st.session_state:
         df = st.session_state['last_ml_training_data'].copy()
         filename = st.session_state.get('last_ml_output_file', 'ml_training_data.csv')
         
-        st.success(f"✅ Generated {len(df)} training samples!")
+        st.success(f" Generated {len(df)} training samples!")
         
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Samples", len(df))
@@ -4316,7 +4552,7 @@ def generate_ml_data_streamlit():
         
         csv = df.to_csv(index=False)
         st.download_button(
-            "📥 Download CSV",
+            " Download CSV",
             csv,
             filename,
             "text/csv",
@@ -4399,7 +4635,7 @@ class PredictionOrchestrator:
 
             except Exception as e:
                 # Fallback to season-long data if API fails
-                # print(f"⚠️ Recency fetch failed ({e}), falling back to full season data.")
+                # print(f" Recency fetch failed ({e}), falling back to full season data.")
                 # Use standard data loader fallback
                 self._team_stats, self._avg_pace, self._avg_def = self.data_loader.fetch_team_stats()
     
@@ -4457,6 +4693,12 @@ class PredictionOrchestrator:
                         player_team_id = team_obj['id']
             
             # Step 5: Build feature vector (V20.3: with absence features)
+            # Pre-fetch player position to avoid per-worker API calls
+            try:
+                player_position = self.data_loader.get_player_position(p_obj['id'])
+            except Exception:
+                player_position = 'SF'
+
             features = self.feature_engineer.build_feature_vector(
                 player_id=p_obj['id'],
                 player_name=p_obj['full_name'],
@@ -4476,7 +4718,8 @@ class PredictionOrchestrator:
                 game_total=game_total,
                 player_team_id=player_team_id,  # V20.2: For team pace
                 player_team_abbrev=player_team_abbrev,  # V20.3: For injury-based absence
-                data_loader=self.data_loader  # V20.3: For PPG lookups
+                data_loader=self.data_loader,  # V20.3: For PPG lookups
+                player_position=player_position
             )
             
             # Step 6: Generate projection
@@ -5099,7 +5342,7 @@ class Tracker:
                     raw = bet.get(key)
                     break
 
-            # 🚀 LAZY BACKFILL for feat_eff_per_min
+            #  LAZY BACKFILL for feat_eff_per_min
             # If the feature is missing or sentinel (-1.0), try to calculate it on-the-fly
             if col == 'feat_eff_per_min' and (raw is None or raw == -1.0):
                 try:
@@ -5114,7 +5357,7 @@ class Tracker:
                 except Exception:
                     raw = 0.0
 
-            # 🚀 LAZY BACKFILL for feat_fatigue_load
+            #  LAZY BACKFILL for feat_fatigue_load
             # Compute as avg_minutes / (days_rest + 0.5) when missing
             if col == 'feat_fatigue_load' and (raw is None or raw == -1.0):
                 try:
@@ -5124,7 +5367,7 @@ class Tracker:
                 except Exception:
                     raw = 0.0
 
-            # 🚀 LAZY BACKFILL for feat_form_gap
+            #  LAZY BACKFILL for feat_form_gap
             # Compute as (l10_avg - season_avg) / max(1.0, season_avg)
             if col == 'feat_form_gap' and (raw is None or raw == -1.0):
                 try:
@@ -5315,6 +5558,15 @@ class Tracker:
             'exportable_to_csv': exportable
         }
 
+    def update_stake(self, bet_id: int, new_stake: float):
+        """Update the stake for a specific bet."""
+        current_bets = self.get_bets()
+        for bet in current_bets:
+            if bet.get('id') == bet_id:
+                bet['stake'] = new_stake
+                break
+        self._save(current_bets)
+
 
 class ParlayTracker: 
     """Tracks parlay bets."""
@@ -5457,33 +5709,33 @@ def render_data_quality_card(result: AnalysisResult):
     color = grade_colors.get(dq.grade, 'gray')
     
     # Always show data sources panel for transparency
-    with st.expander(f"📡 Data Quality: :{color}[{dq.grade}] ({dq.score:.0f}/100)", expanded=False):
+    with st.expander(f" Data Quality: :{color}[{dq.grade}] ({dq.score:.0f}/100)", expanded=False):
         # Data Sources Status
-        st.markdown("**📊 Data Sources:**")
+        st.markdown("** Data Sources:**")
         col1, col2 = st.columns(2)
         
         with col1:
             # Team Stats
             if dq.missing_team_stats:
-                st.markdown("❌ **Team Stats:** Unavailable")
+                st.markdown(" **Team Stats:** Unavailable")
             elif dq.team_stats_age_hours > 24:
-                st.markdown(f"⚠️ **Team Stats:** {dq.team_stats_age_hours:.0f}h old")
+                st.markdown(f" **Team Stats:** {dq.team_stats_age_hours:.0f}h old")
             else:
-                st.markdown("✅ **Team Stats:** Fresh (<24h)")
+                st.markdown(" **Team Stats:** Fresh (<24h)")
         
         with col2:
             # Sample Size
             if features.games_played >= 15:
-                st.markdown(f"✅ **Sample Size:** {features.games_played} games")
+                st.markdown(f" **Sample Size:** {features.games_played} games")
             elif features.games_played >= 10:
-                st.markdown(f"⚠️ **Sample Size:** {features.games_played} games")
+                st.markdown(f" **Sample Size:** {features.games_played} games")
             else:
-                st.markdown(f"❌ **Sample Size:** {features.games_played} games (small)")
+                st.markdown(f" **Sample Size:** {features.games_played} games (small)")
         
         # Show warnings if any
         if dq.has_issues:
             st.markdown("---")
-            st.caption("**⚠️ Fallbacks Used:**")
+            st.caption("** Fallbacks Used:**")
             
             flags = []
             if dq.used_default_pace:
@@ -5501,7 +5753,7 @@ def render_data_quality_card(result: AnalysisResult):
                 st.write(", ".join(flags))
             
             for warning in dq.warnings:
-                st.markdown(f"• {warning}")
+                st.markdown(f" {warning}")
 
 
 def render_ticket_card(result: 'AnalysisResult', bankroll: float, bankroll_enabled: bool = True):
@@ -5531,7 +5783,7 @@ def render_ticket_card(result: 'AnalysisResult', bankroll: float, bankroll_enabl
 
     is_over = decision.recommended_side == 'OVER'
     side_color = '#00c853' if is_over else '#f44336'
-    side_icon = '📈' if is_over else '📉'
+    side_icon = '' if is_over else ''
     
     # Get predicted values
     predicted_mean = decision.predicted_mean
@@ -5569,11 +5821,11 @@ def render_ticket_card(result: 'AnalysisResult', bankroll: float, bankroll_enabl
 <div style="font-size: 10px; color: #888;">Predicted</div>
 </div>
 <div style="background: rgba(255,255,255,0.05); border-radius: 8px; padding: 10px;">
-<div style="font-size: 18px; font-weight: 700; color: #aaa;">±{predicted_std:.1f}</div>
+<div style="font-size: 18px; font-weight: 700; color: #aaa;">{predicted_std:.1f}</div>
 <div style="font-size: 10px; color: #888;">Std Dev</div>
 </div>
 <div style="background: rgba(255,255,255,0.05); border-radius: 8px; padding: 10px;">
-<div style="font-size: 18px; font-weight: 700; color: white;">{"₱" + f"{decision.kelly_stake:.0f}" if bankroll_enabled else "—"}</div>
+<div style="font-size: 18px; font-weight: 700; color: white;">{"" + f"{decision.kelly_stake:.0f}" if bankroll_enabled else ""}</div>
 <div style="font-size: 10px; color: #888;">{"Stake" if bankroll_enabled else "N/A"}</div>
 </div>
 </div>
@@ -5584,7 +5836,7 @@ def render_ticket_card(result: 'AnalysisResult', bankroll: float, bankroll_enabl
 
     st.markdown(ticket_html, unsafe_allow_html=True)
     if projection.ml_prob is not None:
-        with st.expander("🧠 ML Decoder", expanded=False):
+        with st.expander(" ML Decoder", expanded=False):
             render_ml_decoder(result)
 
 
@@ -5597,12 +5849,12 @@ def render_ml_decoder(result: AnalysisResult):
     
     # ROW 0: ML MODEL INFO (V18 - Calibration Details)
     if ml_details and ml_details.get('has_model'):
-        st.caption("🤖 **ML Model Info**")
+        st.caption(" **ML Model Info**")
         m1, m2, m3, m4 = st.columns(4)
         
         model_group = ml_details.get('model_group', 'universal')
-        group_emoji = {'scoring': '🏀', 'counting': '📊', 'combo': '🔗', 'rare': '💎', 'universal': '🌐'}
-        m1.metric("Model", f"{group_emoji.get(model_group, '🤖')} {model_group.title()}")
+        group_emoji = {'scoring': '', 'counting': '', 'combo': '', 'rare': '', 'universal': ''}
+        m1.metric("Model", f"{group_emoji.get(model_group, '')} {model_group.title()}")
         
         raw_prob = ml_details.get('raw_prob')
         if raw_prob is not None:
@@ -5615,12 +5867,12 @@ def render_ml_decoder(result: AnalysisResult):
             m3.metric("Calibrated", f"{calibrated_prob:.1%}", delta_str)
             
         has_calib = ml_details.get('has_calibrator', False)
-        m4.metric("Calibrator", "✅ Active" if has_calib else "❌ None")
+        m4.metric("Calibrator", " Active" if has_calib else " None")
         
         st.divider()
     
     # ROW 1: KEY STATS
-    st.caption("📊 **Key Stats**")
+    st.caption(" **Key Stats**")
     r1, r2, r3 = st.columns(3)
     
     with r1:  # Volatility (CV from std/ema)
@@ -5635,7 +5887,7 @@ def render_ml_decoder(result: AnalysisResult):
         st.metric("Spread", f"{features.spread:.1f}")
     
     # ROW 2: KEY FACTORS (V20 EMPIRICAL)
-    st.caption("📊 **Key Factors**")
+    st.caption(" **Key Factors**")
     e1, e2, e3, e4 = st.columns(4)
     e1.metric("Avg Min", f"{features.avg_minutes:.1f}")
     e2.metric("Opp DRTG", f"{features.opponent_drtg_season:.1f}")
@@ -5664,7 +5916,7 @@ def render_recommendation_card(result: AnalysisResult, bankroll: float):
     # --- 1. HEADER ---
     
     # V20 EMPIRICAL: Display ML recommendation directly
-    st.markdown(f"### {decision.recommended_side} {result.line} — :{ev_color}[EV: {ev:+.1%}]")
+    st.markdown(f"### {decision.recommended_side} {result.line}  :{ev_color}[EV: {ev:+.1%}]")
     
     # --- 2. KEY METRICS ---
     
@@ -5672,7 +5924,7 @@ def render_recommendation_card(result: AnalysisResult, bankroll: float):
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Win Prob", f"{decision.probability:.0%}")
         c2.metric("EV", f"{decision.expected_value:+.1%}")
-        c3.metric("Stake", f"₱{decision.kelly_stake:.0f}", f"{decision.kelly_fraction:.1%}")
+        c3.metric("Stake", f"{decision.kelly_stake:.0f}", f"{decision.kelly_fraction:.1%}")
         
         # V20 EMPIRICAL: Display raw probability - no categorical labels
         c4.metric("ML P(Over)", f"{projection.ml_prob:.0%}")
@@ -5682,15 +5934,15 @@ def render_recommendation_card(result: AnalysisResult, bankroll: float):
         c1, c2, c3 = st.columns(3)
         c1.metric("Win Prob", f"{decision.probability:.0%}")
         c2.metric("EV", f"{decision.expected_value:+.1%}")
-        c3.metric("Stake", f"₱{decision.kelly_stake:.0f}", f"{decision.kelly_fraction:.1%}")
+        c3.metric("Stake", f"{decision.kelly_stake:.0f}", f"{decision.kelly_fraction:.1%}")
     
     # --- 3. V19 SIGNAL DECODER (STREAMLINED) ---
     
-    with st.expander("🧠 ML Signal Decoder", expanded=False):
+    with st.expander(" ML Signal Decoder", expanded=False):
         # V20.2 EMPIRICAL: Display raw observables only - NO categorical labels
         # The ML model interprets these values; humans should not add labels
         
-        st.caption("📊 **Raw Observables (Model Inputs)**")
+        st.caption(" **Raw Observables (Model Inputs)**")
         r1, r2, r3 = st.columns(3)
         
         with r1:
@@ -5706,7 +5958,7 @@ def render_recommendation_card(result: AnalysisResult, bankroll: float):
         st.divider()
 
         # V20: Raw numeric values only - no categorical interpretation
-        st.caption("📈 **Feature Values**")
+        st.caption(" **Feature Values**")
         d1, d2, d3 = st.columns(3)
         
         with d1:
@@ -5720,7 +5972,7 @@ def render_recommendation_card(result: AnalysisResult, bankroll: float):
         
         # V20.2 NEW: Pace and trend features
         st.divider()
-        st.caption("🆕 **V20.2 Features**")
+        st.caption(" **V20.2 Features**")
         p1, p2, p3 = st.columns(3)
         
         with p1:
@@ -5730,7 +5982,7 @@ def render_recommendation_card(result: AnalysisResult, bankroll: float):
             st.metric("Team Pace", f"{features.team_pace:.1f}")
             
         with p3:
-            trend_color = "🔺" if features.trend_5g > 0 else "🔻" if features.trend_5g < 0 else "➡️"
+            trend_color = "" if features.trend_5g > 0 else "" if features.trend_5g < 0 else ""
             st.metric("Trend 5G", f"{trend_color} {features.trend_5g:+.2f}")
         
         h1, h2 = st.columns(2)
@@ -5788,9 +6040,9 @@ def render_distribution_chart(result: AnalysisResult):
 
 def render_backtest_tab(orchestrator):
     """Render compact backtesting tab with Form Optimization & Bug Fixes."""
-    st.markdown("### 📊 Model Backtest")
+    st.markdown("###  Model Backtest")
     
-    # 🚀 START FORM
+    #  START FORM
     with st.form(key='backtest_form'):
         col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
@@ -5803,7 +6055,7 @@ def render_backtest_tab(orchestrator):
         with col3:
             bt_days = st.number_input("Games", 10, 50, 30, key="bt_days")
         
-        with st.expander("⚙️ Advanced", expanded=False):
+        with st.expander(" Advanced", expanded=False):
             c1, c2, c3 = st.columns(3)
             with c1:
                 bt_lookback = st.slider("Lookback", 5, 20, 15, key="bt_lookback")
@@ -5812,9 +6064,9 @@ def render_backtest_tab(orchestrator):
             with c3:
                 bt_spread = st.number_input("Spread", -20.0, 20.0, 0.0, 0.5, key="bt_spread")
         
-        submitted = st.form_submit_button("🚀 Run Backtest", type="primary")
+        submitted = st.form_submit_button(" Run Backtest", type="primary")
 
-    # 🛑 LOGIC EXECUTION
+    #  LOGIC EXECUTION
     if submitted:
         if not bt_player:
             st.error("Please select a player to backtest.")
@@ -5846,7 +6098,7 @@ def render_backtest_tab(orchestrator):
                 # Save to session state so it survives refreshes
                 st.session_state['last_backtest_summary'] = summary
 
-    # 📊 RESULTS DISPLAY (Persists via session state)
+    #  RESULTS DISPLAY (Persists via session state)
     if 'last_backtest_summary' in st.session_state:
         summary = st.session_state['last_backtest_summary']
         
@@ -5855,13 +6107,13 @@ def render_backtest_tab(orchestrator):
             st.warning("No results to display.")
             return
 
-        # 🛡️ FIX 1: Get player name safely from the DATAFRAME, not the widget
+        #  FIX 1: Get player name safely from the DATAFRAME, not the widget
         try:
             safe_player_name = summary.results_df['player'].iloc[0]
         except:
             safe_player_name = "Backtest_Result"
             
-        st.success(f"✅ {summary.total_predictions} predictions analyzed for {safe_player_name}")
+        st.success(f" {summary.total_predictions} predictions analyzed for {safe_player_name}")
         
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Win Rate", f"{summary.win_rate:.0%}")
@@ -5869,7 +6121,7 @@ def render_backtest_tab(orchestrator):
         c3.metric("Brier", f"{summary.brier_score:.3f}")
         c4.metric("Record", f"{summary.wins}-{summary.losses}")
         
-        with st.expander("📊 Detailed Results", expanded=True):
+        with st.expander(" Detailed Results", expanded=True):
             if summary.calibration_by_bucket:
                 st.markdown("**Calibration:**")
                 cal_data = []
@@ -5880,7 +6132,7 @@ def render_backtest_tab(orchestrator):
                         'Actual': f"{data['actual']:.0%}",
                         'N': data['count'],
                     })
-                # 🛡️ FIX 2: Replace use_container_width with width="stretch"
+                #  FIX 2: Replace use_container_width with width="stretch"
                 st.dataframe(pd.DataFrame(cal_data), hide_index=True, width="stretch")
             
             if summary.grade_performance:
@@ -5893,16 +6145,16 @@ def render_backtest_tab(orchestrator):
                         'Win%': f"{data['win_rate']:.0%}",
                         'ROI': f"{data['roi']:+.1%}"
                     })
-                # 🛡️ FIX 2: Replace use_container_width with width="stretch"
+                #  FIX 2: Replace use_container_width with width="stretch"
                 st.dataframe(pd.DataFrame(grade_data), hide_index=True, width="stretch")
             
-            # 🛡️ FIX 2: Replace use_container_width with width="stretch"
+            #  FIX 2: Replace use_container_width with width="stretch"
             st.dataframe(summary.results_df, hide_index=True, width="stretch")
             
             csv = summary.results_df.to_csv(index=False)
-            # 🛡️ FIX 1: Use the safe_player_name variable we created above
+            #  FIX 1: Use the safe_player_name variable we created above
             st.download_button(
-                "📥 Download CSV", 
+                " Download CSV", 
                 csv, 
                 f"backtest_{safe_player_name.replace(' ', '_')}.csv", 
                 "text/csv"
@@ -5946,7 +6198,7 @@ def render_watchlist_tab(orchestrator):
     1. Uses st.form to batch inputs (No more refreshing while typing).
     2. Uses cached helper to calculate stats (No more freezing).
     """
-    st.markdown("### 👀 Watchlist")
+    st.markdown("###  Watchlist")
     
     # --- LOAD DATA ---
     if 'watchlist' not in st.session_state:
@@ -5956,7 +6208,7 @@ def render_watchlist_tab(orchestrator):
     with st.container(border=True):
         st.caption("Add to Watchlist")
         
-        # 🚀 THE FIX: Wrapping inputs in a form stops the "Triple Reload"
+        #  THE FIX: Wrapping inputs in a form stops the "Triple Reload"
         with st.form(key="add_watchlist_form", clear_on_submit=True):
             c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
             
@@ -5973,9 +6225,9 @@ def render_watchlist_tab(orchestrator):
                 target_line = st.number_input("Line", 0.5, 100.0, 15.5, 0.5)
 
             with c4:
-                st.write("") # Spacer for alignment
+                st.write(" ")  # Spacer for alignment (non-empty for accessibility)
                 # The form only submits when this is clicked
-                submit_add = st.form_submit_button("Add ➕", use_container_width="stretch")
+                submit_add = st.form_submit_button("Add ", use_container_width="stretch")
 
         # Logic runs ONLY on submit
         if submit_add:
@@ -5993,7 +6245,7 @@ def render_watchlist_tab(orchestrator):
                     save_watchlist(st.session_state.watchlist)
                     st.rerun()
             else:
-                st.warning("⚠️ Please select a player.")
+                st.warning(" Please select a player.")
 
     # --- SECTION 2: VIEW LIST ---
     if not st.session_state.watchlist:
@@ -6003,7 +6255,7 @@ def render_watchlist_tab(orchestrator):
         h1, h2, h3, h4 = st.columns([2, 1, 2, 0.5])
         h1.caption("Player")
         h2.caption("Target Line")
-        h3.caption("Trends (Cached ⚡)")
+        h3.caption("Trends (Cached )")
         
         # Create a copy to iterate safely
         current_list = st.session_state.watchlist.copy()
@@ -6036,7 +6288,7 @@ def render_watchlist_tab(orchestrator):
                         save_watchlist(st.session_state.watchlist)
 
                 with c3:
-                    # 🚀 CACHED LOOKUP (Fast)
+                    #  CACHED LOOKUP (Fast)
                     p_obj = next((p for p in all_players if p['full_name'] == item['player']), None)
                     
                     if p_obj:
@@ -6052,13 +6304,13 @@ def render_watchlist_tab(orchestrator):
                             ema = stats['ema']
                             offset = ema - new_line
                             off_color = "green" if offset > 0 else "red"
-                            off_sym = "↑" if offset > 0 else "↓"
+                            off_sym = "" if offset > 0 else ""
                             
                             l5 = stats['l5_hit_rate']
-                            if l5 >= 0.8: icon, color = "🔥", "green"
-                            elif l5 >= 0.6: icon, color = "✅", "green"
-                            elif l5 >= 0.4: icon, color = "😐", "orange"
-                            else: icon, color = "❄️", "red"
+                            if l5 >= 0.8: icon, color = "", "green"
+                            elif l5 >= 0.6: icon, color = "", "green"
+                            elif l5 >= 0.4: icon, color = "", "orange"
+                            else: icon, color = "", "red"
 
                             st.markdown(f"**EMA:** {ema:.1f} :{off_color}[{offset:+.1f}{off_sym}]")
                             st.markdown(f"**L5:** :{color}[{l5:.0%}] {icon}")
@@ -6068,17 +6320,18 @@ def render_watchlist_tab(orchestrator):
                         st.caption("Player ID not found")
 
                 with c4:
-                    if st.button("🗑️", key=f"del_{item_id}"):
+                    # Accessibility: provide a hidden label instead of empty string
+                    if st.button("Remove watchlist item", key=f"del_{item_id}"):
                         st.session_state.watchlist.pop(i)
                         save_watchlist(st.session_state.watchlist)
                         st.rerun()
 
 def render_parlay_tab(parlay_tracker: ParlayTracker, bankroll: float, bankroll_enabled: bool = True):
     """Render compact parlay tab."""
-    st.markdown("### 🎲 Parlay Builder")
+    st.markdown("###  Parlay Builder")
     
     if not bankroll_enabled:
-        st.info("📊 **Data Collection Mode** — Parlay stakes disabled. Toggle Bankroll Mode in sidebar to enable.")
+        st.info(" **Data Collection Mode**  Parlay stakes disabled. Toggle Bankroll Mode in sidebar to enable.")
     
     builder = st.session_state.get('parlay_builder', [])
     
@@ -6092,14 +6345,14 @@ def render_parlay_tab(parlay_tracker: ParlayTracker, bankroll: float, bankroll_e
             with st.container(border=True):
                 c1, c2 = st.columns([5, 1])
                 c1.markdown(f"**{leg['player']}** {leg['side']} {leg['line']} @ {leg['odds']:.2f}")
-                if c2.button("❌", key=f"remove_leg_{i}"):
+                if c2.button("", key=f"remove_leg_{i}"):
                     st.session_state.parlay_builder.pop(i)
                     st.rerun()
         
         c1, c2, c3 = st.columns(3)
         c1.metric("Odds", f"{combined_odds:.2f}")
         c2.metric("Prob", f"{combined_prob:.1%}")
-        c3.metric("Payout", f"₱{50 * combined_odds:,.0f}")
+        c3.metric("Payout", f"{50 * combined_odds:,.0f}")
         
         c1, c2 = st.columns(2)
         with c1:
@@ -6107,58 +6360,59 @@ def render_parlay_tab(parlay_tracker: ParlayTracker, bankroll: float, bankroll_e
                 parlay_stake = st.number_input("Stake", 10.0, float(bankroll), 50.0, 10.0, key="parlay_stake")
             else:
                 parlay_stake = 0.0
-                st.caption("📊 Stake tracking disabled")
+                st.caption(" Stake tracking disabled")
         with c2:
             parlay_name = st.text_input("Name", placeholder="Optional...", key="parlay_name")
         
         c1, c2 = st.columns(2)
-        if c1.button("✅ Create", type="primary", use_container_width="stretch"):
+        if c1.button(" Create", type="primary", use_container_width="stretch"):
             parlay_tracker.create_parlay(legs=builder.copy(), stake=parlay_stake, name=parlay_name)
             st.session_state.parlay_builder = []
-            st.toast("Parlay created!", icon="🎲")
+            st.toast("Parlay created!")
             st.rerun()
-        if c2.button("🗑️ Clear", use_container_width="stretch"):
+        if c2.button(" Clear", use_container_width="stretch"):
             st.session_state.parlay_builder = []
             st.rerun()
     else:
         st.info("Add legs from Analyze tab.")
     
     # History
-    with st.expander("📜 History", expanded=False):
+    with st.expander(" History", expanded=False):
         stats = parlay_tracker.get_stats()
         if stats['total_parlays'] > 0:
             c1, c2, c3 = st.columns(3)
             c1.metric("Win%", f"{stats['win_rate']:.0%}")
-            c2.metric("P/L", f"₱{stats['total_profit']:+,.0f}")
+            c2.metric("P/L", f"{stats['total_profit']:+,.0f}")
             c3.metric("Legs", f"{stats['total_legs_hit']}/{stats['total_legs']}")
         
         parlays = parlay_tracker.get_parlays()
         for parlay in sorted(parlays, key=lambda x: x['id'], reverse=True):
             result = parlay['result']
-            icon = "✅" if result == 'Win' else "❌" if result == 'Loss' else "⏳"
+            icon = "" if result == 'Win' else "" if result == 'Loss' else ""
             
             with st.container(border=True):
                 col1, col2, col3 = st.columns([3, 1, 0.5])
                 with col1:
                     parlay_name = parlay.get('name') or f"#{parlay['id']}"
                     st.markdown(f"{icon} **{parlay_name}** ({parlay['num_legs']})")
-                    st.caption(f"₱{parlay['stake']:.0f} @ {parlay['combined_odds']:.2f}")
+                    st.caption(f"{parlay['stake']:.0f} @ {parlay['combined_odds']:.2f}")
                 with col2:
                     if result == 'Win': 
-                        st.markdown(f"**+₱{parlay['actual_payout'] - parlay['stake']:,.0f}**")
+                        st.markdown(f"**+{parlay['actual_payout'] - parlay['stake']:,.0f}**")
                     elif result == 'Loss':
-                        st.markdown(f"**-₱{parlay['stake']:,.0f}**")
+                        st.markdown(f"**-{parlay['stake']:,.0f}**")
                     else:
-                        st.markdown(f"*₱{parlay['potential_profit']:,.0f}*")
+                        st.markdown(f"*{parlay['potential_profit']:,.0f}*")
                 with col3:
-                    if st.button("🗑️", key=f"del_parlay_{parlay['id']}"):
+                    # Accessibility: give button a descriptive (hidden) label
+                    if st.button("Delete parlay", key=f"del_parlay_{parlay['id']}"):
                         parlay_tracker.delete_parlay(parlay['id'])
                         st.rerun()
                 
                 with st.expander(f"Legs ({parlay['legs_hit']}/{parlay['legs_decided']})"):
                     for i, leg in enumerate(parlay['legs']):
                         leg_result = leg.get('result', 'Pending')
-                        leg_icon = "✅" if leg_result == 'Win' else "❌" if leg_result == 'Loss' else "🔄" if leg_result == 'Push' else "⏳"
+                        leg_icon = "" if leg_result == 'Win' else "" if leg_result == 'Loss' else "" if leg_result == 'Push' else ""
                         
                         c1, c2 = st.columns([4, 1])
                         c1.markdown(f"{leg_icon} {leg['player']} {leg['side']} {leg['line']}")
@@ -6172,21 +6426,21 @@ def render_parlay_tab(parlay_tracker: ParlayTracker, bankroll: float, bankroll_e
                             parlay_tracker.update_leg_result(parlay['id'], i, new_result)
                             st.rerun()
         
-        if st.button("🗑️ Clear All", key="clear_parlays"):
+        if st.button(" Clear All", key="clear_parlays"):
             parlay_tracker.clear_history()
             st.rerun()
 
 
 def render_ml_data_tab(tracker: Tracker):
     """Render enhanced ML data tab with better preview."""
-    st.markdown("### 🤖 ML Training Data")
+    st.markdown("###  ML Training Data")
     
     csv_path = DATA_DIR / "ml_training_data.csv"
     
     # =========================================================================
     # SECTION 1: THEORETICAL PERFORMANCE (The Math - from CSV)
     # =========================================================================
-    with st.expander("📐 Theoretical Performance (The Math)", expanded=False):
+    with st.expander(" Theoretical Performance (The Math)", expanded=False):
         st.caption("Based on simulation data from ml_training_data.csv")
         
         if csv_path.exists():
@@ -6200,7 +6454,7 @@ def render_ml_data_tab(tracker: Tracker):
                         raw_line_count = sum(1 for _ in f)
                     if raw_line_count > len(csv_df) + 10:
                         skipped_warning = True
-                        st.warning(f"⚠️ CSV has {raw_line_count - len(csv_df) - 1} corrupted rows. Click 'Repair CSV' below.")
+                        st.warning(f" CSV has {raw_line_count - len(csv_df) - 1} corrupted rows. Click 'Repair CSV' below.")
                 except:
                     pass
                 
@@ -6247,7 +6501,7 @@ def render_ml_data_tab(tracker: Tracker):
                         quality_roi = 0
                     
                     # Display: Theoretical (Raw) vs Quality (Filtered)
-                    st.markdown("**📊 Theoretical Win Rate (All Sim Bets)**")
+                    st.markdown("** Theoretical Win Rate (All Sim Bets)**")
                     th_c1, th_c2, th_c3, th_c4 = st.columns(4)
                     th_c1.metric("Total Samples", f"{total_sim_bets:,}")
                     th_c2.metric("Win Rate", f"{sim_win_rate:.1%}")
@@ -6258,7 +6512,7 @@ def render_ml_data_tab(tracker: Tracker):
                     th_c4.metric("ROI", f"{sim_roi:+.1f}%")
                     
                     st.markdown("---")
-                    st.markdown("**🎯 Quality Units (Offset Rule - V16)**")
+                    st.markdown("** Quality Units (Offset Rule - V16)**")
                     st.caption("Offset Rule: Only bet when projection agrees with side (53.8% win rate, +2.8% ROI)")
                     q_c1, q_c2, q_c3, q_c4 = st.columns(4)
                     q_c1.metric("Filtered Bets", f"{quality_total:,}")
@@ -6273,24 +6527,24 @@ def render_ml_data_tab(tracker: Tracker):
                 
                 # Repair button
                 if skipped_warning:
-                    if st.button("🔧 Repair CSV", type="primary"):
+                    if st.button(" Repair CSV", type="primary"):
                         clean_df = pd.read_csv(csv_path, on_bad_lines='skip')
                         backup_path = DATA_DIR / "ml_training_data_backup.csv"
                         import shutil
                         shutil.copy(csv_path, backup_path)
                         clean_df.to_csv(csv_path, index=False)
-                        st.success(f"✅ Repaired! Kept {len(clean_df):,} valid rows. Backup saved to {backup_path.name}")
+                        st.success(f" Repaired! Kept {len(clean_df):,} valid rows. Backup saved to {backup_path.name}")
                         st.rerun()
                     
             except Exception as e:
                 st.warning(f"Could not read CSV file: {e}")
         else:
-            st.info("📂 No training data file found. Generate data using backtest or track bets to create one.")
+            st.info(" No training data file found. Generate data using backtest or track bets to create one.")
     
     # =========================================================================
     # SECTION 2: REAL PERFORMANCE (The Human - from tracker.history ONLY)
     # =========================================================================
-    with st.expander("🧑 Real Performance (Your Actual Bets)", expanded=True):
+    with st.expander(" Real Performance (Your Actual Bets)", expanded=True):
         st.caption("Based on YOUR tracked bets in bet_tracker.json - this is what actually happened")
         
         tracker_bets = tracker.get_bets()
@@ -6330,10 +6584,10 @@ def render_ml_data_tab(tracker: Tracker):
             # Show pending count
             pending_bets = [b for b in tracker_bets if b.get('result', 'Pending') == 'Pending']
             if len(pending_bets) > 0:
-                st.caption(f"📋 {len(pending_bets)} pending bets awaiting results")
+                st.caption(f" {len(pending_bets)} pending bets awaiting results")
             
             # Real performance chart (cumulative units over time)
-            st.markdown("**📈 Cumulative Units Over Time**")
+            st.markdown("** Cumulative Units Over Time**")
             
             # Sort by date and calculate cumulative units
             chart_data = []
@@ -6363,7 +6617,7 @@ def render_ml_data_tab(tracker: Tracker):
                 line_color = "#00ff00" if cumulative >= 0 else "#ff4444"
                 st.line_chart(chart_df.set_index('date')['units'], color=line_color)
         else:
-            st.info("📋 No decided bets yet. Track bets and update their results to see your real performance.")
+            st.info(" No decided bets yet. Track bets and update their results to see your real performance.")
     
     st.markdown("---")
     
@@ -6381,7 +6635,7 @@ def render_ml_data_tab(tracker: Tracker):
         c4.metric("Win Rate", f"{win_rate:.0%}")
         
         # Data quality summary
-        with st.expander("📊 Data Quality Summary", expanded=False):
+        with st.expander(" Data Quality Summary", expanded=False):
             sq1, sq2, sq3 = st.columns(3)
             
             # Feature columns count
@@ -6432,20 +6686,20 @@ def render_ml_data_tab(tracker: Tracker):
                 
                 # Losses
                 loss_cols = st.columns(4)
-                loss_cols[0].write(f"💔 Bad Beat: {quality_counts.get('bad_beat', 0)}")
-                loss_cols[1].write(f"😤 Close Loss: {quality_counts.get('close_loss', 0)}")
-                loss_cols[2].write(f"📉 Clear Loss: {quality_counts.get('clear_loss', 0)}")
-                loss_cols[3].write(f"🚫 Bad Read: {quality_counts.get('bad_read', 0)}")
+                loss_cols[0].write(f" Bad Beat: {quality_counts.get('bad_beat', 0)}")
+                loss_cols[1].write(f" Close Loss: {quality_counts.get('close_loss', 0)}")
+                loss_cols[2].write(f" Clear Loss: {quality_counts.get('clear_loss', 0)}")
+                loss_cols[3].write(f" Bad Read: {quality_counts.get('bad_read', 0)}")
                 
                 # Wins
                 win_cols = st.columns(4)
-                win_cols[0].write(f"😅 Sweat Win: {quality_counts.get('sweat_win', 0)}")
-                win_cols[1].write(f"✌️ Close Win: {quality_counts.get('close_win', 0)}")
-                win_cols[2].write(f"💪 Solid Win: {quality_counts.get('solid_win', 0)}")
-                win_cols[3].write(f"🔥 Blowout Win: {quality_counts.get('blowout_win', 0)}")
+                win_cols[0].write(f" Sweat Win: {quality_counts.get('sweat_win', 0)}")
+                win_cols[1].write(f" Close Win: {quality_counts.get('close_win', 0)}")
+                win_cols[2].write(f" Solid Win: {quality_counts.get('solid_win', 0)}")
+                win_cols[3].write(f" Blowout Win: {quality_counts.get('blowout_win', 0)}")
         
         # Tabbed data views
-        view_tab1, view_tab2, view_tab3 = st.tabs(["📋 Summary", "🔢 Features", "📄 Raw Data"])
+        view_tab1, view_tab2, view_tab3 = st.tabs([" Summary", " Features", " Raw Data"])
         
         with view_tab1:
             # Key columns for quick overview
@@ -6490,20 +6744,20 @@ def render_ml_data_tab(tracker: Tracker):
         
         with view_tab3:
             # Full raw data with column count
-            st.caption(f"All {len(training_df.columns)} columns × {len(training_df)} rows")
+            st.caption(f"All {len(training_df.columns)} columns  {len(training_df)} rows")
             st.dataframe(safe_clean_for_arrow(training_df.tail(30)), hide_index=True, width="stretch")
         
         # Download buttons
         st.markdown("---")
         dc1, dc2, dc3 = st.columns(3)
         csv_data = training_df.to_csv(index=False)
-        dc1.download_button("📥 Download CSV", csv_data, "ml_training_data.csv", "text/csv", use_container_width="stretch")
+        dc1.download_button(" Download CSV", csv_data, "ml_training_data.csv", "text/csv", use_container_width="stretch")
         json_data = training_df.to_json(orient='records', indent=2)
-        dc2.download_button("📥 Download JSON", json_data, "ml_training_data.json", "application/json", use_container_width="stretch")
+        dc2.download_button(" Download JSON", json_data, "ml_training_data.json", "application/json", use_container_width="stretch")
         
         # Show column list
         with dc3:
-            if st.button("📋 Show Columns", use_container_width="stretch"):
+            if st.button(" Show Columns", use_container_width="stretch"):
                 st.session_state['show_ml_cols'] = not st.session_state.get('show_ml_cols', False)
         
         if st.session_state.get('show_ml_cols', False):
@@ -6518,10 +6772,10 @@ def render_ml_data_tab(tracker: Tracker):
                     if cols:
                         st.markdown(f"**{cat}:** `{'`, `'.join(cols)}`")
         
-        st.caption(f"💡 Need 100-200+ samples for XGBoost. Currently: {feature_stats['decided_with_features']}")
+        st.caption(f" Need 100-200+ samples for XGBoost. Currently: {feature_stats['decided_with_features']}")
     else: 
         c4.metric("Win Rate", "N/A")
-        st.info("Track bets to collect training data. Log bets with the 📝 Track button after analysis.")
+        st.info("Track bets to collect training data. Log bets with the  Track button after analysis.")
 
 
 def validate_training_data(df: pd.DataFrame) -> Dict[str, Any]:
@@ -6572,7 +6826,7 @@ def validate_training_data(df: pd.DataFrame) -> Dict[str, Any]:
         mismatches = (df_check['hit'] != df_check['computed_hit']).sum()
         stats['label_mismatches'] = mismatches
         if mismatches > 0:
-            issues.append(f"⚠️ {mismatches} rows ({mismatches/len(df)*100:.1f}%) have incorrect 'hit' labels!")
+            issues.append(f" {mismatches} rows ({mismatches/len(df)*100:.1f}%) have incorrect 'hit' labels!")
     
     # 6. Check for reasonable feature ranges (V20.3 STRICT - exact feature names with 27 features)
     range_checks = {
@@ -6679,7 +6933,7 @@ def render_train_model_tab():
     data_path = DATA_DIR / "ml_training_data.csv"
     
     if not data_path.exists():
-        st.error("❌ Training data not found.")
+        st.error(" Training data not found.")
         st.warning("**Action Required:** Go to 'Generate Dataset' tab and create a new dataset.")
         return
 
@@ -6694,10 +6948,10 @@ def render_train_model_tab():
     V20_REQUIRED_METADATA = ['player', 'market', 'line', 'date']
 
     # Data Validation Section
-    st.markdown("#### 🔍 V20.3 Schema Validation")
+    st.markdown("####  V20.3 Schema Validation")
     st.caption(f"Required features: {len(V20_REQUIRED_FEATURES)} (V20.3 empirical)")
     
-    if st.button("🔬 Validate Dataset", type="secondary"):
+    if st.button(" Validate Dataset", type="secondary"):
         with st.spinner("Validating against V20.3 schema..."):
             df = pd.read_csv(data_path)
             
@@ -6707,16 +6961,16 @@ def render_train_model_tab():
             # 1. Check required features (NO inference, NO remapping)
             missing_features = [f for f in V20_REQUIRED_FEATURES if f not in df.columns]
             if missing_features:
-                errors.append(f"❌ Missing V20.3 features ({len(missing_features)}): {', '.join(missing_features)}")
+                errors.append(f" Missing V20.3 features ({len(missing_features)}): {', '.join(missing_features)}")
             
             # 2. Check regression target exists (NO fallback to classification)
             if V20_REQUIRED_TARGET not in df.columns:
-                errors.append(f"❌ Missing regression target: '{V20_REQUIRED_TARGET}'")
+                errors.append(f" Missing regression target: '{V20_REQUIRED_TARGET}'")
             
             # 3. Check metadata columns
             missing_meta = [m for m in V20_REQUIRED_METADATA if m not in df.columns]
             if missing_meta:
-                errors.append(f"⚠️ Missing metadata: {', '.join(missing_meta)}")
+                errors.append(f" Missing metadata: {', '.join(missing_meta)}")
             
             # 4. Detect legacy/heuristic columns (should NOT exist in V20 data)
             legacy_columns = [
@@ -6726,26 +6980,26 @@ def render_train_model_tab():
             ]
             found_legacy = [c for c in legacy_columns if c in df.columns]
             if found_legacy:
-                errors.append(f"⚠️ Legacy columns detected (invalid for V20): {', '.join(found_legacy)}")
+                errors.append(f" Legacy columns detected (invalid for V20): {', '.join(found_legacy)}")
             
             # === DISPLAY RESULTS ===
             if errors:
-                st.error("❌ **Dataset is INVALID for V20.2 training**")
+                st.error(" **Dataset is INVALID for V20.2 training**")
                 for err in errors:
-                    st.write(f"  • {err}")
+                    st.write(f"   {err}")
                 st.warning("**Action Required:** Regenerate dataset using V20.2 pipeline.")
-                st.caption("Go to 'Generate Dataset' tab → Run generation → Return here to train.")
+                st.caption("Go to 'Generate Dataset' tab  Run generation  Return here to train.")
             else:
-                st.success("✅ **Dataset passes V20.3 schema validation**")
-                st.write(f"  • Rows: {len(df):,}")
-                st.write(f"  • Features: {len(V20_REQUIRED_FEATURES)} (all present)")
-                st.write(f"  • Target: {V20_REQUIRED_TARGET}")
-                st.write(f"  • Players: {df['player'].nunique()}")
-                st.write(f"  • Markets: {df['market'].nunique()}")
+                st.success(" **Dataset passes V20.3 schema validation**")
+                st.write(f"   Rows: {len(df):,}")
+                st.write(f"   Features: {len(V20_REQUIRED_FEATURES)} (all present)")
+                st.write(f"   Target: {V20_REQUIRED_TARGET}")
+                st.write(f"   Players: {df['player'].nunique()}")
+                st.write(f"   Markets: {df['market'].nunique()}")
     
     st.markdown("---")
     
-    if st.button("🏋️ Start Training", type="primary"):
+    if st.button(" Start Training", type="primary"):
         status = st.status("Training in progress...", expanded=True)
         try:
             # 1. Load Data
@@ -6760,22 +7014,22 @@ def render_train_model_tab():
             # Check required features - ALL 24 MUST EXIST
             missing_features = [f for f in V20_REQUIRED_FEATURES if f not in df.columns]
             if missing_features:
-                status.update(label="❌ Schema Validation Failed", state="error")
+                status.update(label=" Schema Validation Failed", state="error")
                 st.error(f"**FATAL:** Missing V20.3 features ({len(missing_features)}):")
                 for f in missing_features:
-                    st.write(f"  • `{f}`")
+                    st.write(f"   `{f}`")
                 st.warning("Dataset is incompatible with V20.3. Regenerate using 'Generate Dataset' tab.")
                 st.info("V20.3 requires 27 features. Your dataset may have an older schema.")
                 return
             
             # Check regression target (NO fallback to classification)
             if V20_REQUIRED_TARGET not in df.columns:
-                status.update(label="❌ Schema Validation Failed", state="error")
+                status.update(label=" Schema Validation Failed", state="error")
                 st.error(f"**FATAL:** Missing regression target '{V20_REQUIRED_TARGET}'")
                 st.warning("V20 requires actual stat values for regression. Regenerate dataset.")
                 return
             
-            status.write(f"✅ Schema validation passed ({len(V20_REQUIRED_FEATURES)} features)")
+            status.write(f" Schema validation passed ({len(V20_REQUIRED_FEATURES)} features)")
             
             # 2. Prepare Data (strict - no fillna inference)
             status.write(f"Processing {len(df)} samples with {len(V20_REQUIRED_FEATURES)} features...")
@@ -6785,7 +7039,7 @@ def render_train_model_tab():
             nan_counts = X.isna().sum()
             if nan_counts.sum() > 0:
                 bad_cols = nan_counts[nan_counts > 0].to_dict()
-                status.update(label="❌ Data Quality Failed", state="error")
+                status.update(label=" Data Quality Failed", state="error")
                 st.error(f"**FATAL:** NaN values in features: {bad_cols}")
                 st.warning("Dataset contains missing values. Regenerate with complete data.")
                 return
@@ -6795,12 +7049,12 @@ def render_train_model_tab():
             
             # Check for NaN in target
             if y.isna().sum() > 0:
-                status.update(label="❌ Data Quality Failed", state="error")
+                status.update(label=" Data Quality Failed", state="error")
                 st.error(f"**FATAL:** {y.isna().sum()} NaN values in target '{V20_REQUIRED_TARGET}'")
                 st.warning("Dataset has missing actual values. Regenerate with complete data.")
                 return
             
-            status.write("✅ Data quality passed (no NaN)")
+            status.write(" Data quality passed (no NaN)")
             
             # 3. Train Model
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -6818,48 +7072,48 @@ def render_train_model_tab():
             r2 = r2_score(y_test, preds)
             
             # 5. Save
-            status.write("💾 Saving model...")
+            status.write(" Saving model...")
             joblib.dump(model, DATA_DIR / "nba_model_v20.pkl")
             joblib.dump(V20_REQUIRED_FEATURES, DATA_DIR / "nba_features_v20.pkl")
             
-            status.update(label="✅ Training Complete!", state="complete")
+            status.update(label=" Training Complete!", state="complete")
             
             st.success("V20.2 Regression Model Trained!")
             c1, c2 = st.columns(2)
             c1.metric("Mean Absolute Error", f"{mae:.2f}")
-            c2.metric("R² Score", f"{r2:.3f}")
+            c2.metric("R Score", f"{r2:.3f}")
             
             st.balloons()
             
         except Exception as e:
-            status.update(label="❌ Training Failed", state="error")
+            status.update(label=" Training Failed", state="error")
             st.error(f"Error: {str(e)}")
 
 def render_guide_tab():
     """Renders the comprehensive user guide - V20 Empirical."""
-    st.markdown("### 📘 User Guide")
+    st.markdown("###  User Guide")
     st.caption(f"V20 Empirical ML | {CURRENT_VERSION}")
 
     # --- SECTION 1: CORE WORKFLOW ---
-    with st.expander("🚀 Quick Start", expanded=True):
+    with st.expander(" Quick Start", expanded=True):
         st.markdown("""
         1. **Analyze:** Pick a player/market, hit "Run Analysis".
         2. **Decide:** Look for **EV+ bets** with probability in the 55-75% zone.
-        3. **Track:** Click **"💾 Track"** to save the bet.
+        3. **Track:** Click **" Track"** to save the bet.
         4. **Resolve:** Next day, mark Win/Loss and enter actual score in **Bets Tab**.
         5. **Train:** With 500+ samples, retrain in **ML Tab** for better predictions.
         """)
 
     # --- SECTION 2: V20 ML ARCHITECTURE ---
-    with st.expander("🤖 V20 ML Architecture", expanded=True):
+    with st.expander(" V20 ML Architecture", expanded=True):
         st.markdown("""
         **Pure Empirical ML Pipeline:**
         
         V20 uses ML as the **sole prediction engine**. No heuristics, no hand-tuned multipliers.
         
         * **Mean Model:** XGBRegressor predicts expected stat value E[stat]
-        * **Variance Model:** Separate XGBRegressor predicts uncertainty σ[stat]
-        * **CDF Probability:** P(Over) = 1 - Φ((line - μ) / σ)
+        * **Variance Model:** Separate XGBRegressor predicts uncertainty [stat]
+        * **CDF Probability:** P(Over) = 1 - ((line - ) / )
         * **Calibration:** Isotonic regression corrects probability biases
         
         **15 Raw Observable Features:**
@@ -6872,7 +7126,7 @@ def render_guide_tab():
         """)
 
     # --- SECTION 3: BET DECISION RULES ---
-    with st.expander("📊 Bet Decision Rules"):
+    with st.expander(" Bet Decision Rules"):
         st.markdown("""
         **The 4 Rules (all must pass):**
         
@@ -6885,15 +7139,15 @@ def render_guide_tab():
            - Above 80% = suspiciously confident, likely mispriced
         
         3. **Positive EV:** Expected Value > 0%
-           - EV = (Prob × Win) - ((1-Prob) × Loss)
+           - EV = (Prob  Win) - ((1-Prob)  Loss)
         
-        4. **Stability:** CV ≤ 30%
+        4. **Stability:** CV  30%
            - CV = std / mean
            - High variance players are harder to predict
         """)
 
     # --- SECTION 4: INTERPRETING THE UI ---
-    with st.expander("🎯 Understanding the Output"):
+    with st.expander(" Understanding the Output"):
         st.markdown("""
         **Ticket Card:**
         - **Win Prob:** CDF-based probability for recommended side
@@ -6905,7 +7159,7 @@ def render_guide_tab():
         - **Model Group:** Which specialized model (scoring/counting/combo/rare)
         - **Raw ML:** Uncalibrated probability from CDF
         - **Calibrated:** After isotonic correction
-        - **Calibrator:** ✅ Active means calibration curve is applied
+        - **Calibrator:**  Active means calibration curve is applied
         
         **Key Factors:**
         - All raw observables that fed into the model
@@ -6913,13 +7167,13 @@ def render_guide_tab():
         """)
 
     # --- SECTION 5: ML TRAINING ---
-    with st.expander("🧠 Training Your Model"):
+    with st.expander(" Training Your Model"):
         st.markdown("""
         **The Training Loop:**
         
         1. **Track Bets:** Log every bet with actual scores
-        2. **Generate Dataset:** ML Tab → Generate Dataset (bulk backtests)
-        3. **Train Models:** ML Tab → Train Brain
+        2. **Generate Dataset:** ML Tab  Generate Dataset (bulk backtests)
+        3. **Train Models:** ML Tab  Train Brain
         4. **Models Created:**
            - `nba_model_{group}.pkl` - Mean regression
            - `nba_variance_{group}.pkl` - Uncertainty model
@@ -6934,7 +7188,7 @@ def render_guide_tab():
 
 def main():
     """Main application entry point."""
-    st.title("🏀 NBA Prop Analyzer")
+    st.title(" NBA Prop Analyzer")
     
     # Initialize session state
     if 'version' not in st. session_state or st.session_state['version'] != CURRENT_VERSION: 
@@ -6954,10 +7208,10 @@ def main():
     
     # Compact Sidebar
     with st. sidebar:
-        st.markdown("### ⚙️ Settings")
+        st.markdown("###  Settings")
         
         # Emergency: Reset caches (clears cached data in Streamlit)
-        if st.button("🗑️ Reset Cache", use_container_width="stretch"):
+        if st.button(" Reset Cache", use_container_width="stretch"):
             try:
                 st.cache_data.clear()
             except Exception:
@@ -6968,28 +7222,28 @@ def main():
             except Exception:
                 pass
             try:
-                st.toast("Cache cleared! Reloading...", icon="🔄")
+                st.toast("Cache cleared! Reloading...")
             except Exception:
                 st.info("Cache cleared! Reloading...")
             time.sleep(1)
             st.rerun()
         
         # Bankroll Mode Toggle
-        bankroll_enabled = st.toggle("💰 Bankroll Mode", value=True, help="Turn off when just gathering data for ML")
+        bankroll_enabled = st.toggle(" Bankroll Mode", value=True, help="Turn off when just gathering data for ML")
         st.session_state.bankroll_enabled = bankroll_enabled
         
         if bankroll_enabled:
-            bankroll = st.number_input("💰 Bankroll (₱)", 100, 1000000, 500)
+            bankroll = st.number_input(" Bankroll ()", 100.0, 1000000.0, 500.0)
             
             # Unit Calculator (1 unit = 1%)
             unit_size = bankroll * 0.01
-            st.caption(f"1u = ₱{unit_size:,.0f} | 5u = ₱{unit_size*5:,.0f}")
+            st.caption(f"1u = {unit_size:,.0f} | 5u = {unit_size*5:,.0f}")
             st.caption("Stakes: A=5u | B=3u | C=1u")
         else:
             bankroll = 0  # No bankroll tracking
             unit_size = 0
-            st.info("📊 Data Collection Mode")
-            st.caption("Stakes hidden • P/L tracking disabled")
+            st.info(" Data Collection Mode")
+            st.caption("Stakes hidden  P/L tracking disabled")
         
         # Quick stats with P/L in units (only show when bankroll enabled)
         if bankroll_enabled:
@@ -6999,10 +7253,10 @@ def main():
                 profit_color = "green" if stats['total_profit'] >= 0 else "red"
                 profit_units = stats['total_profit'] / unit_size if unit_size > 0 else 0
                 st.markdown(f"**Record:** {stats['wins']}-{stats['losses']} ({stats['win_rate']:.0%})")
-                st.markdown(f"**P/L:** :{profit_color}[₱{stats['total_profit']:+,.0f}] ({profit_units:+.1f}u)")
+                st.markdown(f"**P/L:** :{profit_color}[{stats['total_profit']:+,.0f}] ({profit_units:+.1f}u)")
         
         if st.session_state.parlay_builder:
-            st.markdown(f"🎲 Parlay: {len(st.session_state.parlay_builder)} legs")
+            st.markdown(f" Parlay: {len(st.session_state.parlay_builder)} legs")
         
         st.caption(f"{CURRENT_VERSION}")
     
@@ -7018,13 +7272,13 @@ def main():
         all_players = get_all_nba_players()
         player_names = sorted([p['full_name'] for p in all_players if p.get('is_active', True)])
         
-        # 🚀 START FORM: Prevents reloading until "Run" is clicked
+        #  START FORM: Prevents reloading until "Run" is clicked
         with st.form(key='analysis_form'):
             
             # Primary inputs
             col1, col2 = st.columns(2)
             with col1:
-                player_in = st.selectbox("🏃 Player", player_names, index=None, placeholder="Search...")
+                player_in = st.selectbox(" Player", player_names, index=None, placeholder="Search...")
             with col2:
                 nba_teams = teams.get_teams()
                 team_opts = sorted([t['abbreviation'] for t in nba_teams])
@@ -7032,15 +7286,15 @@ def main():
                     def_idx = team_opts.index('LAL')
                 except ValueError:
                     def_idx = 0
-                opp_in = st.selectbox("🎯 vs", team_opts, index=def_idx)
+                opp_in = st.selectbox(" vs", team_opts, index=def_idx)
             
             col1, col2, col3 = st.columns(3)
             with col1:
-                market = st.selectbox("📊 Market", ["PTS", "REB", "AST", "PRA", "3PM", "PA", "PR", "RA", "STL", "BLK"])
+                market = st.selectbox(" Market", ["PTS", "REB", "AST", "PRA", "3PM", "PA", "PR", "RA", "STL", "BLK"])
             with col2:
-                line_in = st.number_input("🎯 Line", 0.5, 100.0, 25.5, 0.5)
+                line_in = st.number_input(" Line", 0.5, 100.0, 25.5, 0.5)
             with col3:
-                odds_in = st.number_input("💲 Odds", 1.01, 10.00, 1.85, 0.01)
+                odds_in = st.number_input(" Odds", 1.01, 10.00, 1.85, 0.01)
             
             # Show injury reports (Updates on Submit)
             if opp_in:
@@ -7065,17 +7319,17 @@ def main():
                 
                 # Opponent injuries
                 with inj_col1:
-                    with st.expander(f"🏥 {opp_in} Injuries (Opponent)", expanded=False):
+                    with st.expander(f" {opp_in} Injuries (Opponent)", expanded=False):
                         try:
                             injuries = orchestrator.injury_manager.get_team_injury_report(opp_in)
                             if injuries:
                                 for inj in injuries:
                                     status = inj.get('status', 'Unknown')
-                                    emoji = {'OUT': '🔴', 'DOUBTFUL': '🟠', 'QUESTIONABLE': '🟡', 'DAY-TO-DAY': '🟡', 'PROBABLE': '🟢'}.get(status, '⚪')
+                                    emoji = {'OUT': '', 'DOUBTFUL': '', 'QUESTIONABLE': '', 'DAY-TO-DAY': '', 'PROBABLE': ''}.get(status, '')
                                     pos = inj.get('position', '')
                                     pos_str = f" [{pos}]" if pos else ""
                                     injury_desc = inj.get('injury', '')
-                                    st.markdown(f"{emoji} **{inj.get('name', 'Unknown')}**{pos_str} — {status}" + (f" ({injury_desc})" if injury_desc else ""))
+                                    st.markdown(f"{emoji} **{inj.get('name', 'Unknown')}**{pos_str}  {status}" + (f" ({injury_desc})" if injury_desc else ""))
                                 st.caption(f"Source: {injuries[0].get('source', 'ESPN')}")
                             else:
                                 st.info("No injuries reported")
@@ -7085,17 +7339,17 @@ def main():
                 # Player Team injuries
                 with inj_col2:
                     if player_team_abbrev and player_team_abbrev != opp_in:
-                        with st.expander(f"🏥 {player_team_abbrev} Injuries (Player's Team)", expanded=False):
+                        with st.expander(f" {player_team_abbrev} Injuries (Player's Team)", expanded=False):
                             try:
                                 team_injuries = orchestrator.injury_manager.get_team_injury_report(player_team_abbrev)
                                 if team_injuries:
                                     for inj in team_injuries:
                                         status = inj.get('status', 'Unknown')
-                                        emoji = {'OUT': '🔴', 'DOUBTFUL': '🟠', 'QUESTIONABLE': '🟡', 'DAY-TO-DAY': '🟡', 'PROBABLE': '🟢'}.get(status, '⚪')
+                                        emoji = {'OUT': '', 'DOUBTFUL': '', 'QUESTIONABLE': '', 'DAY-TO-DAY': '', 'PROBABLE': ''}.get(status, '')
                                         pos = inj.get('position', '')
                                         pos_str = f" [{pos}]" if pos else ""
                                         injury_desc = inj.get('injury', '')
-                                        st.markdown(f"{emoji} **{inj.get('name', 'Unknown')}**{pos_str} — {status}" + (f" ({injury_desc})" if injury_desc else ""))
+                                        st.markdown(f"{emoji} **{inj.get('name', 'Unknown')}**{pos_str}  {status}" + (f" ({injury_desc})" if injury_desc else ""))
                                     st.caption(f"Source: {team_injuries[0].get('source', 'ESPN')}")
                                 else:
                                     st.info("No injuries reported")
@@ -7122,11 +7376,11 @@ def main():
             if not is_valid: 
                 st.error(error_msg)
             
-            # 🚀 SUBMIT BUTTON
+            #  SUBMIT BUTTON
             # This replaces the old st.button. It triggers the form submission.
-            submitted = st.form_submit_button("🚀 Run Analysis", type="primary", disabled=not is_valid)
+            submitted = st.form_submit_button(" Run Analysis", type="primary", disabled=not is_valid)
 
-        # 🛑 LOGIC EXECUTION (Only runs when button is clicked)
+        #  LOGIC EXECUTION (Only runs when button is clicked)
         if submitted:
             if not player_in:
                 st.error("Please select a player.")
@@ -7186,7 +7440,7 @@ def main():
                             loc_type = "Home" if is_home else "Away"
                             
                             # ---------------------------------------------------------
-                            # 🚀 FIX: FORCE AI TO SEE THE "SMART" NUMBER (23.2)
+                            #  FIX: FORCE AI TO SEE THE "SMART" NUMBER (23.2)
                             # ---------------------------------------------------------
                             final_proj = None
                             
@@ -7223,7 +7477,7 @@ def main():
                                 "ev": result.decision.expected_value,
                                 "prob": result.decision.probability,
                                 
-                                # ✅ NOW THIS WILL MATCH THE CARD (23.2)
+                                #  NOW THIS WILL MATCH THE CARD (23.2)
                                 "projected": round(final_proj, 1), 
                                 "gap": round(gap, 1),
                                 
@@ -7323,7 +7577,7 @@ def main():
                                     
                                     last_5_str = []
                                     for _, row in res_df.head(5).iterrows():
-                                        icon = "✅" if row['hit'] == 1 else "❌"
+                                        icon = "" if row['hit'] == 1 else ""
                                         m_val = row.get('margin', 0)
                                         last_5_str.append(f"{icon}({m_val:+.1f})")
 
@@ -7354,7 +7608,7 @@ def main():
                                 
                             # 3. GET OPINION
                             insight = get_ai_second_opinion(prop_payload, backtest_payload, history_context=history_context)
-                            st.markdown("### 🤖 groq's Verdict")
+                            st.markdown("###  groq's Verdict")
                             st.markdown(insight)
             
             col_track, col_parlay = st.columns(2)
@@ -7365,7 +7619,7 @@ def main():
                 index=tag_options.index(default_tag), key="bet_tag_select")
             
             with col_track: 
-                if st.button("💾 Track", use_container_width="stretch"):
+                if st.button(" Track", use_container_width="stretch"):
                     try:
                         features = result.features
                         # Build payload with static metadata
@@ -7387,7 +7641,7 @@ def main():
                         # Dynamically merge features based on canonical schema
                         bet_payload.update(extract_features_dynamically(features, market=result.market))
                         tracker.log_bet(bet_payload)
-                        st.toast(f"Bet tracked! [{selected_tag}]", icon="💾")
+                        st.toast(f"Bet tracked! [{selected_tag}]")
                     except Exception as e:
                         st.error(f"Failed to track bet: {e}")
                         logger.error(f"Bet tracking failed: {e}")
@@ -7416,7 +7670,7 @@ def main():
                             st.warning(f"Max {CONFIG.MAX_PARLAY_LEGS} legs!")
                         else:
                             st.session_state.parlay_builder.append(leg)
-                            st.toast("Added!", icon="🎲")
+                            st.toast("Added!")
                             st.rerun()
                         pass 
                 else: 
@@ -7500,185 +7754,236 @@ def main():
         else:
             st.info("Run analysis first")
     
-    # Tab 6: Bets
-    with tab6:
-        st.markdown("### 📝 Bet Tracker")
-        
-        # --- STATS & CHARTS (Keep existing logic) ---
-        stats = tracker.get_stats()
-        all_bets = tracker.get_bets()
-        
-        if stats['total_decided'] > 0:
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Win%", f"{stats['win_rate']:.0%}")
-            c2.metric("Record", f"{stats['wins']}-{stats['losses']}")
-            c3.metric("P/L", f"₱{stats['total_profit']:+,.0f}")
-            c4.metric("Pending", stats['pending'])
+        # Tab 6: Bets
+        with tab6:
+            st.markdown("###  Bet Tracker")
             
-            # Equity Curve (Optimized: Put inside expander to load lazily)
-            with st.expander("📈 Equity Curve", expanded=True):
-                decided_bets = [b for b in all_bets if b.get('result') in ['Win', 'Loss']]
-                if len(decided_bets) >= 2:
-                    decided_bets.sort(key=lambda x: x.get('date', '2024-01-01'))
-                    cumulative = []
-                    running_total = 0
-                    for bet in decided_bets:
-                        if bet.get('result') == 'Win':
-                            running_total += 0.91 # Standard -110 juice
-                        else:
-                            running_total -= 1.0
-                        cumulative.append({'Bet #': len(cumulative)+1, 'P/L': running_total})
+            # Section 1: The Dashboard
+            stats = tracker.get_stats()
+            all_bets = tracker.get_bets()
+            
+            if stats['total_decided'] > 0:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Win%", f"{stats['win_rate']:.0%}")
+                c2.metric("Record", f"{stats['wins']}-{stats['losses']}")
+                c3.metric("P/L", f"{stats['total_profit']:+,.0f}")
+                c4.metric("Pending", stats['pending'])
+                
+                with st.expander(" Equity Curve", expanded=True):
+                    decided_bets = [b for b in all_bets if b.get('result') in ['Win', 'Loss']]
+                    if len(decided_bets) >= 2:
+                        decided_bets.sort(key=lambda x: x.get('date', '2024-01-01'))
+                        cumulative = []
+                        running_total = 0
+                        for bet in decided_bets:
+                            if bet.get('result') == 'Win':
+                                running_total += 0.91
+                            else:
+                                running_total -= 1.0
+                            cumulative.append({'Bet #': len(cumulative)+1, 'P/L': running_total})
+                        
+                        if cumulative:
+                            eq_df = pd.DataFrame(cumulative)
+                            st.line_chart(eq_df.set_index('Bet #')['P/L'], height=250, color="#00c853")
+            
+            # Section 2: The Risk Engine
+            if bankroll_enabled:
+                st.markdown("---")
+                st.markdown("###  Quant Risk Engine")
+                
+                # Bankroll Sync Logic (CRITICAL)
+                if 'bankroll' in locals():
+                    real_bankroll = bankroll
+                elif 'bankroll_current' in st.session_state:
+                    real_bankroll = st.session_state['bankroll_current']
+                else:
+                    real_bankroll = 1500.0
+                
+                real_bankroll = float(real_bankroll)
+                
+                # Display the locked bankroll amount
+                st.info(f" Using Bankroll: {real_bankroll:,.0f} (synced from sidebar)")
+                
+                # Optional override (hidden by default)
+                with st.expander("Override Bankroll (Advanced)", expanded=False):
+                    override_bankroll = st.number_input("Custom Bankroll", value=real_bankroll, min_value=0.0, step=100.0, key="override_bankroll")
+                    if st.button("Apply Override", key="apply_override"):
+                        real_bankroll = override_bankroll
+                        st.success(f"Bankroll overridden to {real_bankroll:,.0f}")
+                
+                if st.button(" Run Risk Engine", key="run_risk_engine"):
+                    pending_bets = [b for b in all_bets if b.get('result') == 'Pending']
                     
-                    if cumulative:
-                        eq_df = pd.DataFrame(cumulative)
-                        st.line_chart(eq_df.set_index('Bet #')['P/L'], height=250, color="#00c853")
-        
-        # --- EXPORT CONTROLS (Keep outside form) ---
-        col_export, col_dl, col_clear = st.columns([2, 2, 1])
-        with col_export:
-            exportable = tracker.get_exportable_count()
-            if exportable > 0:
-                if st.button(f"📤 Export {exportable} to ML CSV", type="primary", key="export_ml"):
-                    count, path = tracker.export_bets_to_training_csv()
-                    st.success(f"Exported {count} bets!")
-            else:
-                st.button("📤 Export", disabled=True, help="No new completed bets")
-        
-        with col_dl:
-            if TRACKER_FILE.exists():
-                with open(TRACKER_FILE, "r") as f:
-                    st.download_button("📥 JSON Backup", f.read(), "history.json", "application/json")
-        
-        with col_clear:
-            if st.button("🗑️ Clear All", key="clear_all"):
-                tracker.clear_history()
-                st.rerun()
-
-        st.divider()
-        
-        # --- FILTERS (Keep live, no form) ---
-        if all_bets: 
-            f_col1, f_col2, f_col3 = st.columns([2, 2, 1])
-            with f_col1:
-                filter_opts = ["Pending", "Win", "Loss", "Push"]
-                selected_filters = st.multiselect("Filter Result:", filter_opts, default=["Pending", "Win", "Loss"])
-            with f_col2:
-                all_tags = list(set(b.get('tag', 'legacy') for b in all_bets))
-                selected_tags = st.multiselect("Filter Tag:", all_tags, default=all_tags)
-            with f_col3:
-                # 🚀 PAGINATION: Prevents rendering 500 widgets at once
-                view_limit = st.selectbox("Show Last:", [10, 20, 50, "All"], index=1)
-            
-            # Apply Filters
-            filtered_bets = [b for b in all_bets 
-                             if b.get('result', 'Pending') in selected_filters 
-                             and b.get('tag', 'legacy') in selected_tags]
-            
-            # Sort: Pending first, then by ID (newest first)
-            sort_map = {'Pending': 0, 'Win': 1, 'Loss': 2, 'Push': 3}
-            filtered_bets.sort(key=lambda x: (sort_map.get(x.get('result', 'Pending'), 99), -x.get('id', 0)))
-            
-            # Apply Limit
-            total_count = len(filtered_bets)
-            if view_limit != "All":
-                filtered_bets = filtered_bets[:int(view_limit)]
-            
-            if not filtered_bets: 
-                st.info("No bets found.")
-            else:
-                st.caption(f"Showing {len(filtered_bets)} of {total_count} bets")
-
-                # --- 🚀 BATCH UPDATE FORM ---
-                # This form wraps the entire list. No reloads until you click Save.
-                with st.form(key="batch_bet_editor"):
-                    
-                    # Header
-                    c1, c2, c3, c4, c5 = st.columns([3, 1.2, 1, 1, 0.5])
-                    c1.caption("Bet Details")
-                    c2.caption("Result")
-                    c3.caption("Actual")
-                    c4.caption("Closing")
-                    c5.caption("Del")
-
-                    for bet in filtered_bets:
-                        b_id = bet['id']
-                        bet_res = bet.get('result', 'Pending')
-                        
-                        # Use container for visual grouping
-                        with st.container(border=True):
-                            c1, c2, c3, c4, c5 = st.columns([3, 1.2, 1, 1, 0.5])
-                            
-                            with c1:
-                                # Visual Info (Read Only)
-                                color = {"Win": "green", "Loss": "red", "Push": "blue"}.get(bet_res, "gray")
-                                icon = {"Win": "✅", "Loss": "❌", "Push": "🔄"}.get(bet_res, "⏳")
-                                st.markdown(f"**{bet['player']}** {bet['market']}")
-                                st.caption(f"{icon} :{color}[{bet['side']} {bet['line']}] vs {bet['opponent']} ({bet.get('ev',0):.1%})")
-
-                            with c2:
-                                # Result Selectbox
-                                opts = ["Pending", "Win", "Loss", "Push"]
-                                try:
-                                    idx = opts.index(bet_res)
-                                except:
-                                    idx = 0
-                                st.selectbox("Res", opts, index=idx, key=f"s_{b_id}", label_visibility="collapsed")
-                            
-                            with c3:
-                                # Actual Value
-                                st.number_input("Act", value=float(bet.get('actual_value', 0)), step=1.0, key=f"av_{b_id}", label_visibility="collapsed")
-                            
-                            with c4:
-                                # Closing Line
-                                st.number_input("Clv", value=float(bet.get('closing_line', bet['line'])), step=0.5, key=f"cl_{b_id}", label_visibility="collapsed")
-                            
-                            with c5:
-                                # Delete Checkbox (Replaces slow delete button)
-                                st.checkbox("🗑️", key=f"del_{b_id}", label_visibility="collapsed")
-
-                            # Score Box Logic (Visual feedback)
-                            if bet.get('margin') is not None:
-                                m = bet['margin']
-                                mc = 'green' if m > 0 else 'red'
-                                st.caption(f":{mc}[Margin: {m:+.1f}] | {bet.get('result_quality','').replace('_',' ')}")
-
-                    # 🚀 ONE BUTTON TO RULE THEM ALL
-                    st.divider()
-                    submitted = st.form_submit_button("💾 Save Changes", type="primary", use_container_width="stretch")
-
-                # --- HANDLE UPDATES ---
-                if submitted:
-                    changes = 0
-                    for bet in filtered_bets:
-                        b_id = bet['id']
-                        
-                        # 1. Handle Deletion
-                        if st.session_state.get(f"del_{b_id}"):
-                            tracker.delete_bet(b_id)
-                            changes += 1
-                            continue # Skip update if deleted
-                        
-                        # 2. Handle Updates
-                        new_res = st.session_state.get(f"s_{b_id}")
-                        new_act = st.session_state.get(f"av_{b_id}")
-                        new_cl = st.session_state.get(f"cl_{b_id}")
-                        
-                        # Only update if changed
-                        old_res = bet.get('result', 'Pending')
-                        old_act = float(bet.get('actual_value', 0) or 0)
-                        old_cl = float(bet.get('closing_line', 0) or 0)
-                        
-                        if (new_res != old_res) or (abs(new_act - old_act) > 0.01) or (abs(new_cl - old_cl) > 0.01):
-                            tracker.update_result(b_id, new_res, new_cl, new_act)
-                            changes += 1
-                    
-                    if changes > 0:
-                        st.success(f"Updated {changes} bets!")
-                        st.rerun()
+                    if not pending_bets:
+                        st.warning("No pending bets to analyze.")
                     else:
-                        st.info("No changes detected.")
-        else:
-            st.info("Tracker is empty.")
+                        df = pd.DataFrame(pending_bets)
+                        required_cols = ['predicted_mean', 'predicted_std', 'line', 'side', 'odds']
+                        if not all(col in df.columns for col in required_cols):
+                            st.error("Pending bets missing required columns for risk analysis.")
+                        else:
+                            engine = TradingEngine()
+                            processed_df = engine.process_bets(df, real_bankroll)
+                            
+                            st.session_state.processed_bets = processed_df
+                            st.session_state.risk_run = True
+                            st.rerun()
+                
+                if 'processed_bets' in st.session_state and st.session_state.get('risk_run'):
+                    processed_df = st.session_state.processed_bets
+                    
+                    approved = processed_df[processed_df['is_bet'] == True]
+                    rejected = processed_df[processed_df['is_bet'] == False]
+                    
+                    st.markdown("####  Approved Bets")
+                    if not approved.empty:
+                        for _, bet in approved.iterrows():
+                            with st.container(border=True):
+                                st.markdown(f"**{bet['player']}** {bet['market']} - {bet['side']} {bet['line']} @ {bet['odds']}")
+                                st.caption(f"EV: {bet['adjusted_ev']:.3%} | Stake: {bet['rec_stake']:.0f}")
+                    else:
+                        st.info("No bets approved.")
+                    
+                    st.markdown("####  Rejected Bets")
+                    if not rejected.empty:
+                        for _, bet in rejected.iterrows():
+                            with st.container(border=True):
+                                st.markdown(f"**{bet['player']}** {bet['market']} - {bet['side']} {bet['line']} @ {bet['odds']}")
+                                st.caption(f"EV: {bet['adjusted_ev']:.3%} | Stake: {bet['rec_stake']:.0f}", help="Rejected due to low EV or stake")
+                    else:
+                        st.info("No bets rejected.")
+                    
+                    if st.button(" Optimize & Commit", key="commit_risk"):
+                        for _, bet in processed_df.iterrows():
+                            b_id = bet['id']
+                            # Prefer the Risk Engine's recommended stake (rec_stake) over a forced flat bet
+                            stake_val = None
+                            if 'rec_stake' in bet and pd.notna(bet['rec_stake']):
+                                stake_val = float(bet['rec_stake'])
+                            elif 'recommended_stake' in bet and pd.notna(bet['recommended_stake']):
+                                stake_val = float(bet['recommended_stake'])
+                            else:
+                                stake_val = 0.0
+
+                            new_stake = float(stake_val) if bet.get('is_bet') else 0.0
+                            tracker.update_stake(b_id, new_stake)
+
+                        # Show what we committed for user verification
+                        preview = processed_df.copy()
+                        if 'rec_stake' in preview.columns:
+                            preview['committed_stake'] = preview['rec_stake'].where(preview['is_bet'], 0.0)
+                        else:
+                            preview['committed_stake'] = 0.0
+
+                        st.dataframe(preview[['player', 'market', 'line', 'predicted_std', 'rec_stake']].fillna('N/A'))
+                        st.success("Bets optimized and committed!")
+                        del st.session_state.processed_bets
+                        del st.session_state.risk_run
+                        st.rerun()
+            
+            # Section 3: The Manager
+            st.markdown("---")
+            st.markdown("###  Bet Manager")
+            
+            if all_bets:
+                f_col1, f_col2, f_col3 = st.columns([2, 2, 1])
+                with f_col1:
+                    filter_opts = ["Pending", "Win", "Loss", "Push"]
+                    selected_filters = st.multiselect("Filter Result:", filter_opts, default=["Pending", "Win", "Loss"])
+                with f_col2:
+                    all_tags = list(set(b.get('tag', 'legacy') for b in all_bets))
+                    selected_tags = st.multiselect("Filter Tag:", all_tags, default=all_tags)
+                with f_col3:
+                    view_limit = st.selectbox("Show Last:", [10, 20, 50, "All"], index=1)
+                
+                filtered_bets = [b for b in all_bets 
+                                if b.get('result', 'Pending') in selected_filters 
+                                and b.get('tag', 'legacy') in selected_tags]
+                
+                sort_map = {'Pending': 0, 'Win': 1, 'Loss': 2, 'Push': 3}
+                filtered_bets.sort(key=lambda x: (sort_map.get(x.get('result', 'Pending'), 99), -x.get('id', 0)))
+                
+                total_count = len(filtered_bets)
+                if view_limit != "All":
+                    filtered_bets = filtered_bets[:int(view_limit)]
+                
+                if not filtered_bets:
+                    st.info("No bets found.")
+                else:
+                    st.caption(f"Showing {len(filtered_bets)} of {total_count} bets")
+                    
+                    with st.form(key="batch_bet_editor"):
+                        c1, c2, c3, c4, c5 = st.columns([3, 1.2, 1, 1, 0.5])
+                        c1.caption("Bet Details")
+                        c2.caption("Result")
+                        c3.caption("Actual")
+                        c4.caption("Closing")
+                        c5.caption("Del")
+                        
+                        for bet in filtered_bets:
+                            b_id = bet['id']
+                            bet_res = bet.get('result', 'Pending')
+                            
+                            with st.container(border=True):
+                                c1, c2, c3, c4, c5 = st.columns([3, 1.2, 1, 1, 0.5])
+                                
+                                with c1:
+                                    color = {"Win": "green", "Loss": "red", "Push": "blue"}.get(bet_res, "gray")
+                                    icon = {"Win": "", "Loss": "", "Push": ""}.get(bet_res, "")
+                                    st.markdown(f"**{bet['player']}** {bet['market']}")
+                                    st.caption(f"{icon} :{color}[{bet['side']} {bet['line']}] vs {bet['opponent']} ({bet.get('ev',0):.1%})")
+                                
+                                with c2:
+                                    opts = ["Pending", "Win", "Loss", "Push"]
+                                    idx = opts.index(bet_res) if bet_res in opts else 0
+                                    st.selectbox("Res", opts, index=idx, key=f"s_{b_id}", label_visibility="collapsed")
+                                
+                                with c3:
+                                    st.number_input("Act", value=float(bet.get('actual_value', 0)), step=1.0, key=f"av_{b_id}", label_visibility="collapsed")
+                                
+                                with c4:
+                                    st.number_input("Clv", value=float(bet.get('closing_line', bet['line'])), step=0.5, key=f"cl_{b_id}", label_visibility="collapsed")
+                                
+                                with c5:
+                                    # Accessibility: provide a non-empty label but hide it visually
+                                    st.checkbox("Delete bet", key=f"del_{b_id}", label_visibility="collapsed")
+                                
+                                if bet.get('margin') is not None:
+                                    m = bet['margin']
+                                    mc = 'green' if m > 0 else 'red'
+                                    st.caption(f":{mc}[Margin: {m:+.1f}] | {bet.get('result_quality','').replace('_',' ')}")
+                        
+                        submitted = st.form_submit_button(" Save Changes", type="primary", use_container_width="stretch")
+                    
+                    if submitted:
+                        changes = 0
+                        for bet in filtered_bets:
+                            b_id = bet['id']
+                            
+                            if st.session_state.get(f"del_{b_id}"):
+                                tracker.delete_bet(b_id)
+                                changes += 1
+                                continue
+                            
+                            new_res = st.session_state.get(f"s_{b_id}")
+                            new_act = st.session_state.get(f"av_{b_id}")
+                            new_cl = st.session_state.get(f"cl_{b_id}")
+                            
+                            old_res = bet.get('result', 'Pending')
+                            old_act = float(bet.get('actual_value', 0) or 0)
+                            old_cl = float(bet.get('closing_line', 0) or 0)
+                            
+                            if (new_res != old_res) or (abs(new_act - old_act) > 0.01) or (abs(new_cl - old_cl) > 0.01):
+                                tracker.update_result(b_id, new_res, new_cl, new_act)
+                                changes += 1
+                        
+                        if changes > 0:
+                            st.success(f"Updated {changes} bets!")
+                            st.rerun()
+                        else:
+                            st.info("No changes detected.")
+            else:
+                st.info("Tracker is empty.")
     
     # Tab 7: Parlays
     with tab7:

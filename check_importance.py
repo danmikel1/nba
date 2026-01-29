@@ -26,7 +26,10 @@ try:
         'feat_h2h_avg', 
         'feat_eff_per_min',   # <--- Added
         'feat_fatigue_load',  # <--- Added
-        'feat_form_gap'       # <--- Added
+        'feat_form_gap',      # <--- Added
+        'feat_hit_rate_l10',  # <--- The Consistency Metric
+        'feat_hit_rate_l20',  # <--- The Long-Term Form
+        'feat_opp_rank_vs_pos' # <--- The "Wemby Effect" (DvP)
     ]
     print(df_imp[df_imp['feature'].isin(new_features)])
 
