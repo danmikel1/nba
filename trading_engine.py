@@ -27,7 +27,7 @@ class TradingEngine:
         max_stake = 0.05 * bankroll
         return min(stake, max_stake)
 
-    def process_bets(self, df, bankroll, ev_threshold=0.025, fractional_kelly=0.10, default_sigma: float = 3.0, sigma_multiplier: float = 1.6, z_score_threshold: float = 0.0, require_abs_z: bool = False):
+    def process_bets(self, df, bankroll, ev_threshold=0.025, fractional_kelly=0.10, default_sigma: float = 3.0, sigma_multiplier: float = 1.2, z_score_threshold: float = 0.0, require_abs_z: bool = False):
         """
         Risk-Pricing: Convert model log-variance to sigma and price bets with uncertainty filtering.
 
