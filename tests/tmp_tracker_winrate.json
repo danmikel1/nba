@@ -1,0 +1,29 @@
+[
+  {
+    "id": 1,
+    "player": "A",
+    "market": "PTS",
+    "result": "Win",
+    "stake": 10.0,
+    "odds": 1.91,
+    "date": "2026-01-31"
+  },
+  {
+    "id": 2,
+    "player": "B",
+    "market": "PTS",
+    "result": "Loss",
+    "stake": 5.0,
+    "odds": 1.91,
+    "date": "2026-01-31"
+  },
+  {
+    "id": 3,
+    "player": "C",
+    "market": "PTS",
+    "result": "Win",
+    "stake": 0.0,
+    "odds": 1.91,
+    "date": "2026-01-31"
+  }
+]

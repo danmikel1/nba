@@ -27,7 +27,7 @@ class TradingEngine:
         max_stake = 0.05 * bankroll
         return min(stake, max_stake)
 
-    def process_bets(self, df, bankroll, ev_threshold=0.025, fractional_kelly=0.10, default_sigma: float = 3.0, sigma_multiplier: float = 1.2, z_score_threshold: float = 0.0, require_abs_z: bool = False):
+    def process_bets(self, df, bankroll, ev_threshold=0.025, fractional_kelly=0.20, default_sigma: float = 3.0, sigma_multiplier: float = 1.6, z_score_threshold: float = 0.0, require_abs_z: bool = False, max_bets=8, return_all: bool = False):
         """
         Risk-Pricing: Convert model log-variance to sigma and price bets with uncertainty filtering.
 
@@ -88,44 +88,65 @@ class TradingEngine:
         mid_mask = (z_score >= 0.35) & (z_score < 0.6)
         stake_multiplier[mid_mask] = 0.5
 
-        # --- 5) Compute EV and pricing score ---
+        # --- 5) Compute EV and pricing score (Hunger Games flow) ---
+        # Compute nominal EV from model-derived prob (keep existing prob if available)
         true_ev = prob * (df['odds'] - 1) - (1 - prob)
-        adjusted_ev = true_ev  # keep simple; we already use stake_multiplier to scale
 
-        pricing_score = adjusted_ev * (z_score / (1.0 + sigma))
-
-        # --- 6) Compute recommended stake using Kelly, attenuated by stake_multiplier ---
-        raw_kelly = np.array([self.calculate_kelly_stake(p, o, bankroll, fractional_kelly) for p, o in zip(prob, df['odds'])], dtype=float)
-        # Clamp negative Kelly stakes to zero (no shorting)
+        # Apply stake multipliers determined earlier
+        # Calculate Kelly stakes (conservative fractional_kelly applied)
+        raw_kelly = np.array([self.calculate_kelly_stake(p, o, bankroll, fractional_kelly) for p, o in zip(df.get('predicted_prob', prob), df['odds'])])
         raw_kelly = np.maximum(raw_kelly, 0.0)
         rec_stake = raw_kelly * stake_multiplier
 
-        # is_bet: user-level decision if we actually recommend a stake > 0
-        is_bet = rec_stake > 0
+        # Quality ranking: combine profitability and signal strength
+        # Prefer columns expected by downstream systems (predicted_ev, projected_value)
+        quality_score = (df.get('predicted_ev', true_ev).astype(float)) * (z_score)
 
-        # --- 7) Assemble output columns and filter/sort ---
+        df['quality_score'] = quality_score
+        df['rec_stake'] = rec_stake
+        df['predicted_ev'] = df.get('predicted_ev', true_ev)
+        df['predicted_prob'] = df.get('predicted_prob', prob)
+
+        # --- Compatibility columns (restore original outputs expected elsewhere) ---
+        adjusted_ev = true_ev  # legacy name; keep equal to true_ev for now
+        pricing_score = adjusted_ev * (z_score / (1.0 + sigma))
+
         df['sigma'] = sigma
         df['z_metric'] = z_metric
         df['prob'] = prob
-        df['win_prob'] = prob  # backward compatibility
+        df['win_prob'] = prob
         df['z_score'] = z_score
         df['stake_multiplier'] = stake_multiplier
         df['true_ev'] = true_ev
         df['adjusted_ev'] = adjusted_ev
         df['pricing_score'] = pricing_score
         df['rec_stake'] = rec_stake
-        df['is_bet'] = is_bet
-        # Volatility-adjusted rank (backcompat): adjusted_ev per sigma
-        df['vol_adj_rank'] = np.where(sigma == 0, 0.0, adjusted_ev / sigma)
+        df['is_bet'] = df['rec_stake'] > 0
+        df['vol_adj_rank'] = np.where(sigma == 0, 0.0, (df['adjusted_ev'].astype(float) / sigma))
 
-        # Filter per spec: keep rows where stake_multiplier > 0 (discard too-uncertain cases)
-        df = df[df['stake_multiplier'] > 0].copy()
+        # Sort by Quality, keep only top N (the Hunger Games)
+        df = df.sort_values(by='quality_score', ascending=False).copy()
+        if len(df) > max_bets:
+            # zero out stakes for everyone below the top `max_bets`
+            df.iloc[max_bets:, df.columns.get_loc('rec_stake')] = 0.0
+            df.iloc[max_bets:, df.columns.get_loc('is_bet')] = False
 
-        # Optional: require absolute z-score threshold for bets (backcompat)
+        # Ensure rows failing preliminary filters (stake_multiplier, require_abs_z) have rec_stake == 0
+        if 'stake_multiplier' in df.columns:
+            df.loc[df['stake_multiplier'] <= 0, 'rec_stake'] = 0.0
+            df.loc[df['stake_multiplier'] <= 0, 'is_bet'] = False
+
         if require_abs_z and z_score_threshold > 0.0:
-            df = df[df['z_score'] >= z_score_threshold]
+            df.loc[df['z_score'] < z_score_threshold, 'rec_stake'] = 0.0
+            df.loc[df['z_score'] < z_score_threshold, 'is_bet'] = False
 
-        # Sort by pricing_score descending
-        df = df.sort_values('pricing_score', ascending=False)
+        # Default behavior: filter out zero-stake rows (backwards-compatible for tests and execution).
+        if not return_all:
+            out = df[df['rec_stake'] > 0].copy()
+            # optional absolute z requirement (legacy behavior)
+            if require_abs_z and z_score_threshold > 0.0:
+                out = out[out['z_score'] >= z_score_threshold]
+            return out
 
+        # return_all=True -> return full table including rejected rows (for UI/display)
         return df

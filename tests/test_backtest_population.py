@@ -1,7 +1,8 @@
 import pytest
 
 # Ensure flattened `feat_` columns are converted to a FeatureVector without loading heavy models
-from scripts.backtest_risk_pricing_sweep import _fv_from_snapshot
+# Use a small, importable utility that mirrors the repo's flattened->feature mapping
+from nba_ml_utils import fv_from_flat_snapshot as _fv_from_snapshot
 
 
 def test_fv_from_flattened_snapshot_sets_core_fields():

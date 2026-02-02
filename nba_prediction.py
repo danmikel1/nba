@@ -270,38 +270,65 @@ def get_ai_second_opinion(prop_analysis, backtest_json, history_context=None):
     """
 
     # --- 3. BUILD PROMPT ---
-    prompt = f"""
-    Act as a sharp NBA capper. Analyze this prop bet.
+    # Build a lightweight `row` mapping so the new prompt block can reference a single record-like dict.
+    row = {
+        'player': prop_analysis.get('player'),
+        'position': prop_analysis.get('position', ''),
+        'opponent': prop_analysis.get('opponent', backtest_json.get('opponent') or prop_analysis.get('team', '')),
+        'market': prop_analysis.get('market'),
+        'predicted_side': prop_analysis.get('predicted_side', prop_analysis.get('signal', 'OVER')),
+        'line': float(prop_analysis.get('line', backtest_json.get('line', 0.0)) or 0.0),
+        'projected_value': float(prop_analysis.get('projected', prop_analysis.get('projected_value', 0.0)) or 0.0),
+        'prob': float(prop_analysis.get('prob', 0.0) or 0.0),
+        'spread': float(prop_analysis.get('spread', backtest_json.get('spread', 0.0)) or 0.0),
+    }
 
-    ** THE BET**
-    * **Player:** {prop_analysis.get('player')} ({prop_analysis.get('team')})
-    * **Market:** {prop_analysis.get('market')} {prop_analysis.get('line')}
-    * **Signal:** {prop_analysis.get('signal')} (EV: {prop_analysis.get('ev'):.1%}, Prob: {prop_analysis.get('prob'):.1%})
-    * **Projected:** {prop_analysis.get('projected')} (Edge: {edge_str})
-    * **Note:** A Positive Edge (+) means we have a safety cushion. A Negative Edge (-) means the projection is fighting the line.
+    # ===============================================================================
+    # 1. CALCULATE CONTEXT VARIABLES (The "Eyes" of the Prompt)
+    # ===============================================================================
     
-    {history_section}
-    {bucket_section}
+    # A) Blowout Detection
+    spread_val = row.get('spread', 0.0)  # Use 'spread' key (not 'feat_spread')
+    is_blowout = abs(spread_val) >= 12
+    game_script = "NEUTRAL"
+    if spread_val < -10: game_script = "BLOWOUT RISK (Starters might sit Q4)"
+    elif spread_val > 10: game_script = "TRAILING (Garbage time risk)"
+    
+    # B) Glitch Detection (The "Minutes vs Line" Trap)
+    # If the Line is closer to their Avg Minutes (e.g., 25.5) than their Projection (15.0)
+    diff_line_proj = row['line'] - row['projected_value']
+    glitch_warning = "PASS"  # Clearer than "NONE" — tells LLM data looks OK
+    if abs(diff_line_proj) > 8.0:
+        glitch_warning = f"⚠️ CRITICAL WARNING: Line ({row['line']}) is >8pts away from Projection ({row['projected_value']:.1f}). CHECK IF DATA IS 'MINUTES' INSTEAD OF 'PRA'."
 
-    ** GAME ENVIRONMENT**
-    * **Spread:** {prop_analysis.get('spread')}
-    * **Total:** {prop_analysis.get('total')}
-    * **Rest:** {prop_analysis.get('rest')} days
-    * **Opponent Rank:** {prop_analysis.get('opp_rank')}
-
-    ** PLAYER FORM**
-    * **Season Avg:** {season_avg:.1f}
-    * **L10 Avg:** {l10_avg:.1f} ({prop_analysis.get('trend')})
-    * **Est. Usage:** {usage_pct:.1f}%
-
-    ** L30 TRENDS**
-    * **Hit Rate:** {backtest_json.get('l30_rate')}%
-    * **Avg Margin:** {backtest_json.get('avg_diff', 0):+.1f}
-
-    ** ANALYSIS TASKS:**
-    1.  **Calibration Check:** Look at the "Calibration Check" section. If the Bucket Win Rate is high (e.g., >60%), TRUST the signal. If low, DOUBT it.
-    2.  **Edge Check:** Do we have a positive safety cushion?
-    3.  **Verdict:** AGREE or DISAGREE.
+    # ===============================================================================
+    # 2. THE SYSTEM PROMPT (The "Brain")
+    # ===============================================================================
+    prompt = f"""
+    ROLE:
+    You are a cynical, paranoid Senior Quantitative Risk Manager. 
+    Your job is NOT to find winners. Your job is to preventing the user from losing money on "Traps" and "Bad Data."
+    
+    INPUT DATA:
+    - Player: {row['player']} ({row['position']}) vs {row['opponent']}
+    - Bet: {row['market']} {row['predicted_side']} {row['line']}
+    - Model Projection: {row['projected_value']:.1f}
+    - Model Win Probability: {row.get('prob', 0)*100:.1f}%
+    - Vegas Spread: {spread_val} ({game_script})
+    
+    RISK FACTORS:
+    - Data Integrity Check: {glitch_warning}
+    - Blowout Risk: {"YES" if is_blowout else "NO"}
+    
+    INSTRUCTIONS:
+    1. **KILL SWITCH**: If the "Data Integrity Check" warning is present, you MUST Reject the bet. State that the Line is likely corrupted.
+    2. **BLOWOUT CHECK**: If betting an OVER in a Blowout Risk game, be extremely cautious. Starters lose 15-20% of minutes in blowouts.
+    3. **SYCOPHANT CHECK**: Do not blindly agree with the Model Win Probability. If the Probability is >75% but the edge is thin, call it "Overfitting."
+    
+    OUTPUT FORMAT (Strict):
+    VERDICT: [AGREE / DISAGREE / CAUTION]
+    RATIONALE: [One clear, blunt sentence. Focus on the negative risks.]
+    CONFIDENCE: [0-10]
     """
     
     try:
@@ -5023,11 +5050,19 @@ class Tracker:
         losses = len([b for b in bets if b.get('result') == 'Loss'])
         pushes = len([b for b in bets if b.get('result') == 'Push'])
         pending = len([b for b in bets if b.get('result', 'Pending') == 'Pending'])
-        
+
+        # --- BACKWARDS-COMPAT: expose win_rate_all but compute primary win_rate over staked bets ---
         total_decided = wins + losses
-        win_rate = wins / total_decided if total_decided > 0 else 0
+        win_rate_all = wins / total_decided if total_decided > 0 else 0
+
+        # Primary metric: only count decided bets that had a positive stake
+        decided_staked = [b for b in bets if b.get('result') in ['Win', 'Loss'] and float(b.get('stake', 0) or 0) > 0]
+        wins_staked = len([b for b in decided_staked if b.get('result') == 'Win'])
+        total_decided_staked = len(decided_staked)
+        win_rate = wins_staked / total_decided_staked if total_decided_staked > 0 else 0
+
         total_profit = 0
-        for bet in bets: 
+        for bet in bets:
             # Get decimal odds - check both 'odds_decimal' (new) and 'odds' (legacy)
             odds = bet.get('odds_decimal', bet.get('odds', 1.91))
             # Handle American format if needed
@@ -5037,13 +5072,13 @@ class Tracker:
                 total_profit += bet.get('stake', 0) * (odds - 1)
             elif bet.get('result') == 'Loss':
                 total_profit -= bet.get('stake', 0)
-        
+
         bets_with_clv = [b for b in bets if b.get('clv') is not None and b.get('clv') != 0]
         clv_count = len(bets_with_clv)
         avg_clv = sum(b['clv'] for b in bets_with_clv) / clv_count if clv_count > 0 else 0
         positive_clv = len([b for b in bets_with_clv if b['clv'] > 0])
         clv_positive_rate = positive_clv / clv_count if clv_count > 0 else 0
-        
+
         # V18: CLV-Win Correlation Analysis (CLV is best predictor of long-term edge)
         clv_win_correlation = 0.0
         clv_positive_wins = 0
@@ -5108,7 +5143,14 @@ class Tracker:
         
         return {
             'wins': wins, 'losses': losses, 'pushes': pushes, 'pending': pending,
-            'total_decided': total_decided, 'win_rate': win_rate, 'total_profit': total_profit,
+            'total_decided': total_decided,
+            # Primary win_rate (staked-only) for reporting/business logic
+            'win_rate': win_rate,
+            # Back-compat / audit: win rate across ALL decided bets (including 0-stake)
+            'win_rate_all': win_rate_all,
+            # Staked-specific counters
+            'total_decided_staked': total_decided_staked, 'wins_staked': wins_staked,
+            'total_profit': total_profit,
             'clv_count': clv_count, 'avg_clv': avg_clv, 'clv_positive_rate': clv_positive_rate,
             # V18: New CLV metrics
             'clv_positive_win_rate': clv_positive_win_rate,
@@ -5123,6 +5165,46 @@ class Tracker:
             # V18: Grade analysis
             'grade_stats': grade_stats
         }
+
+    def get_equity_curve(self, in_units: bool = False, unit_size: float | None = None) -> list:
+        """Return a cumulative P/L series (only for bets with a positive stake).
+
+        - Filters to decided bets (Win/Loss) where stake > 0
+        - Sorts by `date` then `id` for deterministic ordering
+        - Computes stake-weighted P/L: win -> stake*(odds-1), loss -> -stake
+        - If `in_units` is True and `unit_size` provided, values are divided by `unit_size`.
+
+        Returns: list[dict] where each dict is {'Bet #': int, 'P/L': float}
+        """
+        bets = self.get_bets()
+        decided_staked = [
+            b for b in bets
+            if b.get('result') in ['Win', 'Loss'] and float(b.get('stake', 0) or 0) > 0
+        ]
+        # deterministic ordering
+        decided_staked.sort(key=lambda x: (x.get('date', ''), x.get('id', 0)))
+
+        cumulative = []
+        running_total = 0.0
+        for b in decided_staked:
+            stake = float(b.get('stake', 0) or 0)
+            odds = b.get('odds_decimal', b.get('odds', 1.91))
+            # Normalize American odds if present
+            if isinstance(odds, (int, float)) and (odds < 0 or odds >= 100):
+                odds = american_to_decimal(odds)
+
+            if b.get('result') == 'Win':
+                running_total += stake * (odds - 1)
+            else:
+                running_total -= stake
+
+            val = running_total
+            if in_units and unit_size and unit_size > 0:
+                val = running_total / float(unit_size)
+
+            cumulative.append({'Bet #': len(cumulative) + 1, 'P/L': val})
+
+        return cumulative
 
     def optimize_grade_thresholds(self) -> Dict[str, Any]:
         """
@@ -5889,7 +5971,22 @@ def render_ml_decoder(result: AnalysisResult):
     # ROW 2: KEY FACTORS (V20 EMPIRICAL)
     st.caption(" **Key Factors**")
     e1, e2, e3, e4 = st.columns(4)
+    # Avg Min (primary) — EMA shown beneath with conditional "Do Not Bet" visual cue
     e1.metric("Avg Min", f"{features.avg_minutes:.1f}")
+    # EMA display: if recommended side is UNDER and EMA > line -> show RED (immediate warning)
+    ema_val = getattr(features, "ema", -1.0) or -1.0
+    ema_display = "N/A" if ema_val < 0 else f"{ema_val:.1f}"
+    recommended_side = ""
+    if getattr(result, "decision", None):
+        recommended_side = (getattr(result.decision, "recommended_side", "") or "").upper()
+    line_val = getattr(result, "line", None) or getattr(features, "line", 0.0)
+    ema_warning = (recommended_side == "UNDER") and (ema_val > line_val)
+    ema_color = "#ff4d4f" if ema_warning else "#aaa"
+    e1.markdown(
+        f"<div style='font-size:11px;color:#888;margin-top:6px'>EMA</div>"
+        f"<div style='font-size:16px;color:{ema_color};font-weight:700'>{ema_display}</div>",
+        unsafe_allow_html=True,
+    )
     e2.metric("Opp DRTG", f"{features.opponent_drtg_season:.1f}")
     e3.metric("Games", f"{features.games_played}")
     e4.metric("Game Total", f"{features.game_total:.1f}")
@@ -6548,8 +6645,9 @@ def render_ml_data_tab(tracker: Tracker):
         st.caption("Based on YOUR tracked bets in bet_tracker.json - this is what actually happened")
         
         tracker_bets = tracker.get_bets()
-        decided_bets = [b for b in tracker_bets if b.get('result') in ['Win', 'Loss']]
-        
+        # Only consider bets where a positive stake was placed for "Real Performance"
+        decided_bets = [b for b in tracker_bets if b.get('result') in ['Win', 'Loss'] and float(b.get('stake', 0) or 0) > 0]
+
         if len(decided_bets) > 0:
             real_wins = len([b for b in decided_bets if b.get('result') == 'Win'])
             real_losses = len([b for b in decided_bets if b.get('result') == 'Loss'])
@@ -7252,7 +7350,7 @@ def main():
                 st.markdown("---")
                 profit_color = "green" if stats['total_profit'] >= 0 else "red"
                 profit_units = stats['total_profit'] / unit_size if unit_size > 0 else 0
-                st.markdown(f"**Record:** {stats['wins']}-{stats['losses']} ({stats['win_rate']:.0%})")
+                st.markdown(f"**Record:** {stats['wins']}-{stats['losses']} ({stats['win_rate']:.0%} (staked))")
                 st.markdown(f"**P/L:** :{profit_color}[{stats['total_profit']:+,.0f}] ({profit_units:+.1f}u)")
         
         if st.session_state.parlay_builder:
@@ -7764,27 +7862,17 @@ def main():
             
             if stats['total_decided'] > 0:
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Win%", f"{stats['win_rate']:.0%}")
+                c1.metric("Win% (staked)", f"{stats['win_rate']:.0%}")
                 c2.metric("Record", f"{stats['wins']}-{stats['losses']}")
                 c3.metric("P/L", f"{stats['total_profit']:+,.0f}")
                 c4.metric("Pending", stats['pending'])
                 
                 with st.expander(" Equity Curve", expanded=True):
-                    decided_bets = [b for b in all_bets if b.get('result') in ['Win', 'Loss']]
-                    if len(decided_bets) >= 2:
-                        decided_bets.sort(key=lambda x: x.get('date', '2024-01-01'))
-                        cumulative = []
-                        running_total = 0
-                        for bet in decided_bets:
-                            if bet.get('result') == 'Win':
-                                running_total += 0.91
-                            else:
-                                running_total -= 1.0
-                            cumulative.append({'Bet #': len(cumulative)+1, 'P/L': running_total})
-                        
-                        if cumulative:
-                            eq_df = pd.DataFrame(cumulative)
-                            st.line_chart(eq_df.set_index('Bet #')['P/L'], height=250, color="#00c853")
+                    # Use stake-filtered, stake-weighted equity (ignore zero-stake bets)
+                    cumulative = tracker.get_equity_curve()
+                    if len(cumulative) >= 2:
+                        eq_df = pd.DataFrame(cumulative)
+                        st.line_chart(eq_df.set_index('Bet #')['P/L'], height=250, color="#00c853")
             
             # Section 2: The Risk Engine
             if bankroll_enabled:
@@ -7823,7 +7911,7 @@ def main():
                             st.error("Pending bets missing required columns for risk analysis.")
                         else:
                             engine = TradingEngine()
-                            processed_df = engine.process_bets(df, real_bankroll)
+                            processed_df = engine.process_bets(df, real_bankroll, return_all=True)
                             
                             st.session_state.processed_bets = processed_df
                             st.session_state.risk_run = True
@@ -7886,7 +7974,7 @@ def main():
             st.markdown("###  Bet Manager")
             
             if all_bets:
-                f_col1, f_col2, f_col3 = st.columns([2, 2, 1])
+                f_col1, f_col2, f_col3, f_col4 = st.columns([2, 2, 1, 1])
                 with f_col1:
                     filter_opts = ["Pending", "Win", "Loss", "Push"]
                     selected_filters = st.multiselect("Filter Result:", filter_opts, default=["Pending", "Win", "Loss"])
@@ -7895,13 +7983,20 @@ def main():
                     selected_tags = st.multiselect("Filter Tag:", all_tags, default=all_tags)
                 with f_col3:
                     view_limit = st.selectbox("Show Last:", [10, 20, 50, "All"], index=1)
+                with f_col4:
+                    sort_option = st.selectbox("Sort by:", ["Result/ID", "Stake Asc", "Stake Desc"], index=0)
                 
                 filtered_bets = [b for b in all_bets 
                                 if b.get('result', 'Pending') in selected_filters 
                                 and b.get('tag', 'legacy') in selected_tags]
                 
-                sort_map = {'Pending': 0, 'Win': 1, 'Loss': 2, 'Push': 3}
-                filtered_bets.sort(key=lambda x: (sort_map.get(x.get('result', 'Pending'), 99), -x.get('id', 0)))
+                if sort_option == "Result/ID":
+                    sort_map = {'Pending': 0, 'Win': 1, 'Loss': 2, 'Push': 3}
+                    filtered_bets.sort(key=lambda x: (sort_map.get(x.get('result', 'Pending'), 99), -x.get('id', 0)))
+                elif sort_option == "Stake Asc":
+                    filtered_bets.sort(key=lambda x: (x.get('stake', 0), -x.get('id', 0)))
+                elif sort_option == "Stake Desc":
+                    filtered_bets.sort(key=lambda x: (-x.get('stake', 0), -x.get('id', 0)))
                 
                 total_count = len(filtered_bets)
                 if view_limit != "All":
@@ -7931,7 +8026,7 @@ def main():
                                     color = {"Win": "green", "Loss": "red", "Push": "blue"}.get(bet_res, "gray")
                                     icon = {"Win": "", "Loss": "", "Push": ""}.get(bet_res, "")
                                     st.markdown(f"**{bet['player']}** {bet['market']}")
-                                    st.caption(f"{icon} :{color}[{bet['side']} {bet['line']}] vs {bet['opponent']} ({bet.get('ev',0):.1%})")
+                                    st.caption(f"{icon} :{color}[{bet['side']} {bet['line']}] vs {bet['opponent']} ({bet.get('ev',0):.1%}) | Stake: ${bet.get('stake', 0):.0f}")
                                 
                                 with c2:
                                     opts = ["Pending", "Win", "Loss", "Push"]
