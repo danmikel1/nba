@@ -5819,7 +5819,166 @@ class Tracker:
                         bet['clv'] = opening_line - closing_line
                 break
         self._save(current_bets)
-    
+
+    def auto_settle_pending_bets(self) -> dict:
+        """
+        Auto-settles all 'Pending' bets in the tracker against official ESPN box scores and game scores.
+        Handles both:
+          1. Game lines (SPREAD, TOTAL)
+          2. Player props (PTS, REB, AST, 3PT, PRA, PR, PA, RA)
+        """
+        import requests
+        from datetime import datetime, timezone
+
+        pending_bets = [b for b in self.get_bets() if b.get('result') == 'Pending']
+        if not pending_bets:
+            return {"settled_count": 0, "wins": 0, "losses": 0, "pushes": 0, "details": []}
+
+        espn_scoreboards_by_date = {}
+        espn_boxscores_by_date = {}
+
+        settled_count = 0
+        wins = 0
+        losses = 0
+        pushes = 0
+        details = []
+
+        for bet in pending_bets:
+            b_id = bet.get('id')
+            bet_date = bet.get('date', '')
+            if not bet_date:
+                continue
+
+            market = str(bet.get('market', '')).upper()
+            bet_type = str(bet.get('bet_type', '')).lower()
+            side = str(bet.get('side', '')).upper()
+            line = float(bet.get('line', 0.0))
+            is_game = market in ['SPREAD', 'TOTAL', 'spread', 'total'] or bet_type in ['spread', 'total']
+
+            if is_game:
+                if bet_date not in espn_scoreboards_by_date:
+                    try:
+                        resp = requests.get(
+                            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+                            params={"dates": bet_date.replace("-", "")},
+                            timeout=10
+                        )
+                        espn_scoreboards_by_date[bet_date] = resp.json().get("events", []) if resp.status_code == 200 else []
+                    except Exception:
+                        espn_scoreboards_by_date[bet_date] = []
+
+                events = espn_scoreboards_by_date[bet_date]
+                matched_event = None
+                p_text = (str(bet.get('player', '')) + " " + str(bet.get('opponent', ''))).upper()
+
+                for ev in events:
+                    comp = ev.get("competitions", [{}])[0]
+                    competitors = comp.get("competitors", [])
+                    abbrevs = [c.get("team", {}).get("abbreviation", "").upper() for c in competitors]
+                    names = [c.get("team", {}).get("name", "").upper() for c in competitors]
+                    if any(a in p_text for a in abbrevs if a) or any(n in p_text for n in names if n):
+                        status = comp.get("status", {}).get("type", {})
+                        if status.get("state") == "post" or "FINAL" in status.get("description", "").upper():
+                            matched_event = comp
+                            break
+
+                if not matched_event:
+                    continue
+
+                home_c = next((c for c in matched_event.get("competitors", []) if c.get("homeAway") == "home"), {})
+                away_c = next((c for c in matched_event.get("competitors", []) if c.get("homeAway") == "away"), {})
+
+                try:
+                    h_score = float(home_c.get("score", 0))
+                    a_score = float(away_c.get("score", 0))
+                except (ValueError, TypeError):
+                    continue
+
+                if market == 'TOTAL' or bet_type == 'total':
+                    actual_total = h_score + a_score
+                    is_over = 'OVER' in side
+                    if actual_total > line:
+                        res = "Win" if is_over else "Loss"
+                    elif actual_total < line:
+                        res = "Loss" if is_over else "Win"
+                    else:
+                        res = "Push"
+
+                    self.update_result(b_id, res, closing_line=line, actual_value=actual_total)
+                    settled_count += 1
+                    if res == "Win": wins += 1
+                    elif res == "Loss": losses += 1
+                    else: pushes += 1
+                    details.append({"id": b_id, "type": "game_total", "result": res, "actual": actual_total, "line": line})
+
+                elif market == 'SPREAD' or bet_type == 'spread':
+                    h_abbr = home_c.get("team", {}).get("abbreviation", "").upper()
+                    picked_home = h_abbr in side or "HOME" in side
+                    margin = (h_score - a_score) if picked_home else (a_score - h_score)
+                    ats_margin = margin + line
+                    if ats_margin > 0.05:
+                        res = "Win"
+                    elif ats_margin < -0.05:
+                        res = "Loss"
+                    else:
+                        res = "Push"
+
+                    self.update_result(b_id, res, closing_line=line, actual_value=margin)
+                    settled_count += 1
+                    if res == "Win": wins += 1
+                    elif res == "Loss": losses += 1
+                    else: pushes += 1
+                    details.append({"id": b_id, "type": "game_spread", "result": res, "actual": margin, "line": line})
+
+            else:
+                if bet_date not in espn_boxscores_by_date:
+                    try:
+                        from scripts.harvest_player_props import fetch_espn_player_boxscores
+                        espn_boxscores_by_date[bet_date] = fetch_espn_player_boxscores(bet_date)
+                    except Exception:
+                        espn_boxscores_by_date[bet_date] = {}
+
+                boxscores = espn_boxscores_by_date[bet_date]
+                if not boxscores:
+                    continue
+
+                player_name = str(bet.get('player', '')).strip().lower()
+                matched_stats = None
+                for b_name, b_stats in boxscores.items():
+                    if b_name in player_name or player_name in b_name:
+                        matched_stats = b_stats
+                        break
+
+                if not matched_stats:
+                    continue
+
+                actual_stat = matched_stats.get(market)
+                if actual_stat is None:
+                    continue
+
+                is_over = 'OVER' in side or side == 'OVER'
+                if actual_stat > line:
+                    res = "Win" if is_over else "Loss"
+                elif actual_stat < line:
+                    res = "Loss" if is_over else "Win"
+                else:
+                    res = "Push"
+
+                self.update_result(b_id, res, closing_line=line, actual_value=actual_stat)
+                settled_count += 1
+                if res == "Win": wins += 1
+                elif res == "Loss": losses += 1
+                else: pushes += 1
+                details.append({"id": b_id, "type": f"prop_{market}", "result": res, "actual": actual_stat, "line": line})
+
+        return {
+            "settled_count": settled_count,
+            "wins": wins,
+            "losses": losses,
+            "pushes": pushes,
+            "details": details,
+        }
+
     def _categorize_result(self, result: str, margin: float, market: str = None) -> str:
         """
         V20 EMPIRICAL: Categorize result for AUDIT TRAIL only.
@@ -10093,18 +10252,55 @@ def main():
     
         # Tab 6: Bets
         with tab6:
-            st.markdown("###  Bet Tracker")
-            
-            # Section 1: The Dashboard
+            # Modern Top Bar with Auto-Settle
             stats = tracker.get_stats()
             all_bets = tracker.get_bets()
-            
+
+            top_head_c1, top_head_c2 = st.columns([3, 1.2])
+            with top_head_c1:
+                st.markdown("### 📋 Bet Tracker")
+            with top_head_c2:
+                pending_count = stats.get('pending', 0)
+                if pending_count > 0:
+                    if st.button(f"⚡ Auto-Settle ({pending_count})", type="primary", use_container_width=True, help="Auto-settles pending game and player prop bets against official ESPN box scores"):
+                        with st.spinner("Grading against official final scores & box scores..."):
+                            settle_res = tracker.auto_settle_pending_bets()
+                            if settle_res.get('settled_count', 0) > 0:
+                                st.success(f"Settled {settle_res['settled_count']} bets! ({settle_res['wins']}W - {settle_res['losses']}L - {settle_res['pushes']}P)")
+                                time.sleep(1)
+                                st.rerun()
+                            else:
+                                st.info("No matching final scores found yet (games may still be in progress).")
+
+            # Section 1: The Dashboard
             if stats['total_decided'] > 0:
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Win% (staked)", f"{stats['win_rate']:.0%}")
                 c2.metric("Record", f"{stats['wins']}-{stats['losses']}")
                 c3.metric("P/L", f"{stats['total_profit']:+,.0f}")
                 c4.metric("Pending", stats['pending'])
+
+                # Sub-metrics: Game Lines vs Player Props
+                decided_bets = [b for b in all_bets if b.get('result') in ['Win', 'Loss', 'Push']]
+                game_decided = [b for b in decided_bets if b.get('market') in ['SPREAD', 'TOTAL', 'spread', 'total'] or b.get('bet_type') in ['spread', 'total']]
+                prop_decided = [b for b in decided_bets if b not in game_decided]
+
+                if game_decided or prop_decided:
+                    sub_c1, sub_c2 = st.columns(2)
+                    with sub_c1:
+                        if game_decided:
+                            gw = sum(1 for b in game_decided if b.get('result') == 'Win')
+                            gl = sum(1 for b in game_decided if b.get('result') == 'Loss')
+                            gpnl = sum((b.get('stake', 0) * (float(b.get('odds_decimal') or 1.91) - 1.0)) if b.get('result') == 'Win' else -float(b.get('stake', 0)) for b in game_decided if b.get('result') in ['Win', 'Loss'])
+                            gcolor = "green" if gpnl >= 0 else "red"
+                            st.caption(f"🏀 **Game Lines:** {gw}-{gl} ({gw/max(1, gw+gl):.0%}) | P/L: :{gcolor}[${gpnl:+,.0f}]")
+                    with sub_c2:
+                        if prop_decided:
+                            pw = sum(1 for b in prop_decided if b.get('result') == 'Win')
+                            pl = sum(1 for b in prop_decided if b.get('result') == 'Loss')
+                            ppnl = sum((b.get('stake', 0) * (float(b.get('odds_decimal') or 1.91) - 1.0)) if b.get('result') == 'Win' else -float(b.get('stake', 0)) for b in prop_decided if b.get('result') in ['Win', 'Loss'])
+                            pcolor = "green" if ppnl >= 0 else "red"
+                            st.caption(f"👤 **Player Props:** {pw}-{pl} ({pw/max(1, pw+pl):.0%}) | P/L: :{pcolor}[${ppnl:+,.0f}]")
                 
                 with st.expander(" Equity Curve", expanded=True):
                     # Use stake-filtered, stake-weighted equity (ignore zero-stake bets)
@@ -10246,7 +10442,9 @@ def main():
             st.markdown("###  Bet Manager")
             
             if all_bets:
-                f_col1, f_col2, f_col3, f_col4 = st.columns([2, 2, 1, 1])
+                f_seg, f_col1, f_col2, f_col3, f_col4 = st.columns([1.6, 1.4, 1.4, 0.8, 1])
+                with f_seg:
+                    bet_type_seg = st.selectbox("Category:", ["All Bets", "🏀 Game Lines", "👤 Player Props"], index=0)
                 with f_col1:
                     filter_opts = ["Pending", "Win", "Loss", "Push"]
                     selected_filters = st.multiselect("Filter Result:", filter_opts, default=["Pending", "Win", "Loss"])
@@ -10261,6 +10459,11 @@ def main():
                 filtered_bets = [b for b in all_bets 
                                 if b.get('result', 'Pending') in selected_filters 
                                 and b.get('tag', 'legacy') in selected_tags]
+
+                if bet_type_seg == "🏀 Game Lines":
+                    filtered_bets = [b for b in filtered_bets if b.get('market') in ['SPREAD', 'TOTAL', 'spread', 'total'] or b.get('bet_type') in ['spread', 'total']]
+                elif bet_type_seg == "👤 Player Props":
+                    filtered_bets = [b for b in filtered_bets if not (b.get('market') in ['SPREAD', 'TOTAL', 'spread', 'total'] or b.get('bet_type') in ['spread', 'total'])]
                 
                 if sort_option == "Result/ID":
                     sort_map = {'Pending': 0, 'Win': 1, 'Loss': 2, 'Push': 3}
@@ -10298,12 +10501,23 @@ def main():
                                 
                                 with c1:
                                     color = {"Win": "green", "Loss": "red", "Push": "blue"}.get(bet_res, "gray")
-                                    icon = {"Win": "", "Loss": "", "Push": ""}.get(bet_res, "")
+                                    icon = {"Win": "✅", "Loss": "❌", "Push": "⚪"}.get(bet_res, "⏳")
                                     proj_val = bet.get('proj', bet.get('predicted_mean', 0))
                                     odds_val = bet.get('odds_decimal', bet.get('odds'))
                                     odds_text = f"{float(odds_val):.2f}" if odds_val is not None else "N/A"
-                                    st.markdown(f"**{bet['player']}** {bet['market']}")
-                                    st.caption(f"{icon} :{color}[{bet['side']} {bet['line']}] vs {bet['opponent']} | Proj: {proj_val:.1f} | EV: {bet.get('ev',0):.1%} | Stake: ${bet.get('stake', 0):.0f} | Odds: {odds_text}")
+                                    is_game_bet = bet.get('market') in ['SPREAD', 'TOTAL', 'spread', 'total'] or bet.get('bet_type') in ['spread', 'total']
+                                    type_icon = "🏀" if is_game_bet else "👤"
+
+                                    clv_badge = ""
+                                    if bet.get('clv') is not None and abs(float(bet.get('clv', 0))) > 0.05:
+                                        clv_val = float(bet['clv'])
+                                        clv_color = "green" if clv_val > 0 else "red"
+                                        clv_badge = f" | CLV: :{clv_color}[{clv_val:+.1f} pts]"
+
+                                    tag_badge = f" `[{bet.get('tag')}]`" if bet.get('tag') else ""
+                                    opponent_text = f" vs {bet.get('opponent')}" if bet.get('opponent') else ""
+                                    st.markdown(f"**{type_icon} {bet['player']}** `{bet['market']}`{tag_badge}")
+                                    st.caption(f"{icon} :{color}[{bet['side']} {bet['line']}]{opponent_text} | Proj: {proj_val:.1f} | EV: {bet.get('ev',0):.1%} | Stake: ${bet.get('stake', 0):.0f} | Odds: {odds_text}{clv_badge}")
                                 
                                 with c2:
                                     opts = ["Pending", "Win", "Loss", "Push"]
@@ -10380,6 +10594,37 @@ def main():
                 else:
                     st.info("Tracker is empty. No tracker file found on disk.")
     
+    
+            # Section 4: Real Harvested Closing Odds Feed
+            st.markdown("---")
+            with st.expander("📊 Real Harvested Closing Odds Feed (League-Wide Database)", expanded=False):
+                st.caption("Farmed daily closing lines and settled game outcomes from official sportsbooks (DraftKings, FanDuel, BetMGM).")
+                h_tab1, h_tab2 = st.tabs(["🏀 Settled Games (Spreads & Totals)", "👤 Settled Player Props (Closing Lines)"])
+                with h_tab1:
+                    games_csv = Path("data/harvested_odds/settled_games.csv")
+                    if games_csv.exists():
+                        g_df = pd.read_csv(games_csv)
+                        if not g_df.empty:
+                            st.dataframe(g_df.tail(20), use_container_width=True)
+                        else:
+                            st.info("No settled games harvested yet.")
+                    else:
+                        st.info("Harvested games database will appear here after first game settlement.")
+                with h_tab2:
+                    props_pqt = Path("data/harvested_odds/settled_player_props.parquet")
+                    if props_pqt.exists():
+                        p_df = pd.read_parquet(props_pqt)
+                        if not p_df.empty:
+                            m_filter = st.selectbox("Filter Market:", ["ALL"] + sorted(p_df['market'].unique()), key="harvest_market_filter")
+                            if m_filter != "ALL":
+                                p_df = p_df[p_df['market'] == m_filter]
+                            disp_cols = [c for c in ['date', 'player', 'market', 'closing_line', 'line_movement', 'actual_value', 'margin', 'result', 'side', 'minutes_played'] if c in p_df.columns]
+                            st.dataframe(p_df[disp_cols].tail(50), use_container_width=True)
+                        else:
+                            st.info("No settled player props harvested yet.")
+                    else:
+                        st.info("Harvested player props database will appear here after first prop settlement.")
+
     # Tab 7: Parlays
     with tab7:
         render_parlay_tab(parlay_tracker, bankroll, bankroll_enabled)
