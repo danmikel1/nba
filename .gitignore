@@ -6,6 +6,7 @@ venv/
 # Streamlit/VS Code state
 .streamlit/
 .vscode/
+.env
 
 # App runtime outputs
 bet_tracker.json

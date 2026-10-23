@@ -14,8 +14,9 @@ def test_model_expected_features_mapped_no_warnings(caplog):
         spread=0.0, game_total=210.0, days_rest=1, is_home=False, is_b2b=False, games_played=10
     )
 
-    # Get the expected features from the model for a common market
-    _, _, expected_features = me._get_model_for_market('PTS')
+    # Get the expected features from the model for a common market (supports 2-tuple and legacy 3-tuple)
+    res = me._get_model_for_market('PTS')
+    expected_features = res[-1]
 
     # Capture any warnings emitted during feature extraction
     caplog.clear()

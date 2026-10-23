@@ -1,0 +1,52 @@
+{
+  "spread": {
+    "name": "spread",
+    "samples_train": 17685,
+    "samples_test": 2640,
+    "mae": 10.837,
+    "rmse": 13.977,
+    "r2": 0.2206,
+    "coverage_80pct": 72.6,
+    "avg_width": "29.76",
+    "vegas_mae": 10.649,
+    "improvement_vs_vegas": -0.188,
+    "cv_mae": 10.093,
+    "cv_std": 0.708
+  },
+  "total": {
+    "name": "total",
+    "samples_train": 17685,
+    "samples_test": 2640,
+    "mae": 14.389,
+    "rmse": 17.988,
+    "r2": 0.2062,
+    "coverage_80pct": 77.0,
+    "avg_width": "43.32",
+    "vegas_mae": 14.144,
+    "improvement_vs_vegas": -0.245,
+    "cv_mae": 14.231,
+    "cv_std": 0.37
+  },
+  "training_config": {
+    "min_season": 2010,
+    "max_season": 2025,
+    "test_seasons": [
+      2024,
+      2025
+    ],
+    "n_features": 42,
+    "xgb_params": {
+      "n_estimators": 600,
+      "learning_rate": 0.04,
+      "max_depth": 5,
+      "min_child_weight": 8,
+      "subsample": 0.8,
+      "colsample_bytree": 0.8,
+      "reg_alpha": 1.0,
+      "reg_lambda": 2.0,
+      "gamma": 0.15,
+      "random_state": 42,
+      "verbosity": 0
+    }
+  }
+}

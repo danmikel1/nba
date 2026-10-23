@@ -11,3 +11,5 @@ def test_cache_ttls_and_season_format():
     assert pattern.match(Config.CURRENT_SEASON), f"CURRENT_SEASON has unexpected format: {Config.CURRENT_SEASON}"
     assert pattern.match(Config.PREV_SEASON), f"PREV_SEASON has unexpected format: {Config.PREV_SEASON}"
     assert isinstance(Config.TRAINING_SEASONS, tuple) and len(Config.TRAINING_SEASONS) >= 3
+    # new toggle for offline/online API fetching
+    assert hasattr(Config, 'API_ALLOW_REFRESH') and Config.API_ALLOW_REFRESH in (True, False)

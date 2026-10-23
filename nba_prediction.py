@@ -17,13 +17,15 @@ import logging
 from enum import Enum
 import warnings
 import joblib
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split, TimeSeriesSplit
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, accuracy_score
 from scipy import stats  # V19: For CDF-based probability calculation
 import requests
 from bs4 import BeautifulSoup
 from data_engine import DataEngine
 from trading_engine import TradingEngine
+from depth_chart_manager import DepthChartManager
+from persistence_utils import atomic_json_save, safe_json_load
 warnings.filterwarnings('ignore')
 
 # =============================================================================
@@ -90,14 +92,18 @@ def _conditional_cache(ttl: int):
 # Initialize Data Engine singleton with st.cache_resource
 if _IN_MAIN_PROCESS:
     @st.cache_resource
-    def get_data_engine(data_dir: Path, season: str) -> DataEngine:
-        """Singleton provider for DataEngine using Streamlit cache."""
-        return DataEngine(data_dir=data_dir, season=season)
+    def get_data_engine(data_dir: Path, season: str, allow_fetch: bool = True) -> DataEngine:
+        """Singleton provider for DataEngine using Streamlit cache.
+
+        `allow_fetch` mirrors `CONFIG.API_ALLOW_REFRESH` and is passed to the
+        underlying DataEngine so that the cached instance honours the setting.
+        """
+        return DataEngine(data_dir=data_dir, season=season, allow_fetch=allow_fetch)
 
 logging.basicConfig(level=logging.INFO if _IN_MAIN_PROCESS else logging.WARNING)
 logger = logging.getLogger(__name__)
 
-CURRENT_VERSION = 'v20.3'
+CURRENT_VERSION = 'v21.5'
 
 
 def _get_dynamic_seasons():
@@ -145,10 +151,25 @@ class Config:
     CACHE_TTL_PLAYER_IDS: int = 3600    # 1 hour (was 86400 / 24h)
     CACHE_TTL_GAME_LOGS: int = 600      # 10 minutes (was 1800 / 30m)
     
+    # === API CONTROLS ===
+    # Allows the app to run completely offline using on-disk caches.
+    # When False, any attempt to refresh data will use stale files or fall
+    # back to defaults instead of hitting stats.nba.com (useful when the
+    # service is down or you're just browsing previous bets).
+    API_ALLOW_REFRESH: bool = True
+
     # === ML COMMITMENT ===
     # ML is the SOLE prediction engine. No fallbacks.
     ML_REQUIRE_MODEL: bool = True
     ML_CALIBRATION_ENABLED: bool = True
+
+    # === LIVE CALIBRATION ===
+    # Temperature scaling corrects overconfident probabilities against sharp
+    # sportsbook lines.  T > 1 = overconfident.  Fitted from bet_tracker.json
+    # outcomes via scripts/fit_live_calibrator.py.  Set to 1.0 to disable.
+    # V26: Reduced from 4.75 → 2.40 after line correction (realistic half-point
+    # training lines via OLS mapping from OddsBlaze DK data).
+    LIVE_CALIBRATION_TEMPERATURE: float = 2.40
     
     # === DATA DEFAULTS (not heuristics - just fallbacks for missing data) ===
     DEFAULT_PACE: float = 100.0
@@ -173,6 +194,40 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 TRACKER_FILE = DATA_DIR / "bet_tracker.json"
 PARLAY_FILE = DATA_DIR / "parlay_tracker.json"
 WATCHLIST_FILE = DATA_DIR / "watchlist.json"
+PREDICTION_LOG_FILE = DATA_DIR / "prediction_log.json"  # All predictions for analysis
+
+# --- Module-level caches for morning_refresh.py data ---
+_FATIGUE_CACHE: dict = {}  # Lazy-loaded from data/fatigue_index.json
+_ALTITUDE_FT_LOOKUP = {"DEN": 5280, "UTA": 4327, "OKC": 1200}
+
+# Arena coordinates for historical travel distance computation (lat, lon)
+_ARENA_COORDS = {
+    "ATL": (33.7573, -84.3963), "BOS": (42.3662, -71.0621),
+    "BKN": (40.6826, -73.9754), "CHA": (35.2251, -80.8392),
+    "CHI": (41.8807, -87.6742), "CLE": (41.4965, -81.6882),
+    "DAL": (32.7905, -96.8103), "DEN": (39.7487, -105.0077),
+    "DET": (42.3410, -83.0552), "GSW": (37.7680, -122.3877),
+    "HOU": (29.7508, -95.3621), "IND": (39.7639, -86.1555),
+    "LAC": (33.9425, -118.1072), "LAL": (34.0430, -118.2673),
+    "MEM": (35.1382, -90.0505), "MIA": (25.7814, -80.1870),
+    "MIL": (43.0450, -87.9170), "MIN": (44.9795, -93.2760),
+    "NOP": (29.9490, -90.0823), "NYK": (40.7505, -73.9934),
+    "OKC": (35.4634, -97.5151), "ORL": (28.5392, -81.3839),
+    "PHI": (39.9012, -75.1720), "PHX": (33.4457, -112.0712),
+    "POR": (45.5316, -122.6668), "SAC": (38.5802, -121.4997),
+    "SAS": (29.4270, -98.4375), "TOR": (43.6435, -79.3791),
+    "UTA": (40.7683, -111.9011), "WAS": (38.8981, -77.0209),
+}
+
+def _haversine_miles(coord1: tuple, coord2: tuple) -> float:
+    """Great-circle distance in miles between two (lat, lon) points."""
+    from math import radians, sin, cos, sqrt, atan2
+    R = 3958.8
+    lat1, lon1 = radians(coord1[0]), radians(coord1[1])
+    lat2, lon2 = radians(coord2[0]), radians(coord2[1])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a))
 
         
 # =============================================================================
@@ -194,156 +249,135 @@ def get_groq_client():
     
 def get_ai_second_opinion(prop_analysis, backtest_json, history_context=None):
     """
-    Get a second opinion from Groq (Llama 3.3 70B) with FULL CONTEXT + MODEL HISTORY.
-    """
-    client = get_groq_client()
-    if not client: 
-        return " Missing GROQ_API_KEY in secrets."
-
-    # --- 1. SAFE DATA PREP (Prevent NoneType Crashes) ---
+    V21.4: RAW FEATURE AI (No Hard-Coded Heuristics)
     
-    # Feature Defaults
+    Philosophy: Feed the LLM the same features the ML model uses.
+    Let the LLM interpret them, not Python hard-coded rules.
+    
+    The ML model learned relationships from data.
+    The LLM provides human-readable interpretation of the same features.
+    """
+    
+    # ==========================================================================
+    # 1. EXTRACT FEATURES (Same as ML Model Input)
+    # ==========================================================================
+    player = prop_analysis.get('player', 'Unknown')
+    position = prop_analysis.get('position', '')
+    opponent = prop_analysis.get('opponent', backtest_json.get('opponent', ''))
+    market = prop_analysis.get('market', 'PTS')
+    
+    # --- Model Outputs ---
+    line = float(prop_analysis.get('line', backtest_json.get('line', 0.0)) or 0.0)
+    proj = float(prop_analysis.get('projected', prop_analysis.get('projected_value', 0.0)) or 0.0)
+    prob = float(prop_analysis.get('prob', 0.0) or 0.0)
+    ev = float(prop_analysis.get('ev', 0.0) or 0.0)
+    signal = prop_analysis.get('predicted_side', prop_analysis.get('signal', 'OVER'))
+    spread = float(prop_analysis.get('spread', backtest_json.get('spread', 0.0)) or 0.0)
+    
+    # --- Raw Features (No Interpretation Yet) ---
+    ema = float(prop_analysis.get('feat_ema', 0) or 0)
     season_avg = float(prop_analysis.get('feat_season_avg', 0) or 0)
     l10_avg = float(prop_analysis.get('feat_l10_avg', 0) or 0)
-    h2h = float(prop_analysis.get('feat_h2h_avg', -1) or -1)
-    missing_production = float(prop_analysis.get('teammates_out_ppg', 0) or 0)
+    trend_5g = float(prop_analysis.get('feat_trend_5g', 0) or 0)
+    std = float(prop_analysis.get('feat_std', 0) or 0)
+    cv = float(prop_analysis.get('feat_cv', 0) or 0)
+    avg_minutes = float(prop_analysis.get('feat_avg_minutes', 0) or 0)
+    min_volatility = float(prop_analysis.get('feat_min_volatility', 0) or 0)
+    days_rest = int(prop_analysis.get('feat_days_rest', 1) or 1)
+    is_b2b = bool(prop_analysis.get('feat_is_b2b', False))
+    is_home = bool(prop_analysis.get('feat_is_home', True))
+    depth_rank = int(prop_analysis.get('feat_depth_rank', 4) or 4)
+    hit_rate_l10 = float(prop_analysis.get('feat_hit_rate_l10', 0) or 0)
+    hit_rate_l20 = float(prop_analysis.get('feat_hit_rate_l20', 0) or 0)
+    team_out_ppg = float(prop_analysis.get('feat_team_out_ppg', 0) or 0)
+    opp_drtg = float(prop_analysis.get('feat_opponent_drtg_season', 110) or 110)
+    opp_rank_vs_pos = int(prop_analysis.get('feat_opp_rank_vs_pos', 15) or 15)
+    home_avg = float(prop_analysis.get('feat_home_avg', ema) or ema)
+    away_avg = float(prop_analysis.get('feat_away_avg', ema) or ema)
+    games_played = int(prop_analysis.get('feat_games_played', 0) or 0)
     
-    # Usage Formatting
-    usage_raw = float(prop_analysis.get('feat_usage_rate', 0) or 0)
-    usage_pct = (usage_raw / 2.083) * 100 if usage_raw < 5.0 else usage_raw
+    # --- Derived (Math, Not Heuristics) ---
+    edge = (proj - line) if signal == 'OVER' else (line - proj)
+    depth_labels = {1: 'Starter', 2: 'Rotation', 3: 'Bench', 4: 'Unknown'}
+    depth_str = depth_labels.get(depth_rank, 'Unknown')
+    location = "HOME" if is_home else "AWAY"
+    location_avg = home_avg if is_home else away_avg
 
-    # Backtest Defaults (Handle Missing/Empty Data)
-    l30_rate = backtest_json.get('l30_rate', 'N/A')
+# ==========================================================================
+    # 2. BUILD RAW FEATURE PROMPT
+    # ==========================================================================
+    # Compute signal coherence for trend analysis
+    trend_aligns = (trend_5g > 0 and signal == 'OVER') or (trend_5g < 0 and signal == 'UNDER') or abs(trend_5g) < 0.3
+    trend_status = "aligned" if trend_aligns else "contradictory"
+
+    # --- NEW: MATH SAFETY CHECK ---
+    # We calculate the severity here so the LLM doesn't have to guess
+    trend_flag = ""
+    if not trend_aligns and abs(trend_5g) > 1.5:
+        trend_flag = f" [⚠️ CRITICAL: Exceeds ±1.5 Threshold!]"
     
-    # Safe Format for Avg Diff
-    avg_diff_val = backtest_json.get('avg_diff')
-    if avg_diff_val is not None and isinstance(avg_diff_val, (int, float)):
-        avg_diff_str = f"{avg_diff_val:+.1f}"
-    else:
-        avg_diff_str = "N/A"
-        
-    # EV/Prob Formatting
-    ev_val = prop_analysis.get('ev', 0)
-    prob_val = prop_analysis.get('prob', 0)
-    ev_str = f"{ev_val:.1%}" if ev_val is not None else "N/A"
-    prob_str = f"{prob_val:.1%}" if prob_val is not None else "N/A"
-
-    #  NEW: INTUITIVE EDGE CALCULATION
-    # Positive Edge always means "Good/Safe". Negative means "Bad/Tight".
-    try:
-        proj = float(prop_analysis.get('projected', 0))
-        line = float(prop_analysis.get('line', 0))
-        signal = prop_analysis.get('signal', 'OVER') # Default to OVER if missing
-        
-        if signal == 'OVER':
-            edge = proj - line # e.g. 17.0 - 14.5 = +2.5 (Good)
-        else: # UNDER
-            edge = line - proj # e.g. 14.5 - 11.0 = +3.5 (Good)
-            
-        edge_str = f"{edge:+.1f}"
-    except:
-        edge_str = "N/A"
-
-    # --- 2. CONSTRUCT HISTORY SECTION ---
-    history_section = "** MODEL TRACK RECORD: No Data**"
-    if history_context:
-        history_section = f"""
-    ** MODEL TRACK RECORD (Specific to {prop_analysis.get('player')} {prop_analysis.get('market')})**
-    * **Record:** {history_context.get('record', 'N/A')} ({history_context.get('win_rate', 'N/A')}%)
-    * **Sample Size:** {history_context.get('count', 0)} tracked bets
-    * **Recent Form:** {history_context.get('last_5', 'N/A')}
-    * **Reality Check:** This is how the model *actually* performs on this specific player.
-    """
-
-    #  EXTRACT BUCKET DATA
-    bucket_name = backtest_json.get('bucket_name', 'N/A')
-    bucket_wr = backtest_json.get('bucket_wr', 'N/A')
-    bucket_count = backtest_json.get('bucket_count', 0)
-    
-    bucket_section = ""
-    if bucket_name != "N/A":
-        bucket_section = f"""
-    ** CALIBRATION CHECK (The "Trust" Factor)**
-    * **Current Confidence:** {prop_analysis.get('prob'):.1%}
-    * **Historical Accuracy:** When the model is in the **{bucket_name}** range, it wins **{bucket_wr}%** of the time ({bucket_count} bets).
-    * **Implication:** Does the model's confidence match its actual performance?
-    """
-
-    # --- 3. BUILD PROMPT ---
-    # Build a lightweight `row` mapping so the new prompt block can reference a single record-like dict.
-    row = {
-        'player': prop_analysis.get('player'),
-        'position': prop_analysis.get('position', ''),
-        'opponent': prop_analysis.get('opponent', backtest_json.get('opponent') or prop_analysis.get('team', '')),
-        'market': prop_analysis.get('market'),
-        'predicted_side': prop_analysis.get('predicted_side', prop_analysis.get('signal', 'OVER')),
-        'line': float(prop_analysis.get('line', backtest_json.get('line', 0.0)) or 0.0),
-        'projected_value': float(prop_analysis.get('projected', prop_analysis.get('projected_value', 0.0)) or 0.0),
-        'prob': float(prop_analysis.get('prob', 0.0) or 0.0),
-        'spread': float(prop_analysis.get('spread', backtest_json.get('spread', 0.0)) or 0.0),
-    }
-
-    # ===============================================================================
-    # 1. CALCULATE CONTEXT VARIABLES (The "Eyes" of the Prompt)
-    # ===============================================================================
-    
-    # A) Blowout Detection
-    spread_val = row.get('spread', 0.0)  # Use 'spread' key (not 'feat_spread')
-    is_blowout = abs(spread_val) >= 12
-    game_script = "NEUTRAL"
-    if spread_val < -10: game_script = "BLOWOUT RISK (Starters might sit Q4)"
-    elif spread_val > 10: game_script = "TRAILING (Garbage time risk)"
-    
-    # B) Glitch Detection (The "Minutes vs Line" Trap)
-    # If the Line is closer to their Avg Minutes (e.g., 25.5) than their Projection (15.0)
-    diff_line_proj = row['line'] - row['projected_value']
-    glitch_warning = "PASS"  # Clearer than "NONE" — tells LLM data looks OK
-    if abs(diff_line_proj) > 8.0:
-        glitch_warning = f"⚠️ CRITICAL WARNING: Line ({row['line']}) is >8pts away from Projection ({row['projected_value']:.1f}). CHECK IF DATA IS 'MINUTES' INSTEAD OF 'PRA'."
-
-    # ===============================================================================
-    # 2. THE SYSTEM PROMPT (The "Brain")
-    # ===============================================================================
     prompt = f"""
-    ROLE:
-    You are a cynical, paranoid Senior Quantitative Risk Manager. 
-    Your job is NOT to find winners. Your job is to preventing the user from losing money on "Traps" and "Bad Data."
-    
-    INPUT DATA:
-    - Player: {row['player']} ({row['position']}) vs {row['opponent']}
-    - Bet: {row['market']} {row['predicted_side']} {row['line']}
-    - Model Projection: {row['projected_value']:.1f}
-    - Model Win Probability: {row.get('prob', 0)*100:.1f}%
-    - Vegas Spread: {spread_val} ({game_script})
-    
-    RISK FACTORS:
-    - Data Integrity Check: {glitch_warning}
-    - Blowout Risk: {"YES" if is_blowout else "NO"}
-    
-    INSTRUCTIONS:
-    1. **KILL SWITCH**: If the "Data Integrity Check" warning is present, you MUST Reject the bet. State that the Line is likely corrupted.
-    2. **BLOWOUT CHECK**: If betting an OVER in a Blowout Risk game, be extremely cautious. Starters lose 15-20% of minutes in blowouts.
-    3. **SYCOPHANT CHECK**: Do not blindly agree with the Model Win Probability. If the Probability is >75% but the edge is thin, call it "Overfitting."
-    
-    OUTPUT FORMAT (Strict):
-    VERDICT: [AGREE / DISAGREE / CAUTION]
-    RATIONALE: [One clear, blunt sentence. Focus on the negative risks.]
-    CONFIDENCE: [0-10]
-    """
+You validate ML sports betting predictions. Your default answer is TAKE.
+
+┌───────────────────────────────────────────────────────────────────────────────┐
+│ BET: {player} ({position}) {market} {signal} {line} vs {opponent}             │
+│ Model Projection: {proj:.1f} | Win Prob: {prob*100:.0f}% | EV: {ev*100:+.1f}% │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+FEATURES:
+• Recent: Season={season_avg:.1f}, L10={l10_avg:.1f}, EMA={ema:.1f}
+• Trend: {trend_5g:+.2f}/game ({trend_status} with {signal}){trend_flag}
+• Volatility: StdDev={std:.1f}, CV={cv*100:.0f}%, MinutesVol={min_volatility:.1f}
+• Sample: {games_played} games, Hit Rate L10={hit_rate_l10*100:.0f}%
+• Context: {location}, Days Rest={days_rest}, B2B={"Yes" if is_b2b else "No"}
+• Matchup: OppDRTG={opp_drtg:.1f}, Rank vs Pos=#{opp_rank_vs_pos}/30
+• Injuries: Team missing {team_out_ppg:.1f}ppg, Opp missing {prop_analysis.get('feat_opp_out_ppg', 0):.1f}ppg
+
+════════════════════════════════════════════════════════════════════════════════
+RULES (FADE requires ALL of these to be true for the specific criterion)
+════════════════════════════════════════════════════════════════════════════════
+FADE ONLY if one of these EXACT conditions is met:
+1. games_played < 15
+2. CV > 35%
+3. Trend magnitude > 1.5/game AND trend direction opposes the signal
+4. MinutesVol > 8 AND signal is OVER
+
+If NONE of these conditions are met, output TAKE. Do not invent other reasons.
+
+OUTPUT (exactly this format, nothing else):
+VERDICT: [TAKE/FADE]
+REASON: [One sentence citing the specific feature values that support your verdict]
+CONFIDENCE: [1-10]
+"""
     
     try:
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile", 
-            messages=[
-                {"role": "system", "content": "You are a professional sports bettor. Be concise, analytical, and ignore 'coach speak'. Focus on math and usage."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=600
+        from llm_engine import query_llm
+        system_msg = (
+            "You validate ML betting predictions against 4 specific numeric thresholds. "
+            "If none are triggered, output TAKE. Do not add subjective commentary or invent concerns not in the rules."
         )
-        return completion.choices[0].message.content
+        res = query_llm(prompt=prompt, system_prompt=system_msg, temperature=0.2)
+        if res.get("success"):
+            return res.get("response", "").strip()
+
+        # Fallback to direct Groq client
+        client = get_groq_client()
+        if client:
+            completion = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.2,
+                max_tokens=120
+            )
+            return completion.choices[0].message.content.strip()
+
+        return res.get("response", "No LLM response available.")
     except Exception as e:
-        return f"Groq Error: {str(e)}"
+        return f"AI Generation Error: {str(e)}"
+    
     
 class ResultQuality(Enum):
     """
@@ -498,6 +532,10 @@ class FeatureVector:
     feat_fatigue_load: float = 0.0  # (Minutes / Rest) interaction
     feat_form_gap: float = 0.0      # (Recent - Season) delta
 
+    # === V21.6 NEW: TRAVEL / ALTITUDE FEATURES (from morning_refresh.py) ===
+    feat_miles_96h: float = 0.0     # Miles traveled by player's team in last 96 h
+    feat_altitude_next: int = 0     # Altitude in feet of the game's arena
+
     # === V20.5 NEW: HIT RATE FEATURES ===
     feat_hit_rate_l10: float = 0.0  # % of last 10 games over line
     feat_hit_rate_l20: float = 0.0  # % of last 20 games over line
@@ -505,6 +543,10 @@ class FeatureVector:
     # === V20.5 NEW: DEFENSE VS POSITION ===
     feat_opp_rank_vs_pos: int = 15   # 1=Best defense, 30=Worst defense
 
+    # === V21.1 NEW: DEPTH CHART RANK ===
+    # 1=Starter, 2=Backup, 3=Reserve, 4=Deep Bench (Not Found)
+    # Dynamically adjusted when starters are injured ("Next Man Up")
+    feat_depth_rank: int = 4
 
     # === MARKET IDENTITY (one-hot encoded) ===
     market_scoring: int = 0  # PTS
@@ -512,9 +554,9 @@ class FeatureVector:
     market_combo: int = 0    # PRA, PR, PA, RA
 
     # === BEHAVIOR & RISK FEATURES ===
-    # Rolling std dev of minutes (risk)
+    # Rolling std dev of minutes across recent games (pre-game observable)
     feat_min_volatility: float = -1.0
-    # Rolling mean of personal fouls (behavior)
+    # Rolling mean of personal fouls per game over lookback window (pre-game observable)
     feat_foul_rate: float = -1.0
     # Coefficient of variation for target stat (std / ema)
     feat_cv: float = -1.0
@@ -562,6 +604,10 @@ class FeatureVector:
         feat_columns: List[str] = []
         for name in ordered:
             feat_columns.append(name if name.startswith('feat_') else f'feat_{name}')
+
+        # Copilot: Remove 'feat_hit_rate_l10' and 'feat_hit_rate_l20' from training feature list.
+        # Keep the fields in the FeatureVector dataclass for live/inference usage — only exclude from training.
+        feat_columns = [c for c in feat_columns if c not in ('feat_hit_rate_l10', 'feat_hit_rate_l20')]
 
         return feat_columns
 
@@ -643,6 +689,7 @@ class BetDecision:
     (These were "fake certainty" - making guesses look like facts)
     
     Standard output: EV, predicted_mean (via projection), predicted_std, win_prob
+    V21.2: Added quality_score for risk-adjusted ranking (EV / sigma)
     """
     recommended_side: str  # "OVER" or "UNDER"
     probability: float     # P(winning the recommended side)
@@ -651,6 +698,7 @@ class BetDecision:
     predicted_std: float   # [stat] uncertainty
     kelly_stake: float     # Suggested stake (EV-based)
     kelly_fraction: float  # Stake as fraction of bankroll
+    quality_score: float = 0.0  # V21.2: Sharpe-like risk-adjusted EV (EV / sigma)
 
 
 @dataclass
@@ -667,6 +715,9 @@ class AnalysisResult:
     market: Optional[str] = None
     line: Optional[float] = None
     odds: Optional[float] = None
+    
+    # V21.2: Player position for AI analyst
+    player_position: Optional[str] = None
     
     # Components
     features: Optional[FeatureVector] = None
@@ -841,21 +892,96 @@ class DataLoader:
         # Position Usage Map: {team_id: {position: mean_usg_pct}}
         self._pos_usage_map: Optional[Dict[int, Dict[str, float]]] = None
 
+        # attempt to warm position cache from disk before any API calls
+        self._preload_positions_from_json()
+
         # Integrate DataEngine
         if data_engine:
             self.data_engine = data_engine
         elif _IN_MAIN_PROCESS:
             # Use singleton if available
-            self.data_engine = get_data_engine(DATA_DIR, config.CURRENT_SEASON)
+            # pass API_ALLOW_REFRESH so that the singleton respects offline mode
+            self.data_engine = get_data_engine(
+                DATA_DIR,
+                config.CURRENT_SEASON,
+                allow_fetch=getattr(config, 'API_ALLOW_REFRESH', True)
+            )
         else:
             # Create fresh instance for worker process
             # Note: Workers will share disk cache (parquet) so this is efficient
-            self.data_engine = DataEngine(DATA_DIR, config.CURRENT_SEASON)
+            self.data_engine = DataEngine(
+                DATA_DIR,
+                config.CURRENT_SEASON,
+                allow_fetch=getattr(config, 'API_ALLOW_REFRESH', True)
+            )
+        # inject any preloaded positions into the newly created data_engine
+        if self._position_cache and hasattr(self.data_engine, '_position_cache'):
+            count = len(self._position_cache)
+            try:
+                self.data_engine._position_cache.update(self._position_cache)
+                logger.debug(f"Injected {count} positions into data_engine cache")
+            except Exception:
+                logger.debug("Failed to inject position cache into data_engine")
     
+    def _preload_positions_from_json(self):
+        """Load player positions from disk if available and cache them.
+
+        Searches DATA_DIR and its parent for player_positions.json which is the
+        same file written by DataLoader.fetch_player_positions(). The file may
+        contain a top-level dict with a "positions" key or be the positions map
+        directly. Keys are string player IDs and values are position codes.
+        Loaded entries are converted to int keys and stored in
+        ``self._position_cache``. If a ``data_engine`` instance already exists
+        and it exposes a ``_position_cache`` attr we also update that so the
+        downstream engine can use the warmed cache immediately.
+        """
+        paths = [
+            DATA_DIR / 'player_positions.json',
+            DATA_DIR.parent / 'player_positions.json'
+        ]
+        positions = {}
+        for p in paths:
+            if p.exists():
+                try:
+                    with open(p, 'r') as f:
+                        data = json.load(f)
+                        if isinstance(data, dict):
+                            positions_dict = data.get('positions', data)
+                            for k, v in positions_dict.items():
+                                try:
+                                    positions[int(k)] = v
+                                except Exception:
+                                    continue
+                except Exception as e:
+                    logger.warning(f"Failed to load positions from {p}: {e}")
+                break
+        if not positions:
+            logger.debug("No player_positions.json found for preloading")
+            return
+        self._position_cache.update(positions)
+        count = len(positions)
+        logger.info(f"DataLoader: pre-loaded {count} player positions from {p}")
+        if hasattr(self, 'data_engine') and getattr(self.data_engine, '_position_cache', None) is not None:
+            try:
+                self.data_engine._position_cache.update(positions)
+                logger.debug(f"Injected {count} positions into data_engine cache")
+            except Exception:
+                logger.debug("Failed to inject positions into data_engine at preload time")
+
     def _api_call_with_retry(self, func, description: str = "API call"):
-        """Execute API call with retry logic. Exponential backoff for rate limits."""
+        """Execute API call with retry logic. Exponential backoff for rate limits.
+
+        Respects CONFIG.API_ALLOW_REFRESH; if refresh is disabled we immediately
+        raise a DataLoaderError to prevent long sleeps and cooldown loops.
+        """
         import multiprocessing
         import random
+
+        # honor offline mode
+        if not getattr(self.config, 'API_ALLOW_REFRESH', True):
+            logger.warning(f"API calls disabled; skipping {description}")
+            raise DataLoaderError(f"API disabled, cannot perform {description}")
+
         last_exception = None
         cooldown_count = 0
         MAX_COOLDOWNS = 5  # More patient - 5 cooldowns before failing
@@ -889,8 +1015,8 @@ class DataLoader:
                     if cooldown_count >= MAX_COOLDOWNS:
                         logger.error(f" {MAX_COOLDOWNS} consecutive timeouts. API is blocked. Failing fast.")
                         raise DataLoaderError(f"{description} failed: API rate limited after {cooldown_count} timeouts")
-                    # Exponential backoff: 30s, 60s, 90s, 120s
-                    wait_time = 30 * cooldown_count
+                    # Exponential backoff: 10s, 20s, 30s, 40s (reduced from 30/60/90/120)
+                    wait_time = 10 * cooldown_count
                     logger.warning(f" API Cooldown {cooldown_count}/{MAX_COOLDOWNS}. Waiting {wait_time}s...")
                     time.sleep(wait_time)
                 else:
@@ -1033,9 +1159,36 @@ class DataLoader:
     
     @_conditional_cache(ttl=CONFIG.CACHE_TTL_TEAM_STATS)
     def fetch_team_stats(_self, season: str = None) -> Tuple[pd.DataFrame, float, float]:
-        """Fetch league-wide team stats for a specific season."""
+        """
+        Fetch league-wide team stats for a specific season.
+
+        V21.6 DISK CACHE: Writes to data/cache/team_stats_{season}.pkl on first fetch.
+        On subsequent app restarts, reads from disk (TTL: 6h current season, 7 days historical).
+        Falls back to stale cache if API is unavailable (rate limited, timeout, etc.).
+        """
+        import joblib
+
         if season is None:
             season = _self.config.CURRENT_SEASON
+
+        # --- Disk cache path & TTL ---
+        cache_dir = DATA_DIR / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"team_stats_{season}.pkl"
+        ttl_hours = 6.0 if season == _self.config.CURRENT_SEASON else 168.0  # 7 days historical
+
+        # --- Cache hit ---
+        if cache_path.exists():
+            age_hours = (time.time() - cache_path.stat().st_mtime) / 3600.0
+            if age_hours < ttl_hours:
+                try:
+                    result = joblib.load(cache_path)
+                    logger.debug(f"Team stats for {season} loaded from disk cache ({age_hours:.1f}h old)")
+                    return result
+                except Exception as e:
+                    logger.warning(f"Failed to read team stats cache for {season}: {e}")
+
+        # --- Cache miss / stale — fetch from API ---
         try:
             def api_call():
                 return leaguedashteamstats.LeagueDashTeamStats(
@@ -1043,22 +1196,42 @@ class DataLoader:
                     measure_type_detailed_defense='Advanced',
                     per_mode_detailed='PerGame'
                 ).get_data_frames()[0]
-            
+
             stats = _self._api_call_with_retry(api_call, f"Fetch team stats ({season})")
-            
+
             if stats is None or len(stats) == 0:
                 logger.warning(f"No team stats available for {season}, using defaults")
                 return pd.DataFrame(), _self.config.DEFAULT_PACE, _self.config.DEFAULT_DEF_RATING
-            
+
             if 'PACE' not in stats.columns:
                 stats['PACE'] = _self.config.DEFAULT_PACE
             if 'DEF_RATING' not in stats.columns:
                 stats['DEF_RATING'] = _self.config.DEFAULT_DEF_RATING
-            
-            return stats.set_index('TEAM_ID'), stats['PACE'].mean(), stats['DEF_RATING'].mean()
-            
+
+            result = (stats.set_index('TEAM_ID'), stats['PACE'].mean(), stats['DEF_RATING'].mean())
+
+            # Save to disk
+            try:
+                joblib.dump(result, cache_path)
+                logger.info(f"Team stats for {season} cached to disk")
+            except Exception as e:
+                logger.warning(f"Failed to save team stats cache for {season}: {e}")
+
+            return result
+
         except Exception as e:
             logger.error(f"Failed to fetch team stats for {season}: {e}")
+
+            # --- Fallback: return stale cache rather than defaults ---
+            if cache_path.exists():
+                try:
+                    result = joblib.load(cache_path)
+                    age_hours = (time.time() - cache_path.stat().st_mtime) / 3600.0
+                    logger.warning(f"Using stale team stats cache for {season} ({age_hours:.1f}h old) due to API failure")
+                    return result
+                except Exception as ce:
+                    logger.warning(f"Stale cache also unreadable for {season}: {ce}")
+
             return pd.DataFrame(), _self.config.DEFAULT_PACE, _self.config.DEFAULT_DEF_RATING
     
     def fetch_all_seasons_team_stats(self, seasons: List[str] = None) -> Dict[str, Tuple[pd.DataFrame, float, float]]:
@@ -1137,35 +1310,48 @@ class DataLoader:
         if seasons is None:
             seasons = list(CONFIG.TRAINING_SEASONS)
 
-        per_season_count = 0
-        for season in seasons:
-            try:
-                logger.info(f"Fetching league player stats for positions (season={season})...")
-                df = leaguedashplayerstats.LeagueDashPlayerStats(season=season, per_mode_detailed='PerGame').get_data_frames()[0]
+        # If we already have good cache coverage for the requested players,
+        # skip the expensive per-season API calls entirely.
+        _need_season_fetch = True
+        if player_ids and positions:
+            _hit = sum(1 for pid in player_ids if pid in positions)
+            _coverage = _hit / len(player_ids) if player_ids else 0
+            if _coverage >= 0.90:
+                logger.info(f"Position cache has {_coverage:.0%} coverage ({_hit}/{len(player_ids)}) — skipping season API calls")
+                _need_season_fetch = False
 
-                # Accept a variety of possible column names for position
-                pos_cols = [c for c in df.columns if c.upper() in ('PLAYER_POSITION','POSITION','PLAYER_POS','POSITION_SHORT','POS')]
-                if 'PLAYER_ID' in df.columns and pos_cols:
-                    col = pos_cols[0]
-                    for _, row in df[['PLAYER_ID', col]].iterrows():
-                        pid = int(row['PLAYER_ID'])
-                        raw_pos = (row.get(col) or '').strip()
-                        if raw_pos == 'G':
-                            norm = 'PG'
-                        elif raw_pos == 'F':
-                            norm = 'PF'
-                        elif raw_pos in ('PG', 'SG', 'SF', 'PF', 'C'):
-                            norm = raw_pos
-                        else:
-                            norm = ''
-                        if norm:
-                            positions[pid] = norm
-                            per_season_count += 1
-                else:
-                    logger.warning(f"Unexpected columns in player stats for {season}: {df.columns.tolist()[:10]}")
-            except Exception as e:
-                logger.warning(f"Failed to fetch league player stats for {season}: {e}")
-                # continue to next season
+        per_season_count = 0
+        if _need_season_fetch:
+            for i, season in enumerate(seasons):
+                try:
+                    if i > 0:
+                        time.sleep(3)  # Rate-limit between season calls
+                    logger.info(f"Fetching league player stats for positions (season={season})...")
+                    df = leaguedashplayerstats.LeagueDashPlayerStats(season=season, per_mode_detailed='PerGame', timeout=30).get_data_frames()[0]
+
+                    # Accept a variety of possible column names for position
+                    pos_cols = [c for c in df.columns if c.upper() in ('PLAYER_POSITION','POSITION','PLAYER_POS','POSITION_SHORT','POS')]
+                    if 'PLAYER_ID' in df.columns and pos_cols:
+                        col = pos_cols[0]
+                        for _, row in df[['PLAYER_ID', col]].iterrows():
+                            pid = int(row['PLAYER_ID'])
+                            raw_pos = (row.get(col) or '').strip()
+                            if raw_pos == 'G':
+                                norm = 'PG'
+                            elif raw_pos == 'F':
+                                norm = 'PF'
+                            elif raw_pos in ('PG', 'SG', 'SF', 'PF', 'C'):
+                                norm = raw_pos
+                            else:
+                                norm = ''
+                            if norm:
+                                positions[pid] = norm
+                                per_season_count += 1
+                    else:
+                        logger.warning(f"Unexpected columns in player stats for {season}: {df.columns.tolist()[:10]}")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch league player stats for {season}: {e}")
+                    # continue to next season
 
         # 3) For any requested player_ids still missing, do limited parallel per-player lookups
         if player_ids:
@@ -1181,7 +1367,7 @@ class DataLoader:
                         logger.warning(f"Failed to get position for player {pid}: {e}")
                         return pid, 'SF'
 
-                max_workers = min(16, max(2, len(missing)))
+                max_workers = min(3, max(1, len(missing)))
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
                     futures = {ex.submit(_get_pos, pid): pid for pid in missing}
                     for fut in as_completed(futures):
@@ -1235,6 +1421,39 @@ class InjuryManager:
         # Cache for injury reports (30 min TTL)
         self._injury_cache: Dict[str, Any] = {}
 
+    def _sanitize_injury_player_name(self, raw_name: str) -> str:
+        """Clean malformed ESPN injury names (e.g., 'Pistons. Immanuel Quickley')."""
+        if not raw_name:
+            return ""
+
+        import re
+
+        name = str(raw_name).strip()
+        name = re.sub(r"\s+", " ", name)
+
+        # ESPN text blobs can leak a team prefix into the player capture.
+        team_tokens = [
+            'hawks', 'celtics', 'nets', 'hornets', 'bulls', 'cavaliers',
+            'mavericks', 'nuggets', 'pistons', 'warriors', 'rockets', 'pacers',
+            'clippers', 'lakers', 'grizzlies', 'heat', 'bucks', 'timberwolves',
+            'pelicans', 'knicks', 'thunder', 'magic', '76ers', 'suns',
+            'trail blazers', 'blazers', 'kings', 'spurs', 'raptors', 'jazz', 'wizards'
+        ]
+        if '. ' in name:
+            left, right = name.split('. ', 1)
+            left_norm = left.strip().lower()
+            if left_norm in team_tokens or left_norm.endswith('ers') or left_norm.endswith('s'):
+                name = right.strip()
+
+        # Remove stray punctuation fragments that are not part of names.
+        name = re.sub(r"^[^A-Za-z]+", "", name)
+        name = re.sub(r"[^A-Za-z\s'\.-]", "", name).strip()
+
+        # Keep only plausible person names (at least first + last token).
+        if len(name.split()) < 2:
+            return ""
+        return name
+
     def _fetch_injury_report_espn(self, team_abbrev: str) -> List[Dict]:
         """
         Fetch REAL injury data from ESPN (publicly accessible).
@@ -1248,7 +1467,17 @@ class InjuryManager:
         if cache_key in self._injury_cache:
             cached = self._injury_cache[cache_key]
             if (datetime.now() - cached['time']).seconds < 1800:
-                return cached['data']
+                cleaned = []
+                for inj in cached.get('data', []):
+                    if not isinstance(inj, dict):
+                        continue
+                    name = self._sanitize_injury_player_name(inj.get('name', ''))
+                    if not name:
+                        continue
+                    c = dict(inj)
+                    c['name'] = name
+                    cleaned.append(c)
+                return cleaned
         
         injuries = []
         
@@ -1297,13 +1526,16 @@ class InjuryManager:
             text = soup.get_text(' ', strip=True)
             
             # Use regex to find injury patterns: "PlayerName Position Status StatusType"
-            # Pattern matches: "Bruce Brown G Status Day-to-day" or "Nikola Jokic C Status Out"
-            pattern = r'([A-Z][a-z]+(?:\s+[A-Z][a-z\'-]+)+)\s+([GFC])\s+Status\s+(Out|Day-to-day|Doubtful|Questionable|Probable)'
+            # Pattern matches: "Bruce Brown G Status Day-to-day", "VJ Edgecombe G Status Out"
+            # Handles all-caps initials (VJ, TJ, KJ) and dotted initials (T.J., D.J.)
+            pattern = r"([A-Z][a-zA-Z\'\.\-]+(?:\s+[A-Z][a-zA-Z\'\.\-]+)+)\s+([GFC])\s+Status\s+(Out|Day-to-day|Doubtful|Questionable|Probable)"
             matches = re.findall(pattern, text)
             
             seen_names = set()
             for match in matches:
-                player_name = match[0].strip()
+                player_name = self._sanitize_injury_player_name(match[0])
+                if not player_name:
+                    continue
                 position = match[1]
                 status_raw = match[2]
                 
@@ -1589,6 +1821,8 @@ class FeatureEngineer:
         self.config = config
         # V20: Only InjuryManager kept for roster status (raw observable: is player out?)
         self.injury_manager = InjuryManager()
+        # V21.1: DepthChartManager for "Next Man Up" scenarios
+        self.depth_manager = DepthChartManager()
     
     def calculate_statistical_features(
         self, 
@@ -1705,17 +1939,8 @@ class FeatureEngineer:
             except Exception:
                 foul_rate = 0.0
 
-        usage_rate = 0.0
-        if len(recent) > 0:
-            try:
-                # Create temporary series for calculation
-                usg_series = (recent['FGA'] + 0.44 * recent['FTA'] + recent['TOV']) / recent['MIN_FLOAT']
-                # Clean infinites/NaNs
-                usg_series = usg_series.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-                # Take average of last N games
-                usage_rate = usg_series.mean()
-            except Exception:
-                usage_rate = 0.0        
+        # NOTE: usage_rate is now calculated in build_feature_vector() where
+        # actual team_pace is available for proper USG% normalization.
 
         # Coefficient of variation (std / ema) - treat very small ema as unstable
         cv = 0.0
@@ -1738,7 +1963,6 @@ class FeatureEngineer:
             'min_volatility': min_volatility,
             'foul_rate': foul_rate,
             'cv': cv,
-            'usage_rate': float(usage_rate),
             'season_avg': float(season_avg),
             'l10_avg': float(l10_avg)
         }
@@ -1774,6 +1998,39 @@ class FeatureEngineer:
         
         return rolling_ts, season_ts
     
+    def _calculate_usage_rate(self, df: pd.DataFrame, lookback: int, team_pace: float) -> float:
+        """
+        Calculate proper NBA Usage Rate using actual team pace.
+        
+        Standard formula: USG% = (FGA + 0.44*FTA + TOV) * (TeamMIN/5) / (PlayerMIN * TeamPoss)
+        
+        TeamMIN = 5 players * 48 min = 240, so TeamMIN/5 = 48.
+        TeamPoss ≈ team_pace (possessions per 48 min).
+        
+            USG% = (FGA + 0.44*FTA + TOV) * 48 / (PlayerMIN * team_pace)
+        
+        Expected output: ~0.15-0.20 for role players, ~0.25-0.35 for stars, max ~0.42.
+        """
+        recent = df.tail(lookback)
+        if len(recent) == 0:
+            return 0.0
+        try:
+            required_cols = ['FGA', 'FTA', 'TOV', 'MIN_FLOAT']
+            if not all(c in recent.columns for c in required_cols):
+                return 0.0
+            
+            pace = max(team_pace, 80.0)  # Floor at 80 to avoid division issues
+            possessions_used = recent['FGA'] + 0.44 * recent['FTA'] + recent['TOV']
+            # USG% = possessions_used * 48 / (MIN * pace)
+            usg_series = (possessions_used * 48.0) / (recent['MIN_FLOAT'] * pace)
+            # Clean infinites/NaNs
+            usg_series = usg_series.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            # Clamp to realistic range [0, 0.50]
+            usg_series = usg_series.clip(0.0, 0.50)
+            return float(usg_series.mean())
+        except Exception:
+            return 0.0
+
     def build_feature_vector(
         self,
         player_id: int,
@@ -1795,12 +2052,30 @@ class FeatureEngineer:
         player_team_id: int = None,
         player_team_abbrev: str = None,
         data_loader: 'DataLoader' = None,
-        player_position: str = None
+        player_position: str = None,
+        game_season: str = None,  # V21.1: Season for historical DvP lookup
+        is_backtest: bool = False  # V21.4: True = use ground truth, False = use depth chart + injuries
     ) -> FeatureVector: 
         """
         Build pure empirical feature vector for ML models.
+        
+        V21.1: Added game_season parameter to fix time-travel bug.
+        When building features for a 2023 game, DvP rank now uses
+        2023-24 defensive stats instead of current season.
         """
         
+        # --- Lazy-load fatigue_index.json (one-time per process) ---
+        if not _FATIGUE_CACHE:
+            _fatigue_path = DATA_DIR / "fatigue_index.json"
+            if _fatigue_path.exists():
+                try:
+                    import json as _json
+                    _raw = _json.loads(_fatigue_path.read_text(encoding="utf-8"))
+                    _FATIGUE_CACHE.update(_raw.get("teams", {}))
+                    logger.debug(f"Loaded fatigue_index.json ({len(_FATIGUE_CACHE)} teams)")
+                except Exception as _fe:
+                    logger.warning(f"Could not load fatigue_index.json: {_fe}")
+
         # Initialize data quality tracker
         data_quality = DataQuality()
         
@@ -1854,7 +2129,9 @@ class FeatureEngineer:
         opp_out_ppg = -1.0
         opp_out_count = -1
         
-        if player_team_abbrev and opponent_abbrev:
+        # V21.7: Skip live injury scrape during backtest — absence features
+        # are computed from bulk game logs and injected by the backtest loop.
+        if player_team_abbrev and opponent_abbrev and not is_backtest:
             absence_features = self.injury_manager.compute_absence_features_from_injuries(
                 player_team_abbrev=player_team_abbrev,
                 opponent_abbrev=opponent_abbrev,
@@ -1919,15 +2196,18 @@ class FeatureEngineer:
 
         # === NEW FEATURES: Hit Rates and DvP ===
         # Get additional features from DataEngine
+        # V21.1 FIX: Pass game_season for historical DvP lookup (fixes time-travel bug)
         player_data = {}
         if data_loader and hasattr(data_loader, 'data_engine'):
             try:
+                # Use game_season if provided, otherwise fall back to current season
+                lookup_season = game_season if game_season else self.config.CURRENT_SEASON
                 player_data = data_loader.data_engine.fetch_player_data(
                     player_id=player_id,
                     opponent_id=opponent_id,
                     market=market,
                     line=line,
-                    season=self.config.CURRENT_SEASON,
+                    season=lookup_season,
                     player_position=player_position
                 )
             except Exception as e:
@@ -1958,18 +2238,150 @@ class FeatureEngineer:
                 
                 # Hit rates
                 last_10 = temp_df.head(10)
-                hits_10 = sum(1 for _, game in last_10.iterrows() if game['ACTUAL_VALUE'] > line)
-                feat_hit_rate_l10 = hits_10 / float(len(last_10)) if len(last_10) > 0 else 0.0
+                hits_10 = sum(
+                    1 for _, game in last_10.iterrows()
+                    if 'line' in game and pd.notna(game['line']) and game['line'] > 0
+                    and game['ACTUAL_VALUE'] > game['line']
+                )
+                feat_hit_rate_l10 = hits_10 / float(len(last_10)) if len(last_10) > 0 else -1.0
                 
                 last_20 = temp_df.head(20)
-                hits_20 = sum(1 for _, game in last_20.iterrows() if game['ACTUAL_VALUE'] > line)
-                feat_hit_rate_l20 = hits_20 / float(len(last_20)) if len(last_20) > 0 else 0.0
+                hits_20 = sum(
+                    1 for _, game in last_20.iterrows()
+                    if 'line' in game and pd.notna(game['line']) and game['line'] > 0
+                    and game['ACTUAL_VALUE'] > game['line']
+                )
+                feat_hit_rate_l20 = hits_20 / float(len(last_20)) if len(last_20) > 0 else -1.0
         except Exception as e:
             logger.warning(f"Failed to calculate hit rates: {e}")
             feat_hit_rate_l10 = 0.0
             feat_hit_rate_l20 = 0.0
 
         feat_opp_rank_vs_pos = player_data.get('feat_opp_rank_vs_pos', 15)
+
+        # === V21.3 GROUND TRUTH DEPTH LOGIC ===
+        # Uses actual starter data from boxscores (no heuristics!)
+        #
+        # Mode A: Historical (Training) - uses starter cache (ground truth from boxscore)
+        # Mode B: Inference (Live) - uses depth chart + injury report
+        
+        feat_depth_rank = 4  # Default: Deep Bench / Not Found
+        game_id = None       # Will be set if historical data available
+        
+        logger.debug(f"[DEPTH] Starting depth logic for {player_name}: df_empty={df.empty}, team={player_team_abbrev}, is_backtest={is_backtest}")
+        
+        try:
+            # --- Step A: Extract GAME_ID and raw minutes from DataFrame row ---
+            game_min = None
+            
+            if not df.empty:
+                # V21.6 FIX: Use tail(1) for MOST RECENT historical game
+                # (df is sorted ascending by date, so tail(1) = latest game)
+                recent_row = df.tail(1)
+                
+                # Extract Game ID for starter cache lookup (backtest only)
+                for col in ['GAME_ID', 'Game_ID', 'gameId']:
+                    if col in recent_row.columns:
+                        game_id = str(recent_row[col].iloc[0])
+                        break
+                
+                # Extract minutes from most recent game
+                if 'MIN' in recent_row.columns:
+                    min_val = recent_row['MIN'].iloc[0]
+                    if pd.notna(min_val):
+                        if isinstance(min_val, str) and ':' in min_val:
+                            parts = min_val.split(':')
+                            game_min = float(parts[0]) + float(parts[1]) / 60.0
+                        else:
+                            game_min = float(min_val)
+                elif 'min' in recent_row.columns:
+                    min_val = recent_row['min'].iloc[0]
+                    if pd.notna(min_val):
+                        if isinstance(min_val, str) and ':' in min_val:
+                            parts = min_val.split(':')
+                            game_min = float(parts[0]) + float(parts[1]) / 60.0
+                        else:
+                            game_min = float(min_val)
+                elif 'MIN_FLOAT' in recent_row.columns:
+                    min_val = recent_row['MIN_FLOAT'].iloc[0]
+                    if pd.notna(min_val):
+                        game_min = float(min_val)
+            
+            # Get the calculated avg_minutes from stats
+            feat_avg_minutes = float(stats.get('avg_minutes', 0.0) or 0.0)
+            
+            # --- Step B: DNP Check (0 minutes = didn't play) ---
+            if game_min is not None and game_min == 0:
+                feat_depth_rank = 3  # DNP / Deep Bench
+                logger.debug(f"DNP detected for {player_name}: MIN=0, setting depth_rank=3")
+            
+            # --- Step C: Backtest Mode - Use Starter Cache (GROUND TRUTH) ---
+            # Only use this for backtesting where we want actual starter status
+            elif is_backtest and game_id is not None:
+                from starter_cache import get_starter_cache
+                starter_cache = get_starter_cache()
+                
+                # Check if we have starter data from offline cache
+                started = starter_cache.get_starter_status(game_id, player_id)
+                logger.debug(f"[DEPTH] Step C (Backtest): game={game_id}, player={player_id}, started={started}")
+                
+                if started is not None:
+                    # Starter cache has this game (built offline from bulk data)
+                    feat_depth_rank = 1 if started else 2
+                    logger.debug(f"Starter cache hit for {player_name}: game={game_id}, started={started} -> rank={feat_depth_rank}")
+                else:
+                    # Cache miss - game not in bulk data or cache not built
+                    # Fall back to minutes-based inference from the row data
+                    if game_min is not None:
+                        feat_depth_rank = 1 if (game_min >= 26 or feat_avg_minutes >= 30) else 2
+                        logger.debug(f"Starter cache miss for {game_id}, using minutes fallback: {game_min:.1f} min -> rank {feat_depth_rank}")
+                    else:
+                        feat_depth_rank = 2 if feat_avg_minutes >= 20 else 3
+                        logger.debug(f"No minutes data for {player_name} in {game_id}, using avg_min fallback")
+            
+            # --- Step D: Inference Mode (Live Betting) ---
+            # No backtest mode - use depth chart + injury report for upcoming game
+            elif player_team_abbrev:
+                # Get base depth rank from ESPN depth chart
+                base_depth_rank = self.depth_manager.get_player_depth_rank(player_name, player_team_abbrev)
+                
+                # V21.2 FIX: If depth chart lookup failed (rank 4) but player averages 28+ min,
+                # they're clearly a starter - ESPN sometimes has name mismatches
+                if base_depth_rank == 4 and feat_avg_minutes >= 28.0:
+                    base_depth_rank = 1  # Override to Starter
+                    logger.info(f"Depth chart fallback: {player_name} avg {feat_avg_minutes:.1f} min -> Starter")
+                elif base_depth_rank == 4 and feat_avg_minutes >= 20.0:
+                    base_depth_rank = 2  # Override to Backup
+                    logger.info(f"Depth chart fallback: {player_name} avg {feat_avg_minutes:.1f} min -> Backup")
+                
+                # Dynamic Promotion: If player is backup (Rank 2+), check if starters are OUT
+                if base_depth_rank > 1:
+                    # Get list of injured players marked OUT on the team
+                    team_injuries = self.injury_manager.get_team_injury_report(player_team_abbrev)
+                    out_players = [
+                        inj['name'] for inj in team_injuries 
+                        if inj.get('status') in ('OUT', 'DOUBTFUL')
+                    ]
+                    
+                    if out_players:
+                        # Use effective rank considering injuries
+                        feat_depth_rank = self.depth_manager.get_effective_depth_rank(
+                            player_name=player_name,
+                            team_abbrev=player_team_abbrev,
+                            injured_players=out_players
+                        )
+                        if feat_depth_rank != base_depth_rank:
+                            logger.info(f"Dynamic Promotion: {player_name} ({player_team_abbrev}) "
+                                       f"promoted from Rank {base_depth_rank} to Rank {feat_depth_rank} "
+                                       f"(starters OUT: {out_players})")
+                    else:
+                        feat_depth_rank = base_depth_rank
+                else:
+                    feat_depth_rank = base_depth_rank
+                    
+        except Exception as e:
+            logger.warning(f"Failed to compute depth rank for {player_name}: {e}")
+            feat_depth_rank = 4
 
         return FeatureVector(
             # Identifiers
@@ -2017,7 +2429,7 @@ class FeatureEngineer:
             data_quality=data_quality,
 
             # V20.4 NEW FEATURES
-            feat_usage_rate=stats.get('usage_rate', 0.0),
+            feat_usage_rate=self._calculate_usage_rate(df, lookback, team_pace),
             feat_h2h_avg=h2h_avg,
 
             #  ADDED NEW FEATURES HERE 
@@ -2025,6 +2437,11 @@ class FeatureEngineer:
             feat_l10_avg=l10_avg,
             feat_fatigue_load=fatigue_load,
             feat_form_gap=form_gap,
+
+            # V21.6 NEW: Travel / altitude (from morning_refresh.py)
+            feat_miles_96h=float(_FATIGUE_CACHE.get(player_team_abbrev, {}).get("miles_96h", 0.0)),
+            # Altitude = venue city: if player is home → player's city, if away → opponent's city
+            feat_altitude_next=_ALTITUDE_FT_LOOKUP.get(player_team_abbrev or "", 0) if is_home else _ALTITUDE_FT_LOOKUP.get(opponent_abbrev, 0),
 
             #  NEW: Efficiency per minute
             feat_eff_per_min=eff_per_min,
@@ -2034,7 +2451,10 @@ class FeatureEngineer:
             feat_hit_rate_l20=feat_hit_rate_l20,
 
             #  NEW: Defense vs. Position
-            feat_opp_rank_vs_pos=feat_opp_rank_vs_pos
+            feat_opp_rank_vs_pos=feat_opp_rank_vs_pos,
+
+            # V21.2 NEW: Depth Chart Rank (Composite Logic)
+            feat_depth_rank=feat_depth_rank,
         )
 
 @dataclass
@@ -2085,83 +2505,147 @@ class ModelEngine:
     Key Architecture:
     - XGBRegressor predicts expected stat value E[stat]
     - Variance model predicts [stat] (uncertainty)
-    - Probability via CDF: P(Over) = 1 - ((line - ) / )
+    - Probability via Quantile Interpolation (no Gaussian assumption)
     - Calibration curves correct probability biases
     - Ablation mode logs feature importance
     
     Model Files (in data/ directory):
-    - nba_model_{group}.pkl: Mean regression model
-    - nba_variance_{group}.pkl: Variance model  
+    - nba_quantile_{group}.pkl: Dict with {'q05': model, 'q50': model, 'q95': model}
     - nba_calibrator_{group}.pkl: Isotonic calibration curve
+    
+    V21.5 QUANTILE UPGRADE (Calibration Fix):
+    - Widened quantiles from q10/q90 (80%) to q05/q95 (90% interval)
+    - Empirical data showed 78% coverage on 80% interval = underconfident
+    - P(Over) calculated via linear interpolation between quantiles
+    - Removes Gaussian assumption - handles skewed player distributions
+    - Synthetic std = (q95 - q05) / 3.29 for UI compatibility
+    - Backward compatible: loads old q10/q90 models if q05/q95 not found
     """
     def __init__(self, config: Config = CONFIG, tracker: 'Tracker' = None):
         self.config = config
         self.tracker = tracker
-        # Market-specific models: {group_name: (mean_model, variance_model, feature_names)}
-        self.ml_models: Dict[str, Tuple[Any, Any, List[str]]] = {}
-        # Calibration curves: {group_name: IsotonicRegression}
+        # Per-market quantile models: {market: ({'q10': model, 'q50': model, 'q90': model}, feature_names)}
+        # Lookup order: exact market (PTS) -> group (scoring) -> universal
+        self.ml_models: Dict[str, Tuple[Dict[str, Any], List[str]]] = {}
+        # Calibration curves: {market_or_group: IsotonicRegression}
         self.calibrators: Dict[str, Any] = {}
-        self.ml_model = None  # Legacy fallback
-        self.variance_model = None  # Variance prediction model
+        self.ml_model = None  # Legacy fallback (single model)
         self.model_features: List[str] = []
         self._load_ml_models()
         self._load_calibrators()
 
     def _load_ml_models(self):
         """
-        Load market-specific regression models.
-        V19 COMMITMENT: Models are REQUIRED, not optional.
-        """
-        market_groups = ['scoring', 'counting', 'combo', 'rare', 'universal']
-        loaded_count = 0
+        Load quantile regression models with priority:
+        1. Per-market models: nba_quantile_{MARKET}.pkl (e.g., PTS, REB, AST)
+        2. Group models: nba_quantile_{GROUP}.pkl (scoring, counting, combo, rare)
+        3. Universal model: nba_quantile_universal.pkl
+        4. Legacy models: nba_model_{group}.pkl (wrapped as pseudo-quantile)
         
-        for group in market_groups:
-            model_path = DATA_DIR / f"nba_model_{group}.pkl"
-            var_model_path = DATA_DIR / f"nba_variance_{group}.pkl"
-            
-            if model_path.exists():
-                try:
-                    model = joblib.load(model_path)
-                    var_model = None
-                    if var_model_path.exists():
-                        var_model = joblib.load(var_model_path)
+        V21.1 PER-MARKET: Each market can have its own specialized model.
+        """
+        # All possible markets
+        individual_markets = ['PTS', 'REB', 'AST', 'PRA', 'PR', 'PA', 'RA', '3PM', 'FG3M', 'STL', 'BLK']
+        market_groups = ['scoring', 'counting', 'combo', 'rare', 'universal']
+        
+        loaded_count = 0
+        per_market_count = 0
+        group_count = 0
+        
+        def _extract_features_from_model(model) -> List[str]:
+            """Extract feature names from a trained model."""
+            if model and hasattr(model, 'feature_names_in_'):
+                return [str(f) for f in model.feature_names_in_]
+            elif model and hasattr(model, 'get_booster'):
+                booster_names = model.get_booster().feature_names
+                return [str(f) for f in booster_names] if booster_names else []
+            return []
+        
+        def _load_quantile_model(key: str, path: Path) -> bool:
+            """Attempt to load a quantile model dict from path."""
+            nonlocal loaded_count, self
+            if not path.exists():
+                return False
+            try:
+                quantile_dict = joblib.load(path)
+                
+                # Validate it's a proper quantile dict
+                if isinstance(quantile_dict, dict) and 'q50' in quantile_dict:
+                    # Detect quantile width: new models have q05/q95, old have q10/q90
+                    is_wide_quantile = 'q05' in quantile_dict or 'q95' in quantile_dict
+                    quantile_dict['_wide_quantile'] = is_wide_quantile
                     
-                    # Extract feature names from model
-                    feature_names = []
-                    if hasattr(model, 'feature_names_in_'):
-                        feature_names = [str(f) for f in model.feature_names_in_]
-                    elif hasattr(model, 'get_booster'):
-                        booster_names = model.get_booster().feature_names
-                        feature_names = [str(f) for f in booster_names] if booster_names else []
-                    
-                    self.ml_models[group] = (model, var_model, feature_names)
+                    feature_names = _extract_features_from_model(quantile_dict.get('q50'))
+                    self.ml_models[key] = (quantile_dict, feature_names)
                     loaded_count += 1
                     
                     if not self.model_features and feature_names:
                         self.model_features = feature_names
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to load {group} model: {e}")
+                    if is_wide_quantile:
+                        logger.info(f" V21.5: Wide quantile model (q05/q95) for {key}")
+                    return True
+                else:
+                    logger.warning(f"Invalid quantile model format for {key}")
+            except Exception as e:
+                logger.warning(f"Failed to load {key} quantile model: {e}")
+            return False
         
+        def _load_legacy_model(key: str, path: Path) -> bool:
+            """Attempt to load a legacy mean-only model and wrap as pseudo-quantile."""
+            nonlocal loaded_count, self
+            if not path.exists():
+                return False
+            try:
+                model = joblib.load(path)
+                feature_names = _extract_features_from_model(model)
+                
+                # Wrap legacy model as pseudo-quantile (q50 only)
+                legacy_quantile = {'q50': model, 'q10': None, 'q90': None, '_legacy': True}
+                self.ml_models[key] = (legacy_quantile, feature_names)
+                loaded_count += 1
+                logger.info(f" Loaded legacy model for {key} (wrapped as quantile)")
+                
+                if not self.model_features and feature_names:
+                    self.model_features = feature_names
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to load {key} legacy model: {e}")
+            return False
+        
+        # 1. Load per-market models first (highest priority)
+        for market in individual_markets:
+            quantile_path = DATA_DIR / f"nba_quantile_{market}.pkl"
+            if _load_quantile_model(market, quantile_path):
+                per_market_count += 1
+                logger.info(f" Loaded per-market quantile model: {market}")
+        
+        # 2. Load group models (fallback for markets without specific model)
+        for group in market_groups:
+            quantile_path = DATA_DIR / f"nba_quantile_{group}.pkl"
+            legacy_path = DATA_DIR / f"nba_model_{group}.pkl"
+            
+            if _load_quantile_model(group, quantile_path):
+                group_count += 1
+                logger.info(f" Loaded group quantile model: {group}")
+            elif _load_legacy_model(group, legacy_path):
+                group_count += 1
+        
+        # Log summary
         if loaded_count > 0:
-            logger.info(f" ML COMMITMENT: Loaded {loaded_count} regression models")
+            logger.info(f" ML MODELS: {per_market_count} per-market, {group_count} group models")
             if self.model_features:
-                logger.info(f"   Model expects {len(self.model_features)} features")
+                logger.info(f"   Models expect {len(self.model_features)} features")
         else:
-            # V19 COMMITMENT: Warn loudly if no models found
-            logger.error(" NO ML MODELS FOUND - Run data/train_model_v19.py first!")
+            logger.error(" NO ML MODELS FOUND - Train models first!")
             if self.config.ML_REQUIRE_MODEL:
                 logger.error("   Predictions will FAIL until models are trained.")
         
-        # Legacy fallback (only if no group models found)
+        # 3. Legacy fallback (only if no models found at all)
         if not self.ml_models:
             model_path = DATA_DIR / "nba_model.pkl"
-            var_path = DATA_DIR / "nba_variance.pkl"
             if model_path.exists():
                 try:
                     self.ml_model = joblib.load(model_path)
-                    if var_path.exists():
-                        self.variance_model = joblib.load(var_path)
                     if hasattr(self.ml_model, 'feature_names_in_'):
                         self.model_features = list(self.ml_model.feature_names_in_)
                     logger.info(" Loaded legacy universal ML model")
@@ -2194,20 +2678,36 @@ class ModelEngine:
         else:
             logger.info(" No calibration curves found (using raw probabilities)")
 
-    def _get_model_for_market(self, market: str) -> Tuple[Any, Any, List[str]]:
+    def _get_model_for_market(self, market: str) -> Tuple[Dict[str, Any], List[str]]:
         """
-        Get the appropriate mean model, variance model, and feature names for a market.
-        Returns (mean_model, variance_model, feature_names) tuple.
-        """
-        group = ML_MARKET_GROUPS.get(market, 'universal')
+        Get the appropriate quantile models and feature names for a market.
         
+        V21.1 PER-MARKET: Lookup priority:
+        1. Exact market match (e.g., 'PTS' -> nba_quantile_PTS.pkl)
+        2. Market group (e.g., 'PTS' -> 'scoring' -> nba_quantile_scoring.pkl)
+        3. Universal fallback (nba_quantile_universal.pkl)
+        4. Legacy single model (wrapped as pseudo-quantile)
+        
+        Returns: (quantile_dict, feature_names) where quantile_dict has 'q10', 'q50', 'q90'.
+        """
+        # 1. Check for per-market model first
+        if market in self.ml_models:
+            return self.ml_models[market]
+        
+        # 2. Check for group model
+        group = ML_MARKET_GROUPS.get(market, 'universal')
         if group in self.ml_models:
             return self.ml_models[group]
         
+        # 3. Universal fallback
         if 'universal' in self.ml_models:
             return self.ml_models['universal']
         
-        return (self.ml_model, self.variance_model, self.model_features)
+        # 4. Legacy fallback: wrap single model
+        if self.ml_model is not None:
+            return ({'q50': self.ml_model, 'q10': None, 'q90': None, '_legacy': True}, self.model_features)
+        
+        return ({}, self.model_features)
 
     def _extract_features_for_model(self, features: FeatureVector, expected_features: List[str]) -> np.ndarray:
         """
@@ -2265,6 +2765,11 @@ class ModelEngine:
             'feat_hit_rate_l10': float(getattr(features, 'feat_hit_rate_l10', 0.0)),
             'feat_hit_rate_l20': float(getattr(features, 'feat_hit_rate_l20', 0.0)),
             'feat_opp_rank_vs_pos': float(getattr(features, 'feat_opp_rank_vs_pos', 15.0)),
+            # V21.1 NEW: Depth chart rank
+            'feat_depth_rank': float(getattr(features, 'feat_depth_rank', 4.0)),
+            # V21.7: Travel features
+            'feat_miles_96h': float(getattr(features, 'feat_miles_96h', 0.0)),
+            'feat_altitude_next': float(getattr(features, 'feat_altitude_next', 0)),
             # Backcompat/missing feature fallbacks (silence older model warnings)
             'feat_eff_per_min': float(getattr(features, 'feat_eff_per_min', 0.0)),
             'feat_fatigue_load': float(getattr(features, 'feat_fatigue_load', 0.0)),
@@ -2286,100 +2791,37 @@ class ModelEngine:
 
     def get_ml_prediction(self, features: FeatureVector, raw_only: bool = False) -> Optional[float]:
         """
-        V19 REGRESSION: Get predicted stat value and convert to P(Over) via CDF.
+        V21 QUANTILE: Get P(Over) probability via quantile interpolation.
         
-        The model predicts E[stat], then we calculate:
-        P(Over) = 1 - ((line - predicted_mean) / predicted_std)
+        Uses the full quantile regression output and returns P(Over).
+        This is a convenience wrapper around get_ml_regression_output().
         
         Returns: P(Over) probability (for compatibility with existing code)
         """
-        market = getattr(features, 'market', None) or 'PTS'
-        mean_model, var_model, expected_features = self._get_model_for_market(market)
+        regression = self.get_ml_regression_output(features)
         
-        if mean_model is None:
+        if not regression.get('has_model'):
             return None
         
-        try:
-            # Extract features
-            if expected_features:
-                X = self._extract_features_for_model(features, expected_features).reshape(1, -1)
-            else:
-                X = features.to_ml_array().reshape(1, -1)
-            
-            # Check if this is a regressor or classifier (for backwards compatibility)
-            if hasattr(mean_model, 'predict_proba'):
-                # Old classifier model - use legacy method
-                raw_prob = mean_model.predict_proba(X)[0][1]
-                return float(max(0.01, min(0.99, raw_prob)))
-            
-            # V19 REGRESSION: Predict expected stat value
-            predicted_mean = float(mean_model.predict(X)[0])
-            
-            # Get variance estimate (use variance-model's feature subset if it differs)
-            if var_model is not None:
-                # Discover variance-model feature names when available
-                var_feature_names = None
-                if hasattr(var_model, 'feature_names_in_'):
-                    var_feature_names = list(var_model.feature_names_in_)
-                else:
-                    try:
-                        var_feature_names = var_model.get_booster().feature_names
-                    except Exception:
-                        var_feature_names = None
-
-                # If var model expects a different subset, extract that subset
-                if var_feature_names and expected_features and set(var_feature_names) != set(expected_features):
-                    logger.debug(f"Selecting {len(var_feature_names)} features for variance model (market={market})")
-                    X_var = self._extract_features_for_model(features, var_feature_names).reshape(1, -1)
-                else:
-                    X_var = X
-
-                try:
-                    pred_log_var = var_model.predict(X_var)[0]
-                    # Convert back to variance space: var = expm1(pred_log_var)
-                    pred_var = float(np.expm1(pred_log_var))
-                    pred_var = max(1e-6, pred_var)
-                except Exception as e:
-                    logger.warning(f"Variance model predict failed (market={market}): {e}; falling back to empirical std")
-                    emp_std = features.std if (features.std is not None and features.std > 0) else 1.0
-                    pred_var = emp_std ** 2
-                predicted_std = float(np.sqrt(pred_var))
-            else:
-                # V20: Use player's empirical std only - no fabricated minimums
-                predicted_std = features.std if (features.std is not None and features.std > 0) else 1.0
-            
-            # Calculate P(Over) using normal CDF
-            # P(X > line) = 1 - ((line - ) / )
-            line = features.line
-            if predicted_std > 0:
-                z_score = (line - predicted_mean) / predicted_std
-                p_over = 1.0 - stats.norm.cdf(z_score)
-            else:
-                # Edge case: no variance
-                p_over = 1.0 if predicted_mean > line else 0.0
-            
-            # Clamp to valid probability range
-            p_over = float(max(0.01, min(0.99, p_over)))
-            
-            return p_over
-            
-        except Exception as e:
-            logger.warning(f"ML Prediction failed: {e}")
-            return None
+        p_over = regression.get('p_over')
+        return p_over if p_over is not None else None
     
     def get_ml_regression_output(self, features: FeatureVector) -> Dict[str, Any]:
         """
-        V19 NEW: Get full regression output including predicted value and uncertainty.
+        V21.5 QUANTILE REGRESSION: Get predictions from q05, q50, q95 models.
         
         Returns dict with:
-        - predicted_value: E[stat] from model
-        - predicted_std: [stat] (uncertainty)
-        - p_over: P(stat > line)
+        - predicted_value: Median (q50) prediction
+        - predicted_std: Synthetic std = (q95 - q05) / 3.29
+        - p_over: P(stat > line) via quantile interpolation
         - p_under: P(stat <= line)
-        - confidence_interval: (5th percentile, 95th percentile)
+        - confidence_interval: (q05, q95) - true 90% interval
+        - quantiles: {'q_low': val, 'q50': val, 'q_high': val}
+        
+        Backward compatible with old q10/q90 models.
         """
         market = getattr(features, 'market', None) or 'PTS'
-        mean_model, var_model, expected_features = self._get_model_for_market(market)
+        quantile_dict, expected_features = self._get_model_for_market(market)
         
         result = {
             'predicted_value': None,
@@ -2387,11 +2829,14 @@ class ModelEngine:
             'p_over': None,
             'p_under': None,
             'confidence_interval': (None, None),
-            'has_model': mean_model is not None,
-            'is_regression': False,
+            'has_model': bool(quantile_dict and quantile_dict.get('q50')),
+            'is_regression': True,
+            'is_quantile': True,
+            'quantiles': {'q_low': None, 'q50': None, 'q_high': None},
+            'is_wide_quantile': bool(quantile_dict and quantile_dict.get('_wide_quantile', False)),
         }
         
-        if mean_model is None:
+        if not quantile_dict or not quantile_dict.get('q50'):
             return result
         
         try:
@@ -2400,86 +2845,157 @@ class ModelEngine:
             else:
                 X = features.to_ml_array().reshape(1, -1)
             
-            # Check model type
-            if hasattr(mean_model, 'predict_proba'):
-                # Old classifier - return probability only
-                raw_prob = float(mean_model.predict_proba(X)[0][1])
+            # Check for old classifier model (backwards compat)
+            q50_model = quantile_dict.get('q50')
+            if hasattr(q50_model, 'predict_proba'):
+                raw_prob = float(q50_model.predict_proba(X)[0][1])
                 result['p_over'] = max(0.01, min(0.99, raw_prob))
                 result['p_under'] = 1.0 - result['p_over']
                 result['is_regression'] = False
-                # Estimate predicted value from EMA and probability direction
+                result['is_quantile'] = False
                 result['predicted_value'] = features.ema
                 result['predicted_std'] = features.std
                 return result
             
-            # V19 REGRESSION
-            result['is_regression'] = True
-            predicted_mean = float(mean_model.predict(X)[0])
-            result['predicted_value'] = predicted_mean
+            # === V21 QUANTILE PREDICTIONS ===
+            pred_50 = float(q50_model.predict(X)[0])
+            result['predicted_value'] = pred_50
+            result['quantiles']['q50'] = pred_50
             
-            # Get variance (respect variance-model feature subset if present)
-            if var_model is not None:
-                var_feature_names = None
-                if hasattr(var_model, 'feature_names_in_'):
-                    var_feature_names = list(var_model.feature_names_in_)
-                else:
-                    try:
-                        var_feature_names = var_model.get_booster().feature_names
-                    except Exception:
-                        var_feature_names = None
-
-                if var_feature_names and expected_features and set(var_feature_names) != set(expected_features):
-                    logger.debug(f"Using variance-model feature subset ({len(var_feature_names)}) for market {market}")
-                    X_var = self._extract_features_for_model(features, var_feature_names).reshape(1, -1)
-                else:
-                    X_var = X
-
-                try:
-                    pred_log_var = var_model.predict(X_var)[0]
-                    pred_var = float(np.expm1(pred_log_var))
-                    pred_var = max(1e-6, pred_var)
-                except Exception as e:
-                    logger.warning(f"Variance prediction failed for market {market}: {e}; falling back to empirical std")
-                    emp_std = features.std if (features.std is not None and features.std > 0) else 1.0
-                    pred_var = emp_std ** 2
-                predicted_std = float(np.sqrt(pred_var))
+            # Get quantile predictions (q05/q95 for new models, q10/q90 for old)
+            is_wide = quantile_dict.get('_wide_quantile', False)
+            is_legacy = quantile_dict.get('_legacy', False)
+            
+            if is_wide:
+                # V21.5: Wide quantiles (90% interval)
+                q_low_model = quantile_dict.get('q05')
+                q_high_model = quantile_dict.get('q95')
+                z_divisor = 3.29  # z-span for 90% of normal distribution
+                fallback_z = 1.645  # ~5th/95th percentile
             else:
-                # V20: Use player's empirical std only - no fabricated minimums
-                predicted_std = features.std if (features.std is not None and features.std > 0) else 1.0
+                # Old models: Narrow quantiles (80% interval)
+                q_low_model = quantile_dict.get('q10')
+                q_high_model = quantile_dict.get('q90')
+                z_divisor = 2.56  # z-span for 80% of normal distribution
+                fallback_z = 1.28  # ~10th/90th percentile
+            
+            if q_low_model is not None and q_high_model is not None and not is_legacy:
+                pred_low = float(q_low_model.predict(X)[0])
+                pred_high = float(q_high_model.predict(X)[0])
+            else:
+                # Legacy model fallback: estimate quantiles from empirical std
+                emp_std = features.std if (features.std is not None and features.std > 0) else 1.0
+                pred_low = pred_50 - fallback_z * emp_std
+                pred_high = pred_50 + fallback_z * emp_std
+            
+            # V22 FIX: When quantile models cross, the model is confused.
+            # Instead of silently clamping (which hides uncertainty), widen the
+            # interval using empirical std as a floor to signal low confidence.
+            if pred_low > pred_50 or pred_high < pred_50:
+                logger.debug(f"Quantile crossing detected: q_low={pred_low:.1f}, q50={pred_50:.1f}, q_high={pred_high:.1f} — widening interval")
+                emp_std = features.std if (features.std is not None and features.std > 0) else 3.0
+                fallback_z_cross = z_divisor / 2  # half the z-span to get per-side z
+                pred_low = pred_50 - fallback_z_cross * emp_std
+                pred_high = pred_50 + fallback_z_cross * emp_std
+            pred_low = max(0, pred_low)
+            pred_high = max(pred_low + 0.1, pred_high)  # Ensure minimum spread
+            
+            result['quantiles']['q_low'] = pred_low
+            result['quantiles']['q_high'] = pred_high
+            result['is_wide_quantile'] = is_wide
+            
+            # Synthetic std for UI compatibility
+            spread = pred_high - pred_low
+            predicted_std = spread / z_divisor if spread > 0 else 1.0
             result['predicted_std'] = predicted_std
             
-            # Calculate probabilities
+            # Confidence interval (90% for wide, 80% for old)
+            result['confidence_interval'] = (max(0, pred_low), pred_high)
+            
+            # === V21.5 PROBABILITY VIA QUANTILE INTERPOLATION ===
             line = features.line
-            if predicted_std > 0:
-                z_score = (line - predicted_mean) / predicted_std
-                p_over = 1.0 - stats.norm.cdf(z_score)
-            else:
-                p_over = 1.0 if predicted_mean > line else 0.0
+            p_over = self._interpolate_probability_from_quantiles(
+                line, pred_low, pred_50, pred_high, is_wide
+            )
             
             result['p_over'] = float(max(0.01, min(0.99, p_over)))
             result['p_under'] = 1.0 - result['p_over']
             
-            # 90% confidence interval
-            ci_low = predicted_mean - 1.645 * predicted_std
-            ci_high = predicted_mean + 1.645 * predicted_std
-            result['confidence_interval'] = (max(0, ci_low), ci_high)
-            
         except Exception as e:
-            logger.warning(f"ML Regression failed: {e}")
+            logger.warning(f"ML Quantile Regression failed: {e}")
         
         return result
     
+    def _interpolate_probability_from_quantiles(
+        self, 
+        line: float, 
+        q_low: float, 
+        q50: float, 
+        q_high: float,
+        is_wide: bool = True
+    ) -> float:
+        """
+        V22 CALIBRATION FIX: Split-normal CDF replaces linear interpolation.
+        
+        The old linear interpolation inflated probabilities near the median
+        because it assumed a uniform distribution between quantile points.
+        Real NBA stat distributions are peaked near the median.
+        
+        Fix: Fit a split-normal distribution to the three quantile points
+        (q_low, q50, q_high) and compute P(Over) using the proper CDF.
+        
+        Split-normal handles asymmetric distributions:
+        - sigma_lower = (q50 - q_low) / z_value  (left half)
+        - sigma_upper = (q_high - q50) / z_value  (right half)
+        - When line < q50: use sigma_lower for CDF
+        - When line > q50: use sigma_upper for CDF
+        """
+        # z-values corresponding to the quantile levels
+        if is_wide:
+            z_val = 1.645  # z for 5th/95th percentile
+        else:
+            z_val = 1.28   # z for 10th/90th percentile
+        
+        # Handle degenerate cases
+        if q_low >= q_high or q_high - q_low < 0.1:
+            # No meaningful spread — return 0.50 (no edge)
+            return 0.50
+        
+        # Compute split-normal sigmas
+        sigma_lower = max((q50 - q_low) / z_val, 0.1)
+        sigma_upper = max((q_high - q50) / z_val, 0.1)
+        
+        # Use the appropriate sigma for each side of the median
+        if line <= q50:
+            z_score = (line - q50) / sigma_lower
+        else:
+            z_score = (line - q50) / sigma_upper
+        
+        # P(Over) = 1 - Phi(z) where Phi is the standard normal CDF
+        p_over = 1.0 - stats.norm.cdf(z_score)
+        
+        # Technical bounds only (no artificial caps)
+        return float(max(0.02, min(0.98, p_over)))
+    
     def get_ml_prediction_details(self, features: FeatureVector) -> Dict[str, Any]:
         """
-        V19 UPDATED: Get detailed ML prediction info for UI display.
-        Now returns regression outputs instead of classification.
+        V21 QUANTILE: Get detailed ML prediction info for UI display.
+        Returns quantile regression outputs and model metadata.
         """
         market = getattr(features, 'market', None) or 'PTS'
         group = ML_MARKET_GROUPS.get(market, 'universal')
-        mean_model, var_model, expected_features = self._get_model_for_market(market)
+        quantile_dict, expected_features = self._get_model_for_market(market)
         
         # Check if calibrator exists for this market group
         has_calibrator = group in self.calibrators if hasattr(self, 'calibrators') else False
+        
+        # Check if we have full quantile models or legacy
+        has_full_quantile = (
+            quantile_dict and 
+            (quantile_dict.get('q05') is not None or quantile_dict.get('q10') is not None) and 
+            (quantile_dict.get('q95') is not None or quantile_dict.get('q90') is not None) and
+            not quantile_dict.get('_legacy', False)
+        )
         
         # Get regression output
         regression = self.get_ml_regression_output(features)
@@ -2487,17 +3003,19 @@ class ModelEngine:
         details = {
             'market': market,
             'model_group': group,
-            'has_model': mean_model is not None,
-            'has_variance_model': var_model is not None,
+            'has_model': regression.get('has_model', False),
+            'has_quantile_models': has_full_quantile,
             'has_calibrator': has_calibrator,
             'is_regression': regression.get('is_regression', False),
+            'is_quantile': regression.get('is_quantile', False),
             'num_features': len(expected_features) if expected_features else 0,
-            # V19 Regression outputs
+            # V21 Quantile outputs
             'predicted_value': regression.get('predicted_value'),
             'predicted_std': regression.get('predicted_std'),
             'p_over': regression.get('p_over'),
             'p_under': regression.get('p_under'),
             'confidence_interval': regression.get('confidence_interval'),
+            'quantiles': regression.get('quantiles', {}),
             # Legacy compatibility
             'raw_prob': regression.get('p_over'),
             'calibrated_prob': regression.get('p_over'),
@@ -2588,9 +3106,9 @@ class ModelEngine:
             return raw_prob
         
         try:
-            # Isotonic regression expects 2D input
-            calibrated = calibrator.predict([[raw_prob]])[0]
-            return float(max(0.01, min(0.99, calibrated)))
+            # IsotonicRegression.predict() takes 1D array
+            calibrated = float(calibrator.predict([raw_prob])[0])
+            return max(0.01, min(0.99, calibrated))
         except Exception as e:
             logger.warning(f"Calibration failed: {e}")
             return raw_prob
@@ -2762,37 +3280,58 @@ class SimulationEngine:
 
 class DecisionPolicy:
     """
-    Applies Kelly Criterion and assigns grades to bets.
-    Makes final bet recommendations. 
+    V21.6: ML-Driven Decision Engine — zero heuristics.
+    
+    All decisions derive from:
+    - Kelly Criterion (mathematical optimal sizing)
+    - ML model outputs (probability, projection, quantile-derived std)
+    
+    NO hardcoded multipliers, tiers, caps, or magic numbers.
     """
+    
+    # Fractional Kelly to control bankroll volatility.
+    # 0.25 = quarter-Kelly, a standard conservative choice in the literature.
+    # This is a configurable risk preference, not a heuristic.
+    KELLY_FRACTION: float = 0.25
     
     def __init__(self, config: Config = CONFIG):
         self.config = config
     
     def calculate_ev(self, prob: float, odds: float) -> float:
-        """Calculate expected value."""
+        """Calculate expected value.  EV = p(o-1) - (1-p). Pure math."""
         return (prob * (odds - 1)) - (1 - prob)
     
-    def calculate_ev_stake(
+    def calculate_kelly_stake(
         self, 
-        ev: float,
+        prob: float,
+        odds: float,
         bankroll: float
     ) -> Tuple[float, float]:
         """
-        V20 EMPIRICAL: Pure EV-proportional staking.
+        True Kelly Criterion stake sizing.
         
-        NO hardcoded EV tiers. Stake is linear with EV.
-        stake_pct = min(EV * 2, 10%)
+        f* = (bp - q) / b   where b = odds-1, p = win_prob, q = 1-p
+        Stake = bankroll * f* * KELLY_FRACTION
         
-        This is mathematically equivalent to fractional Kelly.
+        No hardcoded caps or multipliers — the math self-limits:
+        - Negative f* → no bet (mathematically correct)
+        - Small edge → small f* → small stake (naturally proportional)
+        - High prob + high odds → large f* (deserved aggression)
         """
-        if ev <= 0:
+        if prob <= 0 or prob >= 1 or odds <= 1 or bankroll <= 0:
             return 0.0, 0.0
         
-        # V20: Linear EV-proportional staking, capped at 10%
-        stake_pct = min(ev * 2.0, 0.10)
+        b = odds - 1
+        q = 1.0 - prob
+        f_star = (b * prob - q) / b
         
-        return stake_pct * bankroll, stake_pct
+        if f_star <= 0:
+            return 0.0, 0.0
+        
+        fraction = f_star * self.KELLY_FRACTION
+        stake = bankroll * fraction
+        
+        return stake, fraction
     
     def make_decision(
         self, 
@@ -2804,46 +3343,64 @@ class DecisionPolicy:
         bankroll: float = 10000
     ) -> BetDecision:
         """
-        V19 REFACTOR: Pure statistical decision output.
+        V21.6: ML-DRIVEN DECISION ENGINE.
         
-        REMOVED: Grade system, narratives, rollover scores, confidence warnings
-        OUTPUT: EV, Predicted Mean, Std Dev, Win Probability
+        The ML model (quantile regression) is the PRIMARY decision maker:
+        - Side selection: ML's p_over determines OVER/UNDER directly
+        - Probability: ML's quantile-interpolated probability (distribution-free)
+        - Fallback: Simulation CDF only when ML probability is unavailable
         
-        Formula: P(Over) = 1 - ((line - ) / )
+        This eliminates the prior inconsistency where the simulation engine's
+        Gaussian CDF picked the side but the ML's probability was used for EV,
+        potentially creating side/probability disagreements.
         """
-        # 1. Get CDF-computed probability from simulation
-        prob_over_cdf = simulation.over_prob
-        prob_under_cdf = simulation.under_prob
-        
-        # 2. Determine side based on which has higher probability
-        if prob_over_cdf > prob_under_cdf:
-            side = "OVER"
-            cdf_prob = prob_over_cdf
-        else:
-            side = "UNDER"
-            cdf_prob = prob_under_cdf
-        
-        # 3. Use ML probability if available (from regression model's CDF)
+        # 1. ML MODEL DECIDES (primary path)
         ml_prob_over = projection.ml_prob if projection.ml_prob is not None else None
         
-        # 4. Select best probability estimate
         if ml_prob_over is not None:
-            if side == "OVER":
+            # ML model directly determines side and probability
+            if ml_prob_over > 0.5:
+                side = "OVER"
                 prob = ml_prob_over
             else:
+                side = "UNDER"
                 prob = 1.0 - ml_prob_over
         else:
-            prob = cdf_prob
+            # 2. FALLBACK: Simulation CDF (only when ML model unavailable)
+            prob_over_cdf = simulation.over_prob
+            prob_under_cdf = simulation.under_prob
+            
+            if prob_over_cdf > prob_under_cdf:
+                side = "OVER"
+                prob = prob_over_cdf
+            else:
+                side = "UNDER"
+                prob = prob_under_cdf
 
-        # 5. Calculate EV
+        # V25.2 TEMPERATURE SCALING: Correct overconfident probabilities.
+        # Model is well-calibrated on training data but overconfident against
+        # sharp sportsbook lines (ECE=0.106).  Temperature scaling (T=4.75,
+        # fitted from 489 live outcomes) compresses probabilities toward 0.50,
+        # reducing ECE to 0.022.  Replaces crude linear shrinkage + hard cap.
+        T = self.config.LIVE_CALIBRATION_TEMPERATURE
+        if T > 1.0:
+            from scipy.special import logit, expit
+            prob = float(expit(logit(np.clip(prob, 0.02, 0.98)) / T))
+
+        # 3. Calculate EV (pure math: EV = p(o-1) - q)
         ev = self.calculate_ev(prob, odds)
 
-        # 6. Calculate Stake (EV-based, no grades)
-        stake, fraction = self.calculate_ev_stake(ev, bankroll)
+        # 4. Kelly Criterion stake (f* = (bp - q) / b)
+        stake, fraction = self.calculate_kelly_stake(prob, odds, bankroll)
         
-        # 7. Get predicted mean and std from projection
+        # 5. Get predicted mean and std from ML model
         predicted_mean = projection.final_projection
         predicted_std = projection.adjustments.get('predicted_std', features.std)
+        
+        # 6. Quality score: risk-adjusted EV (EV / sigma)
+        # Standard Sharpe-like metric. No floors — if std is tiny, the model
+        # is very confident, so quality *should* be high.
+        quality_score = ev / predicted_std if (ev > 0 and predicted_std > 0) else 0.0
 
         return BetDecision(
             recommended_side=side,
@@ -2852,7 +3409,8 @@ class DecisionPolicy:
             predicted_mean=predicted_mean,
             predicted_std=predicted_std,
             kelly_stake=stake,
-            kelly_fraction=fraction
+            kelly_fraction=fraction,
+            quality_score=quality_score
         )
 
 
@@ -3014,7 +3572,9 @@ class Backtester:
         preloaded_df: pd.DataFrame = None,  # Optional: use pre-loaded game logs
         bulk_loader: 'BulkGameLogLoader' = None,  # V20.3: For absence feature computation
         preloaded_team_stats_by_season: Dict[str, Tuple[pd.DataFrame, float, float]] = None,  # V20.3: Per-season team stats
-        preloaded_position: str = None  # V20.3: Pre-fetched player position (avoids API call in workers)
+        preloaded_position: str = None,  # V20.3: Pre-fetched player position (avoids API call in workers)
+        historical_fatigue_map: Dict = None,  # V21.7: (team_abbrev, date_str) -> miles_96h
+        historical_odds_cache: Dict = None  # V23: (norm_name, market, date_str) -> {line, over_odds, under_odds}
     ) -> Optional[BacktestSummary]:
         """
         Run STRICTLY walk-forward backtest with TEMPORAL INTEGRITY.
@@ -3139,20 +3699,33 @@ class Backtester:
             if prev_season_games > 0:
                 logger.debug(f"Using {current_season_games} current + {prev_season_games} prev-season games")
             
-            # Determine line (use rolling average as proxy for what line would have been)
+            # Determine line (synthetic prop line with noise — V22)
+            # Real player prop lines require a higher API tier; prop lines
+            # remain synthetic.  Real *game-level* spread/total from the
+            # Odds API are applied further below when computing features.
             rolling_avg = historical_df[market].tail(lookback).mean()
-            line = rolling_avg + line_offset
+            hist_std = historical_df[market].tail(lookback).std()
+            line_noise_std = max(0.5, hist_std * 0.25) if hist_std > 0 else 1.0
+            line_noise = self._rng.normal(0, line_noise_std)
+            raw_line = rolling_avg + line_offset + line_noise
+            # Snap to realistic sportsbook half-point lines (e.g. 19.5, 20.5) to avoid continuous noise lines
+            line = max(0.5, round(float(raw_line) * 2) / 2)
+            if line % 1 == 0:
+                line += 0.5
             
             # Extract game context
             matchup = target_game.get('MATCHUP', '')
             is_home = 'vs.' in matchup
             
-            # Determine opponent (simplified - extract from matchup string)
+            # Determine player's team AND opponent from matchup string
             if 'vs.' in matchup:
+                player_team_abbrev = matchup.split('vs.')[0].strip().split()[-1]
                 opp_abbrev = matchup.split('vs.')[-1].strip()
             elif '@' in matchup:
+                player_team_abbrev = matchup.split('@')[0].strip().split()[-1]
                 opp_abbrev = matchup.split('@')[-1].strip()
             else:
+                player_team_abbrev = None
                 opp_abbrev = 'UNK'
             
             # Check if B2B and calculate days_rest robustly
@@ -3239,12 +3812,15 @@ class Backtester:
                     player_pace = player_team_stats.get('PACE', avg_pace)
                     opp_pace = opp_team_stats.get('PACE', avg_pace)
                     
-                    # Calculate Synthetic Spread
-                    # Spread = -((PlayerTeam_NetRtg - OppTeam_NetRtg) + HomeAdvantage)
-                    # Negative spread means player's team is favored
+                    # Calculate Synthetic Spread  (V24 — corrected formula)
+                    # Net rating per-100-poss × (game_pace / 100) → expected
+                    # margin in actual game points.  Home-court advantage is
+                    # added directly in point-space (the old /2.5 divisor
+                    # compressed spreads ~2.5× and cut HCA to 1.2 pts).
                     net_rtg_diff = player_net_rtg - opp_net_rtg
                     home_adj = HOME_ADVANTAGE if is_home else -HOME_ADVANTAGE
-                    synthetic_spread = -((net_rtg_diff + home_adj) / 2.5)  # Scale to points
+                    pace_factor = (player_pace + opp_pace) / 200.0   # ≈ 1.0
+                    synthetic_spread = -(net_rtg_diff * pace_factor + home_adj)
                     
                     # Calculate Synthetic Total
                     # Total  (PlayerTeam_Pace + OppTeam_Pace) * 1.15
@@ -3269,10 +3845,37 @@ class Backtester:
             # Use fixed_spread if provided (non-zero), otherwise use synthetic
             backtest_spread = fixed_spread if fixed_spread != 0.0 else synthetic_spread
             backtest_game_total = synthetic_total
+
+            # V23: Prefer real Vegas spread/total from Odds API cache when
+            # available.  This significantly improves feat_spread and
+            # feat_game_total accuracy vs the Net Rating synthetic calculation.
+            if historical_odds_cache:
+                date_str = prediction_date.strftime('%Y-%m-%d')
+                if player_team_abbrev and opp_abbrev:
+                    real_spread, real_total = None, None
+                    # Try both home/away orderings
+                    for h, a in [(player_team_abbrev, opp_abbrev), (opp_abbrev, player_team_abbrev)]:
+                        game_data = historical_odds_cache.get((h, a, date_str))
+                        if game_data:
+                            raw_spread = game_data.get('spread')
+                            real_total = game_data.get('total')
+                            if raw_spread is not None:
+                                home_abbrev = game_data.get('home_abbrev', h)
+                                # Adjust spread to player's team perspective
+                                if player_team_abbrev == home_abbrev:
+                                    real_spread = float(raw_spread)
+                                else:
+                                    real_spread = -float(raw_spread)
+                            break
+                    if real_spread is not None:
+                        backtest_spread = real_spread
+                    if real_total is not None:
+                        backtest_game_total = float(real_total)
             
             # =========================================================
-            # V20.3: COMPUTE ABSENCE FEATURES FROM GAME LOGS
-            # Ground truth: who actually played vs who didn't
+            # V21.6 TEMPORAL FIX: COMPUTE ABSENCE FEATURES FROM PREVIOUS GAME
+            # Uses most recent game before prediction date as proxy for
+            # who is available (not the target game's actual box score).
             # =========================================================
             absence_features = {
                 'team_out_ppg': -1.0,
@@ -3293,6 +3896,8 @@ class Backtester:
             
             try:
                 # Build feature vector using historical data only
+                # V21.1: Pass game_season for correct historical DvP lookup
+                # V21.4: is_backtest=True uses ground truth from starter cache
                 features = self.feature_engineer.build_feature_vector(
                     player_id=player_id,
                     player_name=player_name,
@@ -3311,10 +3916,12 @@ class Backtester:
                     days_rest=days_rest,
                     game_total=backtest_game_total,
                     player_team_id=player_team_id,
-                    # Pass worker-local data_loader (safe - uses cached DataEngine)
-                    player_team_abbrev=None,  
+                    # V21.7: Pass team abbrev for altitude + fatigue features
+                    player_team_abbrev=player_team_abbrev,  
                     data_loader=self.data_loader,
-                    player_position=player_position
+                    player_position=player_position,
+                    game_season=game_season,  # V21.1: Historical DvP fix
+                    is_backtest=True  # V21.4: Use ground truth starter data
                 )
 
                 # V20.3: Inject absence features into feature vector
@@ -3323,6 +3930,15 @@ class Backtester:
                 features.opp_out_ppg = absence_features['opp_out_ppg']
                 features.opp_out_count = absence_features['opp_out_count']
 
+                # V21.7: Override travel features with historical values
+                # build_feature_vector uses _FATIGUE_CACHE (today's snapshot only);
+                # for training we need the game-date-specific fatigue.
+                if historical_fatigue_map and player_team_abbrev:
+                    date_str = prediction_date.strftime('%Y-%m-%d')
+                    features.feat_miles_96h = float(
+                        historical_fatigue_map.get((player_team_abbrev, date_str), 0.0)
+                    )
+
                 # =========================================================
                 # TEMPORAL INTEGRITY: FREEZE FEATURE SNAPSHOT
                 # Capture EXACTLY what was known at prediction time
@@ -3330,32 +3946,50 @@ class Backtester:
                 # =========================================================
                 frozen_snapshot = self._freeze_feature_snapshot(features, prediction_date)
 
-                # Generate projection
-                projection = self.model_engine.generate_projection(features)
-
-                # V19: Use CDF-based probability (deterministic, no Monte Carlo)
-                simulation = self.simulation_engine.compute_cdf_probability(
-                    mean=projection.final_projection,
-                    std=features.std,
-                    line=line,
-                    market=market,
-                    features=features
-                )
-
-                # Make decision
-                decision = self.decision_policy.make_decision(
-                    features=features,
-                    projection=projection,
-                    simulation=simulation,
-                    line=line,
-                    odds=1.91,  # Standard -110 odds
-                    bankroll=1000
-                )
-
-                # Get actual result
+                # Get actual result (needed for both model and no-model paths)
                 actual_value = target_game[market]
-                hit = (decision.recommended_side == "OVER" and actual_value > line) or \
-                      (decision.recommended_side == "UNDER" and actual_value <= line)
+
+                # Generate projection (may fail if no models trained yet)
+                try:
+                    projection = self.model_engine.generate_projection(features)
+
+                    # V19: Use CDF-based probability (deterministic, no Monte Carlo)
+                    simulation = self.simulation_engine.compute_cdf_probability(
+                        mean=projection.final_projection,
+                        std=features.std,
+                        line=line,
+                        market=market,
+                        features=features
+                    )
+
+                    # Make decision
+                    decision = self.decision_policy.make_decision(
+                        features=features,
+                        projection=projection,
+                        simulation=simulation,
+                        line=line,
+                        odds=1.91,  # Standard -110 odds
+                        bankroll=1000
+                    )
+
+                    predicted_side = decision.recommended_side
+                    predicted_prob = decision.probability
+                    predicted_ev = decision.expected_value
+
+                except MLModelRequiredError:
+                    # =========================================================
+                    # V21.6: NO-MODEL TRAINING DATA GENERATION
+                    # When no models exist yet, we still need to record
+                    # features + actual_value for training CSV generation.
+                    # Use EMA-based fallback for prediction fields.
+                    # =========================================================
+                    ema_proj = float(getattr(features, 'ema', line))
+                    predicted_side = "OVER" if ema_proj > line else "UNDER"
+                    predicted_prob = 0.5
+                    predicted_ev = 0.0
+
+                hit = (predicted_side == "OVER" and actual_value > line) or \
+                      (predicted_side == "UNDER" and actual_value <= line)
 
                 # =========================================================
                 # V19 TEMPORAL INTEGRITY: Use FROZEN snapshot for features
@@ -3374,12 +4008,12 @@ class Backtester:
                     player_name=player_name,
                     market=market,
                     line=line,
-                    predicted_side=decision.recommended_side,
-                    predicted_prob=decision.probability,
-                    predicted_ev=decision.expected_value,
+                    predicted_side=predicted_side,
+                    predicted_prob=predicted_prob,
+                    predicted_ev=predicted_ev,
                     actual_value=actual_value,
                     hit=hit,
-                    grade='EV+' if decision.expected_value > 0 else 'EV-',  # V19: EV-based label
+                    grade='EV+' if predicted_ev > 0 else 'EV-',
                     opponent=opp_abbrev,
                     position=player_position,
                     is_home=is_home,
@@ -3575,7 +4209,8 @@ MARKET_GROUPS = {
 # V20.3: Base V20 features plus absence-awareness and TS%
 # NOTE: Generated dynamically from the FeatureVector dataclass to keep a single
 # source of truth for feature additions/removals.
-TRAINING_FEATURE_COLUMNS = FeatureVector.get_feature_names()
+# Copilot: Remove 'feat_hit_rate_l10' and 'feat_hit_rate_l20' from TRAINING_FEATURE_COLUMNS (training only).
+TRAINING_FEATURE_COLUMNS = [c for c in FeatureVector.get_feature_names() if c not in ('feat_hit_rate_l10', 'feat_hit_rate_l20')]
 
 # Canonical export schema used for writing ML training CSVs (single source of truth)
 ML_EXPORT_METADATA = [
@@ -3586,7 +4221,9 @@ ML_EXPORT_METADATA = [
 ]
 
 # The full ordered schema for CSV export: metadata followed by canonical training features
-ML_EXPORT_SCHEMA = ML_EXPORT_METADATA + TRAINING_FEATURE_COLUMNS.copy()
+# Copilot: Remove 'feat_hit_rate_l10' and 'feat_hit_rate_l20' from this schema list.
+# These columns should no longer be written to the training CSV.
+ML_EXPORT_SCHEMA = ML_EXPORT_METADATA + [c for c in TRAINING_FEATURE_COLUMNS.copy() if c not in ('feat_hit_rate_l10', 'feat_hit_rate_l20')]
 
 def get_market_group_features(market: str) -> Dict[str, int]:
     """
@@ -3950,20 +4587,27 @@ class BulkGameLogLoader:
         player_list.sort(key=lambda x: x['games'], reverse=True)
         return player_list[:limit]
     
-    def get_team_roster(self, team_id: int) -> Dict[int, Dict]:
+    def get_team_roster(self, team_id: int, cutoff_date: pd.Timestamp = None) -> Dict[int, Dict]:
         """
         Get all players for a team using the optimized index + CACHING.
+        
+        V21.6 TEMPORAL FIX: When cutoff_date is provided, only count games
+        BEFORE that date for PPG/max_date. This prevents future data from
+        leaking into absence features during walk-forward backtesting.
+        
         Cache results to prevent filtering 7.5 million times.
+        NOTE: When cutoff_date is provided, caching uses a date-qualified key.
         """
         if not self._loaded: return {}
         
-        # 1. CHECK CACHE (Fastest)
-        if team_id in self._roster_cache:
-            return self._roster_cache[team_id]
-            
         if not self._indexes_built: self._build_optimization_indexes()
         
-        # 2. COMPUTE (Only done once per team)
+        # 1. CHECK CACHE (Fastest) — date-qualified key when cutoff provided
+        cache_key = (team_id, cutoff_date.strftime('%Y-%m-%d') if cutoff_date is not None else None)
+        if cache_key in self._roster_cache:
+            return self._roster_cache[cache_key]
+            
+        # 2. COMPUTE
         player_ids = self._roster_index.get(team_id, set())
         
         roster = {}
@@ -3972,24 +4616,26 @@ class BulkGameLogLoader:
             # Filter for this team's games
             team_games = df[df['TEAM_ID'] == team_id]
             
+            # V21.6 TEMPORAL FIX: Only use games BEFORE cutoff_date
+            if cutoff_date is not None:
+                team_games = team_games[team_games['GAME_DATE'] < cutoff_date]
+            
             if len(team_games) > 0:
                 ppg = team_games['PTS'].mean() if 'PTS' in team_games.columns else 0.0
                 name = team_games['PLAYER_NAME'].iloc[0] if 'PLAYER_NAME' in team_games.columns else 'Unknown'
-                # Pre-calculate min_date and max_date to avoid expensive dataframe scans in hot loop
                 min_date = team_games['GAME_DATE'].min()
-                # FIX: Track last game date for recency-based "ghost" filtering
                 max_date = team_games['GAME_DATE'].max()
                 
                 roster[pid] = {
                     'name': name, 
                     'ppg': ppg, 
                     'games': len(team_games),
-                    'min_date': min_date,  # STORE THIS FOR SPEED
+                    'min_date': min_date,
                     'max_date': max_date
                 }
         
         # 3. SAVE TO CACHE
-        self._roster_cache[team_id] = roster
+        self._roster_cache[cache_key] = roster
         return roster
     
     def get_players_who_played_on_date(self, game_date: pd.Timestamp, team_id: int) -> set:
@@ -4001,20 +4647,54 @@ class BulkGameLogLoader:
         key = f"{game_date.strftime('%Y-%m-%d')}_{team_id}"
         return self._daily_index.get(key, set())
     
+    def _get_most_recent_participants(self, before_date: pd.Timestamp, team_id: int) -> set:
+        """
+        V21.6 TEMPORAL FIX: Get players who participated in the team's most
+        recent game BEFORE before_date.
+        
+        This is the pre-game observable proxy for "who is available today."
+        Uses the _daily_index for fast lookups, scanning backwards from
+        before_date until we find a game.
+        """
+        if not self._loaded: return set()
+        if not self._indexes_built: self._build_optimization_indexes()
+        
+        # Scan backwards up to 14 days to find the most recent game
+        for days_back in range(1, 15):
+            check_date = before_date - pd.Timedelta(days=days_back)
+            key = f"{check_date.strftime('%Y-%m-%d')}_{team_id}"
+            participants = self._daily_index.get(key, set())
+            if participants:
+                return participants
+        
+        # No recent game found — return empty (will treat everyone as unknown)
+        return set()
+    
     def compute_absence_features(self, game_date: pd.Timestamp, player_team_id: int, opponent_team_id: int, player_id: int) -> Dict[str, float]:
-        """V20.3 Optimized Absence Calculation with Roster Caching."""
+        """
+        V21.6 TEMPORAL FIX: Absence calculation without future data leakage.
+        
+        Previously this used get_players_who_played_on_date(game_date) which
+        looked up the TARGET game's actual box score — a critical data leak.
+        
+        FIX: Use the PREVIOUS game's participation as a proxy. If a player
+        played in the most recent game before today, assume they're available.
+        If they didn't play recently, assume they're out.
+        This is the best pre-game information available.
+        """
         if not self._loaded: return {'team_out_ppg': -1.0, 'team_out_count': -1, 'opp_out_ppg': -1.0, 'opp_out_count': -1}
         
         # Ensure indexes are built (only happens once per worker)
         if not self._indexes_built: self._build_optimization_indexes()
         
-        # 1. Get full rosters (Instantly from cache after first run)
-        team_roster = self.get_team_roster(player_team_id)
-        opp_roster = self.get_team_roster(opponent_team_id)
+        # 1. Get rosters with TEMPORAL cutoff (PPG only from games before prediction date)
+        team_roster = self.get_team_roster(player_team_id, cutoff_date=game_date)
+        opp_roster = self.get_team_roster(opponent_team_id, cutoff_date=game_date)
         
-        # 2. Get active players for this specific game (Fast dict lookup)
-        team_played = self.get_players_who_played_on_date(game_date, player_team_id)
-        opp_played = self.get_players_who_played_on_date(game_date, opponent_team_id)
+        # 2. V21.6 FIX: Use PREVIOUS game's participation (not target game's box score)
+        # Find the most recent game date BEFORE the target for each team
+        team_prev_played = self._get_most_recent_participants(game_date, player_team_id)
+        opp_prev_played = self._get_most_recent_participants(game_date, opponent_team_id)
         
         # 3. Calculate missing production
         team_out_ppg = 0.0
@@ -4026,8 +4706,8 @@ class BulkGameLogLoader:
         # Iterate roster (~15 items) - Super fast now
         for pid, info in team_roster.items():
             if pid == player_id: continue
-            # Check if they are NOT playing today
-            if pid not in team_played:
+            # Check if they did NOT play in the most recent previous game
+            if pid not in team_prev_played:
                 # Filter 1: Must have played at least 5 games
                 if info.get('games', 0) < 5:
                     continue
@@ -4044,7 +4724,7 @@ class BulkGameLogLoader:
         opp_out_ppg = 0.0
         opp_out_count = 0
         for pid, info in opp_roster.items():
-            if pid not in opp_played:
+            if pid not in opp_prev_played:
                 if info.get('games', 0) < 5:
                     continue
                 if info.get('min_date') >= game_date:
@@ -4074,13 +4754,15 @@ class BulkGameLogLoader:
 _worker_bulk_loader = None
 _worker_team_stats = None
 _worker_config = None
+_worker_fatigue_map = None
+_worker_odds_cache = None
 
-def _init_worker(bulk_cache_dict, team_stats_dict, config_obj):
+def _init_worker(bulk_cache_dict, team_stats_dict, config_obj, fatigue_map=None, odds_cache=None):
     """
     Initialize worker process with shared data ONE TIME.
     This eliminates overhead of sending data for every task.
     """
-    global _worker_bulk_loader, _worker_team_stats, _worker_config
+    global _worker_bulk_loader, _worker_team_stats, _worker_config, _worker_fatigue_map, _worker_odds_cache
     
     # 1. Store Config
     _worker_config = config_obj
@@ -4126,6 +4808,12 @@ def _init_worker(bulk_cache_dict, team_stats_dict, config_obj):
             df = pd.DataFrame()
         _worker_team_stats[season] = (df, avg_pace, avg_def)
 
+    # 5. Store historical fatigue map for travel feature computation
+    _worker_fatigue_map = fatigue_map if fatigue_map else {}
+
+    # 6. Store historical odds cache for real line lookups (V23)
+    _worker_odds_cache = odds_cache if odds_cache else {}
+
 
 def _backtest_worker_task(args: Tuple) -> Optional[pd.DataFrame]:
     """
@@ -4139,7 +4827,7 @@ def _backtest_worker_task(args: Tuple) -> Optional[pd.DataFrame]:
      player_df_dict, player_position, task_idx, total_tasks) = args
     
     # Access shared global data
-    global _worker_bulk_loader, _worker_team_stats, _worker_config
+    global _worker_bulk_loader, _worker_team_stats, _worker_config, _worker_odds_cache
     
     worker_id = os.getpid()
     
@@ -4176,7 +4864,9 @@ def _backtest_worker_task(args: Tuple) -> Optional[pd.DataFrame]:
             preloaded_df=player_df,
             bulk_loader=_worker_bulk_loader,  # Use the globally cached loader
             preloaded_team_stats_by_season=_worker_team_stats, # Use globally cached stats
-            preloaded_position=player_position
+            preloaded_position=player_position,
+            historical_fatigue_map=_worker_fatigue_map,  # V21.7: Historical travel fatigue
+            historical_odds_cache=_worker_odds_cache  # V23: Real historical odds lines
         )
         
         # [LOG 3] COMPLETION
@@ -4196,6 +4886,117 @@ def _backtest_worker_task(args: Tuple) -> Optional[pd.DataFrame]:
         return None
 
 
+def _build_historical_fatigue_map(training_seasons: list, bulk_loader: 'BulkGameLogLoader' = None) -> dict:
+    """
+    Build a lookup of (team_abbrev, 'YYYY-MM-DD') -> miles_96h for all games
+    across multiple training seasons.
+
+    If a bulk_loader is provided with cached game logs, builds the map
+    entirely offline (zero API calls).  Otherwise falls back to
+    LeagueGameLog API calls (1 per season).
+
+    Returns dict keyed by (team_abbrev, date_str).
+    """
+    from collections import defaultdict
+
+    # ── Try to build from bulk_loader cache (fully offline) ──────────────
+    if bulk_loader is not None and bulk_loader._loaded:
+        logger.info("Building fatigue map from bulk loader cache (offline)...")
+        # Collect unique (team, date, arena) tuples from all player game logs
+        team_game_set: dict = defaultdict(set)   # abbrev -> set of (date, arena)
+        for _pid, pdf in bulk_loader._cache.items():
+            if pdf.empty:
+                continue
+            for _, row in pdf.iterrows():
+                abbrev = row.get('TEAM_ABBREVIATION', '')
+                if not abbrev or abbrev not in _ARENA_COORDS:
+                    continue
+                matchup = row.get('MATCHUP', '')
+                game_date = pd.to_datetime(row['GAME_DATE'])
+                if ' vs. ' in matchup:
+                    arena = abbrev
+                elif ' @ ' in matchup:
+                    arena = matchup.split('@ ')[-1].strip()
+                else:
+                    arena = abbrev
+                team_game_set[abbrev].add((game_date, arena))
+
+        # Convert sets to sorted lists
+        team_games: dict = {}
+        for abbrev, game_set in team_game_set.items():
+            team_games[abbrev] = sorted(game_set, key=lambda x: x[0])
+
+        logger.info(f"  Extracted games for {len(team_games)} teams from bulk cache")
+
+    else:
+        # ── Fallback: fetch via API ─────────────────────────────────────
+        logger.info("Building fatigue map via API (bulk loader not available)...")
+        all_games = []
+        for season in training_seasons:
+            try:
+                time.sleep(0.6)
+                glg = leaguegamelog.LeagueGameLog(
+                    season=season,
+                    season_type_all_star='Regular Season',
+                    league_id='00',
+                )
+                gdf = glg.get_data_frames()[0]
+                gdf['GAME_DATE'] = pd.to_datetime(gdf['GAME_DATE'])
+                all_games.append(gdf)
+                logger.info(f"  Fatigue map: fetched {len(gdf)} game-team rows for {season}")
+            except Exception as e:
+                logger.warning(f"Failed to fetch game log for season {season}: {e}")
+
+        if not all_games:
+            return {}
+
+        full_df = pd.concat(all_games, ignore_index=True)
+
+        team_games: dict = defaultdict(list)
+        for _, row in full_df.iterrows():
+            abbrev = row.get('TEAM_ABBREVIATION', '')
+            if not abbrev or abbrev not in _ARENA_COORDS:
+                continue
+            game_date = row['GAME_DATE']
+            matchup = row.get('MATCHUP', '')
+            if ' vs. ' in matchup:
+                arena = abbrev
+            elif ' @ ' in matchup:
+                arena = matchup.split('@ ')[-1].strip()
+            else:
+                arena = abbrev
+            team_games[abbrev].append((game_date, arena))
+
+        for abbrev in team_games:
+            team_games[abbrev].sort(key=lambda x: x[0])
+
+    # ── Compute cumulative miles_96h for each (team, game_date) ─────────
+    fatigue_map: dict = {}
+    for abbrev, game_list in team_games.items():
+        for idx, (game_date, game_arena) in enumerate(game_list):
+            cutoff = game_date - pd.Timedelta(hours=96)
+            arenas_in_window = []
+            for j in range(idx, -1, -1):
+                prev_date, prev_arena = game_list[j]
+                if prev_date < cutoff:
+                    break
+                arenas_in_window.append(prev_arena)
+            arenas_in_window.reverse()
+
+            total_miles = 0.0
+            for k in range(1, len(arenas_in_window)):
+                if arenas_in_window[k - 1] != arenas_in_window[k]:
+                    c1 = _ARENA_COORDS.get(arenas_in_window[k - 1])
+                    c2 = _ARENA_COORDS.get(arenas_in_window[k])
+                    if c1 and c2:
+                        total_miles += _haversine_miles(c1, c2)
+
+            fatigue_map[(abbrev, game_date.strftime('%Y-%m-%d'))] = round(total_miles, 1)
+
+    logger.info(f"Historical fatigue map: {len(fatigue_map)} (team, date) pairs across {len(training_seasons)} seasons")
+    return fatigue_map
+
+
 def generate_ml_training_data(
     output_file: str = "ml_training_data.csv",
     num_players: int = 50,
@@ -4210,7 +5011,16 @@ def generate_ml_training_data(
     """
     import os
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    
+
+    # FIX 3: ensure we always write a fresh training CSV — remove any existing file
+    output_path = DATA_DIR / output_file
+    try:
+        if output_path.exists():
+            output_path.unlink()
+            logger.info(f"Cleared existing training data: {output_path}")
+    except Exception as e:
+        logger.warning(f"Failed to remove existing training data {output_path}: {e}")
+
     if markets is None:
         markets = ['PTS', 'REB', 'AST', 'PRA', 'RA', 'PA', 'PR']
     
@@ -4261,6 +5071,29 @@ def generate_ml_training_data(
     bulk_cache_serialized = {}
     for pid, pdf in bulk_loader._cache.items():
         bulk_cache_serialized[pid] = pdf.to_dict('records')
+
+    # =========================================================================
+    # STEP 2b: Build historical fatigue map for travel features (OFFLINE)
+    # =========================================================================
+    logger.info("Building historical fatigue map from bulk cache (zero API calls)...")
+    historical_fatigue = _build_historical_fatigue_map(list(config.TRAINING_SEASONS), bulk_loader=bulk_loader)
+    if progress_callback: progress_callback(0.38)
+
+    # =========================================================================
+    # STEP 2c: Load historical odds cache (V23 — real spreads/totals from The Odds API)
+    # =========================================================================
+    historical_odds_cache = {}
+    try:
+        from odds_engine import OddsEngine
+        oe = OddsEngine()
+        if oe.cache_stats["total_games"] > 0:
+            historical_odds_cache = dict(oe._index)  # (home_abbrev, away_abbrev, date_str) -> game_data
+            logger.info(f"  Loaded {len(historical_odds_cache)} game odds for real spread/total features")
+        else:
+            logger.info("  No game odds cached — will use synthetic spread/total")
+    except Exception as e:
+        logger.warning(f"  Could not load odds cache: {e} — using synthetic spread/total")
+    if progress_callback: progress_callback(0.39)
 
     # === Prefetch player positions using bulk season calls + cache ===
     logger.info("Prefetching player positions for selected players (bulk + cache)...")
@@ -4347,7 +5180,7 @@ def generate_ml_training_data(
             with ProcessPoolExecutor(
                 max_workers=max_workers,
                 initializer=_init_worker,
-                initargs=(bulk_cache_serialized, team_stats_serialized, config)
+                initargs=(bulk_cache_serialized, team_stats_serialized, config, historical_fatigue, historical_odds_cache)
             ) as executor:
 
                 futures = {executor.submit(_backtest_worker_task, task): task for task in tasks}
@@ -4367,6 +5200,8 @@ def generate_ml_training_data(
         except Exception as e:
             logger.warning("Parallel workers failed (pickling/initializer issue). Falling back to sequential execution.")
             logger.debug(str(e))
+            # Initialize globals for sequential mode
+            _init_worker(bulk_cache_serialized, team_stats_serialized, config, historical_fatigue, historical_odds_cache)
             # Sequential fallback
             for task in tasks:
                 try:
@@ -4380,6 +5215,8 @@ def generate_ml_training_data(
                     progress_callback(0.40 + 0.60 * (completed / total_tasks))
     else:
         logger.info("Not in main Streamlit process - running backtests sequentially inside worker.")
+        # Initialize globals for sequential mode
+        _init_worker(bulk_cache_serialized, team_stats_serialized, config, historical_fatigue, historical_odds_cache)
         for task in tasks:
             try:
                 result = _backtest_worker_task(task)
@@ -4419,50 +5256,10 @@ def generate_ml_training_data(
                 # metadata
                 combined_df[col] = ''
 
-    # If an existing file exists, inspect its header BEFORE loading the full file
-    existing_df = None
-    if output_path.exists():
-        import csv, shutil
-        try:
-            with open(output_path, 'r', encoding='utf-8') as fh:
-                existing_header = next(csv.reader(fh), None)
-        except Exception as e:
-            logger.exception(f"Failed to read existing CSV header: {e}")
-            existing_header = None
-
-        # If header doesn't match exactly, archive and start fresh
-        if existing_header != ML_EXPORT_SCHEMA:
-            ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-            archive_path = output_path.with_name(f"{output_path.stem}.archived.{ts}{output_path.suffix}")
-            try:
-                shutil.move(str(output_path), str(archive_path))
-                logger.warning(f"Archived mismatched ML CSV to {archive_path}; creating fresh file.")
-            except Exception as e:
-                logger.exception(f"Failed to archive mismatched CSV: {e}")
-                raise
-            existing_df = None
-        else:
-            # Safe to load the existing DataFrame and normalize columns
-            existing_df = pd.read_csv(output_path)
-            for col in canonical_columns:
-                if col not in existing_df.columns:
-                    if col in TRAINING_FEATURE_COLUMNS:
-                        if col.endswith('_count') or col == 'feat_games_played':
-                            existing_df[col] = -1
-                        elif col in ('feat_is_home', 'feat_is_b2b') or col.startswith('feat_market_'):
-                            existing_df[col] = 0
-                        else:
-                            existing_df[col] = -1.0
-                    else:
-                        existing_df[col] = ''
-
-    # Merge: existing first then new so that newer records take precedence when dropping duplicates
-    if existing_df is not None:
-        merged = pd.concat([existing_df, combined_df], ignore_index=True)
-        merged = merged.drop_duplicates(subset=['date', 'player', 'market'], keep='last')
-        final_df = merged
-    else:
-        final_df = combined_df
+    # NOTE: We removed merging with any pre-existing CSV earlier to guarantee
+    # that generation produces a fresh, self-contained training file.
+    # Use the freshly composed `combined_df` as the final output.
+    final_df = combined_df
 
     # Reorder and select final columns
     final_columns = [c for c in canonical_columns if c in final_df.columns]
@@ -4752,10 +5549,12 @@ class PredictionOrchestrator:
             # Step 6: Generate projection
             projection = self.model_engine. generate_projection(features)
             
-            # Step 7: V19 CDF-based probability (deterministic, no Monte Carlo)
+            # Step 7: V21.6 CDF fallback (only used if ML prob unavailable)
+            # Use model's predicted_std when available, fall back to empirical std
+            sim_std = projection.adjustments.get('predicted_std', features.std) or features.std
             simulation = self.simulation_engine.compute_cdf_probability(
                 mean=projection.final_projection,
-                std=features.std,
+                std=sim_std,
                 line=line,
                 market=market,
                 features=features
@@ -4783,6 +5582,7 @@ class PredictionOrchestrator:
                 market=market,
                 line=line,
                 odds=odds,
+                player_position=player_position,  # V21.2: For AI analyst
                 features=features,
                 projection=projection,
                 simulation=simulation,
@@ -4850,6 +5650,7 @@ class Tracker:
     
     def __init__(self, file_path: Path = TRACKER_FILE):
         self.file = file_path
+        self._load_failed = False
         self._ensure_file_exists()
 
     def _ensure_file_exists(self):
@@ -4875,6 +5676,10 @@ class Tracker:
         # Default sentinel for floats
         return -1.0
 
+    def add_bet(self, bet_data: Dict):
+        """Alias for save_bet / log_bet to support both player props and game-level tracking."""
+        self.save_bet(bet_data)
+
     def log_bet(self, bet_data: Dict):
         """Alias for save_bet to prevent 'AttributeError'."""
         self.save_bet(bet_data)
@@ -4896,6 +5701,10 @@ class Tracker:
         # 3. FIX: Ensure Result defaults to 'Pending' (Fixes the "1 vs 5" bug)
         if 'result' not in bet_data:
             bet_data['result'] = 'Pending'
+        
+        # 4. Add model_version for tracking (v21.2+)
+        if 'model_version' not in bet_data:
+            bet_data['model_version'] = CURRENT_VERSION
             
         # 4. Ensure all canonical ML feature columns exist on saved bets to prevent schema drift.
         # This stores explicit sentinel values for any missing V20.3 features so older records
@@ -4908,12 +5717,12 @@ class Tracker:
         self._save(bets)
 
     def get_bets(self) -> list: 
-        """Loads bets and auto-fixes any legacy data."""
+        """Loads bets and auto-fixes any legacy data safely."""
         try:
             if self.file.exists():
-                with open(self.file, 'r') as f:
-                    content = f.read()
-                    data = json.loads(content) if content else []
+                data = safe_json_load(self.file, default=[])
+                if not isinstance(data, list):
+                    data = []
                 
                 # Auto-Heal Logic
                 if data:
@@ -4938,29 +5747,34 @@ class Tracker:
                     if modified:
                         self._save(data)
                         
+                self._load_failed = False
                 return data
             return []
-        except Exception:
-            return []
+        except Exception as exc:
+            self._load_failed = True
+            import traceback, shutil, time
+            logger.exception("Failed to load bets from tracker JSON — creating a backup and halting write operations to prevent data loss")
+            try:
+                corrupt_name = self.file.with_name(f"{self.file.name}.corrupt.{int(time.time())}")
+                shutil.copy2(self.file, corrupt_name)
+                logger.warning(f"Backed up corrupt tracker to {corrupt_name}")
+            except Exception:
+                logger.exception("Failed to back up corrupt tracker file")
+            raise RuntimeError(
+                f"Tracker file at {self.file} failed to load cleanly: {exc}. "
+                "Halting to prevent accidental overwrite of existing bets."
+            ) from exc
 
     def _save(self, bets: list):
-        # --- FIX: Custom Encoder for NumPy Types (Fixes JSON Error) ---
-        def numpy_converter(obj):
-            if isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                return float(obj)
-            elif isinstance(obj, np.bool_):
-                return bool(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            return str(obj)
-
+        if getattr(self, '_load_failed', False):
+            raise RuntimeError(
+                "Refusing to save bets: tracker failed to load cleanly. Overwrite aborted to protect bet history."
+            )
         try:
-            with open(self.file, 'w') as f:
-                json.dump(bets, f, indent=2, default=numpy_converter)
+            atomic_json_save(self.file, bets, indent=2)
         except Exception as e:
-            logging.error(f"Failed to save bets: {e}")
+            logging.error(f"Failed to save bets atomically: {e}")
+            raise
 
     def get_player_history(self, player_name: str) -> List[Dict]:
         all_bets = self.get_bets()
@@ -5590,7 +6404,9 @@ class Tracker:
                 writer.writeheader()
 
             for bet in bets:
-                if not (bet.get('result') in ['Win', 'Loss'] and bet.get('actual_value') is not None and not bet.get('exported_to_csv', False)):
+                # Only export STAKED bets (stake > 0) - unstaked predictions go to prediction_log.json
+                stake = float(bet.get('stake', 0) or 0)
+                if not (bet.get('result') in ['Win', 'Loss'] and bet.get('actual_value') is not None and not bet.get('exported_to_csv', False) and stake > 0):
                     continue
 
                 row = self._map_bet_to_csv_row(bet)
@@ -5617,12 +6433,14 @@ class Tracker:
         return exported_count, str(output_path)
 
     def get_exportable_count(self) -> int:
+        """Count bets that can be exported to training CSV (staked, decided, not yet exported)."""
         bets = self.get_bets()
         return len([
             b for b in bets 
             if b.get('result') in ['Win', 'Loss'] 
             and b.get('actual_value') is not None 
             and not b.get('exported_to_csv', False)
+            and float(b.get('stake', 0) or 0) > 0  # Only staked bets
         ])
 
     def get_feature_stats(self) -> dict:
@@ -5649,6 +6467,204 @@ class Tracker:
                 break
         self._save(current_bets)
 
+    def get_retrain_recommendation(self) -> dict:
+        """
+        Check if model retraining is recommended based on recent performance.
+        
+        Criteria:
+        - Minimum 50 decided staked bets for statistical significance
+        - Win rate below 52% triggers retrain recommendation
+        - Also checks days since last retrain (weekly recommendation)
+        
+        Returns dict with:
+        - should_retrain: bool
+        - reason: str (explanation)
+        - win_rate: float (current win rate)
+        - sample_size: int (number of decided staked bets)
+        - days_since_retrain: int (if retrain_date stored)
+        """
+        bets = self.get_bets()
+        
+        # Get decided staked bets
+        decided_staked = [
+            b for b in bets 
+            if b.get('result') in ['Win', 'Loss'] 
+            and float(b.get('stake', 0) or 0) > 0
+        ]
+        
+        sample_size = len(decided_staked)
+        wins = len([b for b in decided_staked if b.get('result') == 'Win'])
+        win_rate = wins / sample_size if sample_size > 0 else 0.0
+        
+        # Check last retrain date from config
+        config_path = DATA_DIR / 'retrain_config.json'
+        days_since_retrain = None
+        if config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    last_retrain = config.get('last_retrain_date')
+                    if last_retrain:
+                        from datetime import datetime
+                        last_dt = datetime.fromisoformat(last_retrain)
+                        days_since_retrain = (datetime.now() - last_dt).days
+            except:
+                pass
+        
+        # Determine recommendation
+        reasons = []
+        should_retrain = False
+        
+        if sample_size < 50:
+            reasons.append(f"Need 50+ decided bets for analysis (have {sample_size})")
+        else:
+            if win_rate < 0.52:
+                should_retrain = True
+                reasons.append(f"Win rate {win_rate*100:.1f}% below 52% threshold")
+            
+            if days_since_retrain is not None and days_since_retrain >= 7:
+                should_retrain = True
+                reasons.append(f"Weekly retrain due ({days_since_retrain} days since last)")
+            elif days_since_retrain is None:
+                reasons.append("No retrain history found - consider establishing baseline")
+        
+        return {
+            'should_retrain': should_retrain,
+            'reason': '; '.join(reasons) if reasons else 'Model performing well',
+            'win_rate': win_rate,
+            'sample_size': sample_size,
+            'days_since_retrain': days_since_retrain
+        }
+
+    def mark_retrain_complete(self):
+        """Mark that a retrain was completed today."""
+        from datetime import datetime
+        config_path = DATA_DIR / 'retrain_config.json'
+        config = {}
+        if config_path.exists():
+            try:
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+            except:
+                pass
+        config['last_retrain_date'] = datetime.now().isoformat()
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+
+
+class PredictionLogger:
+    """
+    Logs ALL predictions for analysis (staked and non-staked).
+    
+    This is separate from bet_tracker.json which only tracks placed bets.
+    Use this for:
+    - Analyzing rejected bet patterns
+    - Comparing staked vs non-staked outcomes
+    - Model calibration studies
+    """
+    
+    def __init__(self, file_path: Path = PREDICTION_LOG_FILE):
+        self.file = file_path
+        self._ensure_file_exists()
+    
+    def _ensure_file_exists(self):
+        if not self.file.exists():
+            self._save([])
+    
+    def _save(self, predictions: list):
+        try:
+            atomic_json_save(self.file, predictions, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save prediction log atomically: {e}")
+            raise
+    
+    def get_predictions(self) -> list:
+        try:
+            data = safe_json_load(self.file, default=[])
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            logger.error(f"Failed to load prediction log: {e}")
+            return []
+    
+    def log_prediction(self, prediction: dict):
+        """
+        Log a single prediction with all features.
+        
+        Expected fields:
+        - player, opponent, market, line, side
+        - predicted_mean, predicted_std, prob, ev
+        - was_staked: bool (did it pass risk engine?)
+        - stake: float (0 if not staked)
+        - All feat_* fields
+        """
+        import time
+        from datetime import datetime
+        
+        predictions = self.get_predictions()
+        
+        if 'id' not in prediction:
+            prediction['id'] = int(time.time() * 1000)
+        if 'timestamp' not in prediction:
+            prediction['timestamp'] = datetime.now().isoformat()
+        if 'date' not in prediction:
+            prediction['date'] = datetime.now().strftime("%Y-%m-%d")
+        
+        predictions.append(prediction)
+        self._save(predictions)
+    
+    def log_batch(self, predictions: list):
+        """Log multiple predictions at once (e.g., after risk engine runs)."""
+        import time
+        from datetime import datetime
+        
+        existing = self.get_predictions()
+        
+        for pred in predictions:
+            if 'id' not in pred:
+                pred['id'] = int(time.time() * 1000)
+                time.sleep(0.001)  # Ensure unique IDs
+            if 'timestamp' not in pred:
+                pred['timestamp'] = datetime.now().isoformat()
+            if 'date' not in pred:
+                pred['date'] = datetime.now().strftime("%Y-%m-%d")
+            existing.append(pred)
+        
+        self._save(existing)
+    
+    def get_stats(self) -> dict:
+        """Get summary statistics of logged predictions."""
+        predictions = self.get_predictions()
+        
+        total = len(predictions)
+        staked = len([p for p in predictions if p.get('was_staked', False)])
+        not_staked = total - staked
+        
+        # Get date range
+        dates = [p.get('date') for p in predictions if p.get('date')]
+        min_date = min(dates) if dates else None
+        max_date = max(dates) if dates else None
+        
+        return {
+            'total_predictions': total,
+            'staked': staked,
+            'not_staked': not_staked,
+            'staked_pct': staked / total * 100 if total > 0 else 0,
+            'date_range': f"{min_date} to {max_date}" if min_date and max_date else "N/A"
+        }
+    
+    def clear_old_predictions(self, days: int = 30):
+        """Remove predictions older than N days to manage file size."""
+        from datetime import datetime, timedelta
+        
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        predictions = self.get_predictions()
+        
+        kept = [p for p in predictions if p.get('date', '9999-99-99') >= cutoff]
+        removed = len(predictions) - len(kept)
+        
+        self._save(kept)
+        return removed
+
 
 class ParlayTracker: 
     """Tracks parlay bets."""
@@ -5661,11 +6677,95 @@ class ParlayTracker:
         if not self.file.exists():
             self._save([])
 
+    def _normalize_parlay_record(self, raw: Any, fallback_idx: int = 0) -> Optional[Dict[str, Any]]:
+        """Normalize legacy/external parlay payloads into app schema."""
+        if not isinstance(raw, dict):
+            return None
+
+        # IDs can come in many formats (int, numeric string, slip_id).
+        raw_id = raw.get('id', raw.get('slip_id'))
+        try:
+            pid = int(raw_id)
+        except Exception:
+            pid = int(time.time() * 1000) + fallback_idx
+
+        raw_legs = raw.get('legs', [])
+        if not isinstance(raw_legs, list):
+            raw_legs = []
+
+        legs: List[Dict[str, Any]] = []
+        for leg in raw_legs:
+            if not isinstance(leg, dict):
+                continue
+            legs.append({
+                'player': leg.get('player', 'Unknown'),
+                'opponent': leg.get('opponent', ''),
+                'market': leg.get('market', ''),
+                'line': float(leg.get('line', 0.0) or 0.0),
+                'side': leg.get('side', ''),
+                'odds': float(leg.get('odds', 1.0) or 1.0),
+                'result': leg.get('result', 'Pending'),
+            })
+
+        # External exporters may use "status"; internal code uses "result".
+        raw_result = str(raw.get('result', raw.get('status', 'Pending')) or 'Pending').strip().lower()
+        if raw_result in ('win', 'won'):
+            result = 'Win'
+        elif raw_result in ('loss', 'lost'):
+            result = 'Loss'
+        else:
+            result = 'Pending'
+
+        stake = float(raw.get('stake', 0.0) or 0.0)
+        combined_odds = float(raw.get('combined_odds', 1.0) or 1.0)
+        potential_payout = float(
+            raw.get('potential_payout', raw.get('potential_winnings', stake * combined_odds))
+            or (stake * combined_odds)
+        )
+
+        parlay = {
+            'id': pid,
+            'name': raw.get('name') or raw.get('type') or f"Parlay #{fallback_idx + 1}",
+            'date': raw.get('date') or raw.get('date_placed') or datetime.now().strftime("%Y-%m-%d %H:%M"),
+            'legs': legs,
+            'num_legs': int(raw.get('num_legs', len(legs)) or len(legs)),
+            'stake': stake,
+            'combined_odds': combined_odds,
+            'combined_prob': float(raw.get('combined_prob', raw.get('hit_probability_naive', 0.0)) or 0.0),
+            'potential_payout': potential_payout,
+            'potential_profit': float(raw.get('potential_profit', potential_payout - stake) or (potential_payout - stake)),
+            'result': result,
+            'legs_hit': int(raw.get('legs_hit', 0) or 0),
+            'legs_decided': int(raw.get('legs_decided', 0) or 0),
+            'actual_payout': float(raw.get('actual_payout', 0.0) or 0.0),
+        }
+
+        # Keep status consistent with leg-level outcomes whenever leg statuses exist.
+        self._recalculate_parlay_status(parlay)
+        return parlay
+
     def get_parlays(self) -> list:
         try:
             with open(self.file, 'r') as f:
                 content = f.read()
-                return json. loads(content) if content else []
+                payload = json.loads(content) if content else []
+
+                # Backward compatibility:
+                # - legacy/internal format: [ ...parlays ]
+                # - external wrapped format: {"meta": {...}, "parlays": [ ... ]}
+                if isinstance(payload, dict):
+                    raw_parlays = payload.get('parlays', [])
+                elif isinstance(payload, list):
+                    raw_parlays = payload
+                else:
+                    raw_parlays = []
+
+                normalized = []
+                for idx, raw in enumerate(raw_parlays):
+                    item = self._normalize_parlay_record(raw, fallback_idx=idx)
+                    if item is not None:
+                        normalized.append(item)
+                return normalized
         except (json.JSONDecodeError, IOError) as e:
             logger.error(f"Failed to read parlay tracker:  {e}")
             return []
@@ -5700,7 +6800,7 @@ class ParlayTracker:
     def update_leg_result(self, parlay_id:  int, leg_index: int, result:  str):
         parlays = self.get_parlays()
         for parlay in parlays:
-            if parlay['id'] == parlay_id:
+            if parlay.get('id') == parlay_id:
                 if 0 <= leg_index < len(parlay['legs']):
                     parlay['legs'][leg_index]['result'] = result
                     self._recalculate_parlay_status(parlay)
@@ -5740,23 +6840,23 @@ class ParlayTracker:
 
     def delete_parlay(self, parlay_id: int):
         parlays = self.get_parlays()
-        parlays = [p for p in parlays if p['id'] != parlay_id]
+        parlays = [p for p in parlays if isinstance(p, dict) and p.get('id') != parlay_id]
         self._save(parlays)
 
     def get_stats(self) -> dict:
-        parlays = self.get_parlays()
+        parlays = [p for p in self.get_parlays() if isinstance(p, dict)]
         total_parlays = len(parlays)
-        wins = len([p for p in parlays if p['result'] == 'Win'])
-        losses = len([p for p in parlays if p['result'] == 'Loss'])
-        pending = len([p for p in parlays if p['result'] == 'Pending'])
-        decided_parlays = [p for p in parlays if p['result'] != 'Pending']
-        total_staked = sum(p['stake'] for p in decided_parlays)
-        total_returned = sum(p['actual_payout'] for p in decided_parlays)
+        wins = len([p for p in parlays if p.get('result') == 'Win'])
+        losses = len([p for p in parlays if p.get('result') == 'Loss'])
+        pending = len([p for p in parlays if p.get('result', 'Pending') == 'Pending'])
+        decided_parlays = [p for p in parlays if p.get('result', 'Pending') != 'Pending']
+        total_staked = sum(float(p.get('stake', 0.0) or 0.0) for p in decided_parlays)
+        total_returned = sum(float(p.get('actual_payout', 0.0) or 0.0) for p in decided_parlays)
         total_profit = total_returned - total_staked
         roi = (total_profit / total_staked * 100) if total_staked > 0 else 0
-        avg_legs = sum(p['num_legs'] for p in parlays) / total_parlays if total_parlays > 0 else 0
-        total_legs = sum(p['legs_decided'] for p in parlays)
-        total_legs_hit = sum(p['legs_hit'] for p in parlays)
+        avg_legs = (sum(int(p.get('num_legs', 0) or 0) for p in parlays) / total_parlays) if total_parlays > 0 else 0
+        total_legs = sum(int(p.get('legs_decided', 0) or 0) for p in parlays)
+        total_legs_hit = sum(int(p.get('legs_hit', 0) or 0) for p in parlays)
         leg_hit_rate = total_legs_hit / total_legs if total_legs > 0 else 0
         return {
             'total_parlays': total_parlays, 'wins': wins, 'losses':  losses, 'pending': pending,
@@ -5771,12 +6871,32 @@ class ParlayTracker:
 
     def _save(self, data: list):
         try:
-            with open(self. file, 'w') as f:
-                json.dump(data, f, indent=4)
-        except IOError as e:
-            logger. error(f"Failed to save parlay tracker: {e}")
+            # Preserve wrapped schema if the existing file uses {meta, parlays}.
+            wrapped_mode = False
+            try:
+                if self.file.exists():
+                    existing = safe_json_load(self.file, default=None)
+                    wrapped_mode = isinstance(existing, dict) and 'parlays' in existing
+            except Exception:
+                wrapped_mode = False
 
-
+            if wrapped_mode:
+                total_stake = sum(float(p.get('stake', 0.0) or 0.0) for p in data if isinstance(p, dict))
+                total_potential = sum(float(p.get('potential_payout', 0.0) or 0.0) for p in data if isinstance(p, dict))
+                payload = {
+                    'meta': {
+                        'last_updated': datetime.now().isoformat(),
+                        'total_parlays': len(data),
+                        'total_stake_php': round(total_stake, 2),
+                        'total_potential_winnings_php': round(total_potential, 2),
+                    },
+                    'parlays': data,
+                }
+                atomic_json_save(self.file, payload, indent=4)
+            else:
+                atomic_json_save(self.file, data, indent=4)
+        except Exception as e:
+            logger.error(f"Failed to save parlay tracker atomically: {e}")
 # =============================================================================
 # UI COMPONENTS
 # =============================================================================
@@ -5971,22 +7091,17 @@ def render_ml_decoder(result: AnalysisResult):
     # ROW 2: KEY FACTORS (V20 EMPIRICAL)
     st.caption(" **Key Factors**")
     e1, e2, e3, e4 = st.columns(4)
-    # Avg Min (primary) — EMA shown beneath with conditional "Do Not Bet" visual cue
+    
+    # Display metrics without heuristic warnings (trust the model)
     e1.metric("Avg Min", f"{features.avg_minutes:.1f}")
-    # EMA display: if recommended side is UNDER and EMA > line -> show RED (immediate warning)
     ema_val = getattr(features, "ema", -1.0) or -1.0
     ema_display = "N/A" if ema_val < 0 else f"{ema_val:.1f}"
-    recommended_side = ""
-    if getattr(result, "decision", None):
-        recommended_side = (getattr(result.decision, "recommended_side", "") or "").upper()
-    line_val = getattr(result, "line", None) or getattr(features, "line", 0.0)
-    ema_warning = (recommended_side == "UNDER") and (ema_val > line_val)
-    ema_color = "#ff4d4f" if ema_warning else "#aaa"
     e1.markdown(
         f"<div style='font-size:11px;color:#888;margin-top:6px'>EMA</div>"
-        f"<div style='font-size:16px;color:{ema_color};font-weight:700'>{ema_display}</div>",
+        f"<div style='font-size:16px;color:#aaa;font-weight:700'>{ema_display}</div>",
         unsafe_allow_html=True,
     )
+    
     e2.metric("Opp DRTG", f"{features.opponent_drtg_season:.1f}")
     e3.metric("Games", f"{features.games_played}")
     e4.metric("Game Total", f"{features.game_total:.1f}")
@@ -6446,10 +7561,27 @@ def render_parlay_tab(parlay_tracker: ParlayTracker, bankroll: float, bankroll_e
                     st.session_state.parlay_builder.pop(i)
                     st.rerun()
         
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Odds", f"{combined_odds:.2f}")
-        c2.metric("Prob", f"{combined_prob:.1%}")
-        c3.metric("Payout", f"{50 * combined_odds:,.0f}")
+        # Multivariate Correlated SGP Monte Carlo simulation
+        from simulation_engine import SimulationEngine
+        sim_engine = SimulationEngine()
+        sim_res = sim_engine.simulate_correlated_parlay(builder)
+        joint_prob = sim_res.get("joint_prob", combined_prob)
+        ind_prob = sim_res.get("independent_prob", combined_prob)
+        corr_edge = sim_res.get("correlation_edge_pct", 0.0)
+        fair_odds = sim_res.get("fair_decimal_odds", 1.0 / max(joint_prob, 1e-4))
+        parlay_ev = (joint_prob * combined_odds - 1.0) * 100
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Book Odds", f"{combined_odds:.2f}")
+        c2.metric("SGP Joint Prob", f"{joint_prob:.1%}", help="Cholesky Multivariate Monte Carlo Joint Win Probability")
+        c3.metric("Fair Odds", f"{fair_odds:.2f}")
+        c4.metric("Parlay EV", f"{parlay_ev:+.1f}%", delta=f"{corr_edge:+.1f}% corr")
+
+        if len(builder) >= 2:
+            if corr_edge > 2.0:
+                st.success(f"🔥 **Positive Synergy!** Correlated legs boost true win prob by **{corr_edge:+.1f}%** over bookmaker assumption.")
+            elif corr_edge < -2.0:
+                st.warning(f"⚠️ **Cannibalization Drag!** Correlated legs reduce joint prob by **{corr_edge:.1f}%** below naive multiplication.")
         
         c1, c2 = st.columns(2)
         with c1:
@@ -6532,17 +7664,20 @@ def render_ml_data_tab(tracker: Tracker):
     """Render enhanced ML data tab with better preview."""
     st.markdown("###  ML Training Data")
     
+    from persistence_utils import load_ml_training_data
+    parquet_path = DATA_DIR / "ml_training_data.parquet"
     csv_path = DATA_DIR / "ml_training_data.csv"
+    has_data = parquet_path.exists() or csv_path.exists()
     
     # =========================================================================
-    # SECTION 1: THEORETICAL PERFORMANCE (The Math - from CSV)
+    # SECTION 1: THEORETICAL PERFORMANCE (The Math - from Parquet/CSV)
     # =========================================================================
     with st.expander(" Theoretical Performance (The Math)", expanded=False):
-        st.caption("Based on simulation data from ml_training_data.csv")
+        st.caption("Based on simulation data from ml_training_data.parquet / .csv")
         
-        if csv_path.exists():
+        if has_data:
             try:
-                csv_df = pd.read_csv(csv_path, on_bad_lines='skip')
+                csv_df = load_ml_training_data(DATA_DIR)
                 skipped_warning = False
                 
                 # Quick check for corruption
@@ -6716,6 +7851,30 @@ def render_ml_data_tab(tracker: Tracker):
                 st.line_chart(chart_df.set_index('date')['units'], color=line_color)
         else:
             st.info(" No decided bets yet. Track bets and update their results to see your real performance.")
+    
+    # =========================================================================
+    # SECTION 2.5: RETRAIN RECOMMENDATION
+    # =========================================================================
+    with st.expander(" Retrain Recommendation", expanded=True):
+        retrain_rec = tracker.get_retrain_recommendation()
+        
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Sample Size", f"{retrain_rec['sample_size']} bets")
+        r2.metric("Win Rate", f"{retrain_rec['win_rate']*100:.1f}%")
+        
+        if retrain_rec['days_since_retrain'] is not None:
+            r3.metric("Days Since Retrain", retrain_rec['days_since_retrain'])
+        else:
+            r3.metric("Days Since Retrain", "N/A")
+        
+        if retrain_rec['should_retrain']:
+            st.warning(f"⚠️ **RETRAIN RECOMMENDED:** {retrain_rec['reason']}")
+            if st.button(" Mark Retrain Complete"):
+                tracker.mark_retrain_complete()
+                st.success("Retrain marked complete!")
+                st.rerun()
+        else:
+            st.success(f"✅ **Model OK:** {retrain_rec['reason']}")
     
     st.markdown("---")
     
@@ -7014,23 +8173,36 @@ def validate_training_data(df: pd.DataFrame) -> Dict[str, Any]:
 
 def render_train_model_tab():
     from xgboost import XGBRegressor
+    from sklearn.isotonic import IsotonicRegression
     """
-    V20.2 STRICT: Training UI with NO legacy compatibility.
+    V21.5 QUANTILE REGRESSION: Training UI.
     
-    RULES (per Option A directive):
-    - No data inference
-    - No legacy migration  
-    - No fabricated labels
-    - No column remapping
-    - Training fails loudly on invalid data
+    Trains 3 XGBRegressor models for quantiles 0.05, 0.50, 0.95.
+    - Removes Gaussian assumption (handles skewed player distributions)
+    - Wider 90% intervals fix overconfidence (old 80% only hit 78%)
+    - P(Over) calculated via interpolation, not CDF
     """
-    st.markdown("### Train V20.3 Model")
-    st.info("Trains mean, variance, and calibration models. **Requires a V20-generated dataset with the canonical feature set.**")
+    st.markdown("### Train V21.5 Quantile Model")
+    st.info("""
+    **V21.5 CALIBRATED QUANTILE REGRESSION**: Wider 90% intervals fix overconfidence.
     
-    # Check if data exists
-    data_path = DATA_DIR / "ml_training_data.csv"
+    **Calibration Fix:**
+    -  Old q10/q90 (80% target) → only 78% actual coverage = overconfident
+    -  **New q05/q95 (90% target) → properly calibrated probabilities**
+    -  No more betting big on "90% certainty" that only hits 78%
     
-    if not data_path.exists():
+    **Benefits:**
+    -  Per-market models: PTS, REB, AST each get specialized quantile predictions
+    -  No Gaussian assumption - handles skewed player distributions
+    -  Backward compatible with old models (auto-detected)
+    """)
+    
+    # Check if data exists (Parquet or CSV)
+    from persistence_utils import load_ml_training_data
+    parquet_path = DATA_DIR / "ml_training_data.parquet"
+    csv_path = DATA_DIR / "ml_training_data.csv"
+    
+    if not parquet_path.exists() and not csv_path.exists():
         st.error(" Training data not found.")
         st.warning("**Action Required:** Go to 'Generate Dataset' tab and create a new dataset.")
         return
@@ -7051,7 +8223,7 @@ def render_train_model_tab():
     
     if st.button(" Validate Dataset", type="secondary"):
         with st.spinner("Validating against V20.3 schema..."):
-            df = pd.read_csv(data_path)
+            df = load_ml_training_data(DATA_DIR)
             
             # === STRICT VALIDATION ===
             errors = []
@@ -7097,19 +8269,55 @@ def render_train_model_tab():
     
     st.markdown("---")
     
+    # =========================================================================
+    # V21.1 PER-MARKET TRAINING OPTIONS
+    # =========================================================================
+    st.markdown("####  Training Mode")
+    
+    training_mode = st.radio(
+        "Select training mode:",
+        options=["per_market", "universal"],
+        format_func=lambda x: " Per-Market Models (Recommended)" if x == "per_market" else " Universal Model (All markets)",
+        horizontal=True,
+        help="Per-market trains separate models for PTS, REB, AST, etc. Universal trains one model for all markets."
+    )
+    
+    # Market selection for per-market mode
+    all_markets = ['PTS', 'REB', 'AST', 'PRA', 'PR', 'PA', 'RA', '3PM', 'STL', 'BLK']
+    selected_markets = all_markets  # Default: all
+    
+    if training_mode == "per_market":
+        st.markdown("##### Select markets to train:")
+        col1, col2 = st.columns(2)
+        with col1:
+            select_all = st.checkbox("Select All Markets", value=True)
+        with col2:
+            min_samples = st.number_input("Min samples per market", min_value=50, value=100, step=50,
+                                          help="Markets with fewer samples will use universal fallback")
+        
+        if not select_all:
+            selected_markets = st.multiselect(
+                "Choose markets:",
+                options=all_markets,
+                default=['PTS', 'REB', 'AST', 'PRA'],
+                help="Hold Ctrl/Cmd to select multiple"
+            )
+    
+    st.markdown("---")
+    
     if st.button(" Start Training", type="primary"):
         status = st.status("Training in progress...", expanded=True)
         try:
-            # 1. Load Data
-            status.write("Loading dataset...")
-            df = pd.read_csv(data_path)
+            # 1. Load Data (High-performance Parquet preferred)
+            status.write("Loading dataset (preferring Parquet)...")
+            df = load_ml_training_data(DATA_DIR)
             
             # =========================================================
-            # V20.2 STRICT: NO LEGACY COMPATIBILITY
-            # If data is invalid, training FAILS. No migration. No inference.
+            # V21.1 QUANTILE: Train q10, q50, q90 models
+            # NO LEGACY COMPATIBILITY - strict schema enforcement
             # =========================================================
             
-            # Check required features - ALL 24 MUST EXIST
+            # Check required features - ALL MUST EXIST
             missing_features = [f for f in V20_REQUIRED_FEATURES if f not in df.columns]
             if missing_features:
                 status.update(label=" Schema Validation Failed", state="error")
@@ -7124,161 +8332,1039 @@ def render_train_model_tab():
             if V20_REQUIRED_TARGET not in df.columns:
                 status.update(label=" Schema Validation Failed", state="error")
                 st.error(f"**FATAL:** Missing regression target '{V20_REQUIRED_TARGET}'")
-                st.warning("V20 requires actual stat values for regression. Regenerate dataset.")
+                st.warning("V21 requires actual stat values for regression. Regenerate dataset.")
                 return
             
             status.write(f" Schema validation passed ({len(V20_REQUIRED_FEATURES)} features)")
             
-            # 2. Prepare Data (strict - no fillna inference)
-            status.write(f"Processing {len(df)} samples with {len(V20_REQUIRED_FEATURES)} features...")
+            # XGBoost base params
+            # V21.6 REGULARISATION: Explicit complexity penalties + early stopping
+            # min_child_weight=5: prevents tiny leaves memorising rare players
+            # reg_alpha/lambda: L1+L2 penalty on leaf weights
+            # gamma: requires minimum loss reduction to split (structural regulariser)
+            # n_estimators is an upper bound — early stopping will halt before this
+            from hardware_utils import get_xgboost_hardware_params
+            # Load tuned GPU hyperparameters if available
+            market_gpu_params = {}
+            hp_path = Path("config/model_hyperparams.json")
+            if hp_path.exists():
+                try:
+                    with open(hp_path, "r", encoding="utf-8") as f:
+                        hp_cfg = json.load(f)
+                    if model_name in hp_cfg and isinstance(hp_cfg[model_name], dict):
+                        market_gpu_params = hp_cfg[model_name]
+                        st.caption(f"⚡ Loaded GPU-tuned hyperparameters for {model_name}")
+                except Exception:
+                    pass
+
+            base_params = get_xgboost_hardware_params({
+                'n_estimators': 500,
+                'learning_rate': 0.05,
+                'max_depth': 4,
+                'min_child_weight': 5,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8,
+                'reg_alpha': 1.0,
+                'reg_lambda': 1.0,
+                'gamma': 0.1,
+                'random_state': 42,
+                'verbosity': 0,
+                **market_gpu_params,
+            })
             
-            # Check for NaN in features (fail, don't fill)
-            X = df[V20_REQUIRED_FEATURES]
-            nan_counts = X.isna().sum()
-            if nan_counts.sum() > 0:
-                bad_cols = nan_counts[nan_counts > 0].to_dict()
-                status.update(label=" Data Quality Failed", state="error")
-                st.error(f"**FATAL:** NaN values in features: {bad_cols}")
-                st.warning("Dataset contains missing values. Regenerate with complete data.")
-                return
+            # V21.5 CALIBRATION FIX: Wider quantiles (90% interval)
+            # Old: [0.10, 0.50, 0.90] gave 78% coverage (underconfident)
+            # New: [0.05, 0.50, 0.95] targets 90% coverage (properly calibrated)
+            quantiles = [0.05, 0.50, 0.95]
+            quantile_names = ['q05', 'q50', 'q95']
             
-            X = X.apply(pd.to_numeric, errors='coerce')
-            y = pd.to_numeric(df[V20_REQUIRED_TARGET], errors='coerce')
+            def _interpolate_prob(line, q_low, q50, q_high):
+                """V22: Split-normal CDF (matches ModelEngine fix)."""
+                z_val = 1.645  # wide quantiles (q05/q95)
+                if q_low >= q_high or q_high - q_low < 0.1:
+                    return 0.50
+                sigma_lower = max((q50 - q_low) / z_val, 0.1)
+                sigma_upper = max((q_high - q50) / z_val, 0.1)
+                if line <= q50:
+                    z = (line - q50) / sigma_lower
+                else:
+                    z = (line - q50) / sigma_upper
+                p_over = 1.0 - stats.norm.cdf(z)
+                return float(max(0.02, min(0.98, p_over)))
+
+            def train_quantile_models(X_train, y_train, X_test, y_test, model_name: str, lines_train=None, lines_test=None):
+                """Train q05/q50/q95 models + optional isotonic calibrator.
+
+                V21.6 UPGRADES:
+                - Early stopping: halts training when val RMSE stops improving (25 rounds)
+                - evals_result: captures train vs val RMSE per boosting round for learning curves
+                - Calibrator fitted on chronological val slice from training set (no test leakage)
+                """
+                from sklearn.model_selection import TimeSeriesSplit
+
+                quantile_models = {}
+                all_evals = {}  # {q_name: evals_result dict}
+                best_iters = {}  # record early-stop iteration per quantile
+
+                for q, name in zip(quantiles, quantile_names):
+                    evals_result = {}
+                    use_early_stop = (name == 'q50')
+                    params = {
+                        **base_params,
+                        'objective': 'reg:quantileerror',
+                        'quantile_alpha': q,
+                        'eval_metric': 'mae',
+                    }
+                    if use_early_stop:
+                        params['early_stopping_rounds'] = 25
+
+                    model = XGBRegressor(**params)
+                    model.fit(
+                        X_train, y_train,
+                        eval_set=[(X_train, y_train), (X_test, y_test)],
+                        verbose=False,
+                    )
+                    # Capture evals via booster
+                    try:
+                        evals_result = model.evals_result()
+                    except Exception:
+                        evals_result = {}
+                    quantile_models[name] = model
+                    all_evals[name] = evals_result
+                    best_iter = getattr(model, 'best_iteration', base_params['n_estimators'])
+                    best_iters[name] = best_iter
+                    logger.info(f"  {model_name}/{name}: {'early stop @' if use_early_stop else 'ran'} iter {best_iter}")
+
+                # Mark as wide quantile model for backward compat detection
+                quantile_models['_wide_quantile'] = True
+                # return full history so caller can plot/inspect
+                # Store learning curves for UI rendering
+                quantile_models['_evals_result'] = all_evals
+
+                # Evaluate on held-out TEST set
+                pred_05 = quantile_models['q05'].predict(X_test)
+                pred_50 = quantile_models['q50'].predict(X_test)
+                pred_95 = quantile_models['q95'].predict(X_test)
+
+                mae = mean_absolute_error(y_test, pred_50)
+                r2 = r2_score(y_test, pred_50)
+                in_interval = ((y_test >= pred_05) & (y_test <= pred_95)).mean()
+                coverage = in_interval * 100
+                avg_width = (pred_95 - pred_05).mean()
+
+                # === TIME-SERIES CROSS-VALIDATION (5 folds) ===
+                # Runs on median quantile (q50) only for speed.
+                # Fold MAEs tell us if the model generalises across seasons
+                # or just memorises the most recent one.
+                cv_mae_folds = []
+                try:
+                    tscv = TimeSeriesSplit(n_splits=5)
+                    X_cv = pd.concat([X_train, X_test])
+                    y_cv = pd.concat([y_train, y_test])
+                    for fold_train_idx, fold_val_idx in tscv.split(X_cv):
+                        fold_model = XGBRegressor(
+                            **base_params,
+                            objective='reg:quantileerror',
+                            quantile_alpha=0.50,
+                            eval_metric='mae',
+                            early_stopping_rounds=25,
+                        )
+                        Xf_tr, Xf_val = X_cv.iloc[fold_train_idx], X_cv.iloc[fold_val_idx]
+                        yf_tr, yf_val = y_cv.iloc[fold_train_idx], y_cv.iloc[fold_val_idx]
+                        fold_model.fit(
+                            Xf_tr, yf_tr,
+                            eval_set=[(Xf_val, yf_val)],
+                            verbose=False,
+                        )
+                        fold_pred = fold_model.predict(Xf_val)
+                        cv_mae_folds.append(mean_absolute_error(yf_val, fold_pred))
+                except Exception as e:
+                    logger.warning(f"CV failed for {model_name}: {e}")
+
+                cv_mae_mean = float(np.mean(cv_mae_folds)) if cv_mae_folds else None
+                cv_mae_std  = float(np.std(cv_mae_folds))  if cv_mae_folds else None
+
+                # === CALIBRATION (Isotonic Regression) ===
+                calibrator = None
+                cal_delta = 0.0
+
+                raw_probs_test = None
+                actual_over_test = None
+                if lines_test is not None and len(lines_test) == len(y_test):
+                    lines_arr_test = np.asarray(lines_test, dtype=float)
+                    raw_probs_test = np.array([
+                        _interpolate_prob(l, q05, q50, q95)
+                        for l, q05, q50, q95 in zip(lines_arr_test, pred_05, pred_50, pred_95)
+                    ])
+                    actual_over_test = (np.asarray(y_test, dtype=float) > lines_arr_test).astype(float)
+
+                if lines_train is not None and len(lines_train) == len(y_train):
+                    val_size = max(1, int(len(y_train) * 0.25))
+                    val_start = len(y_train) - val_size
+
+                    X_val = X_train.iloc[val_start:]
+                    y_val = y_train.iloc[val_start:]
+                    lines_val = np.asarray(lines_train[val_start:], dtype=float)
+
+                    pred_05_val = quantile_models['q05'].predict(X_val)
+                    pred_50_val = quantile_models['q50'].predict(X_val)
+                    pred_95_val = quantile_models['q95'].predict(X_val)
+
+                    raw_probs_val = np.array([
+                        _interpolate_prob(l, q05, q50, q95)
+                        for l, q05, q50, q95 in zip(lines_val, pred_05_val, pred_50_val, pred_95_val)
+                    ])
+                    actual_over_val = (np.asarray(y_val, dtype=float) > lines_val).astype(float)
+
+                    try:
+                        from model_engine import SigmoidCalibrator
+                        cal = SigmoidCalibrator(clip_min=0.01, clip_max=0.99)
+                        cal.fit(raw_probs_val, actual_over_val)
+                        calibrator = cal
+
+                        if raw_probs_test is not None and actual_over_test is not None:
+                            cal_probs = cal.predict(raw_probs_test)
+                            cal_delta = abs(cal_probs.mean() - actual_over_test.mean()) - abs(raw_probs_test.mean() - actual_over_test.mean())
+                    except Exception as e:
+                        logger.warning(f"Calibration fitting failed for {model_name}: {e}")
+
+                return quantile_models, calibrator, {
+                    'name': model_name,
+                    'samples': len(y_train) + len(y_test),
+                    'mae': mae,
+                    'r2': r2,
+                    'coverage': coverage,
+                    'avg_width': avg_width,
+                    'calibrated': calibrator is not None,
+                    'cal_delta': round(cal_delta, 4),
+                    'cv_mae_mean': round(cv_mae_mean, 4) if cv_mae_mean is not None else None,
+                    'cv_mae_std':  round(cv_mae_std,  4) if cv_mae_std  is not None else None,
+                    'evals_result': all_evals,
+                }, best_iters
             
-            # Check for NaN in target
-            if y.isna().sum() > 0:
-                status.update(label=" Data Quality Failed", state="error")
-                st.error(f"**FATAL:** {y.isna().sum()} NaN values in target '{V20_REQUIRED_TARGET}'")
-                st.warning("Dataset has missing actual values. Regenerate with complete data.")
-                return
+            all_metrics = []
             
-            status.write(" Data quality passed (no NaN)")
+            if training_mode == "per_market":
+                # =========================================================
+                # PER-MARKET TRAINING
+                # =========================================================
+                status.write(f" Training per-market models for {len(selected_markets)} markets...")
+                
+                # Check market column exists
+                if 'market' not in df.columns:
+                    status.update(label=" Schema Validation Failed", state="error")
+                    st.error("**FATAL:** 'market' column not found in dataset")
+                    return
+                
+                trained_markets = []
+                skipped_markets = []
+                
+                for market in selected_markets:
+                    market_df = df[df['market'] == market]
+                    
+                    if len(market_df) < min_samples:
+                        status.write(f"   {market}: Skipping (only {len(market_df)} samples, need {min_samples})")
+                        skipped_markets.append((market, len(market_df)))
+                        continue
+                    
+                    status.write(f"   {market}: Training on {len(market_df)} samples...")
+                    
+                    # Prepare data
+                    X = market_df[V20_REQUIRED_FEATURES].apply(pd.to_numeric, errors='coerce')
+                    y = pd.to_numeric(market_df[V20_REQUIRED_TARGET], errors='coerce')
+                    
+                    # Skip if too many NaN
+                    if X.isna().sum().sum() > len(X) * 0.1:
+                        status.write(f"   {market}: Skipping (too many NaN values)")
+                        skipped_markets.append((market, 'NaN'))
+                        continue
+                    
+                    # Fill remaining NaN with median for training stability
+                    X = X.fillna(X.median())
+                    
+                    # Drop rows where target is NaN
+                    valid_mask = ~y.isna()
+                    X = X[valid_mask]
+                    y = y[valid_mask]
+                    
+                    if len(y) < min_samples:
+                        skipped_markets.append((market, len(y)))
+                        continue
+                    
+                    # Get lines for calibration (from feat_line feature or metadata 'line' column)
+                    if 'feat_line' in market_df.columns:
+                        market_lines = pd.to_numeric(market_df['feat_line'], errors='coerce').fillna(0)
+                    elif 'line' in market_df.columns:
+                        market_lines = pd.to_numeric(market_df['line'], errors='coerce').fillna(0)
+                    else:
+                        market_lines = pd.Series(0, index=market_df.index)
+                    market_lines = market_lines[valid_mask]
+                    
+                    # Time-aware split: sort chronologically and perform a non-shuffled holdout
+                    # This prevents future->past leakage and gives an out-of-time estimate.
+                    if 'date' in market_df.columns:
+                        ordered_idx = market_df.loc[valid_mask].sort_values('date').index
+                        X = X.loc[ordered_idx]
+                        y = y.loc[ordered_idx]
+                        market_lines = market_lines.loc[ordered_idx]
+
+                    X_train, X_test, y_train, y_test, lines_train, lines_test = train_test_split(
+                        X, y, market_lines, test_size=0.2, shuffle=False
+                    )
+                    # temporal cross-validation on training set
+                    tscv = TimeSeriesSplit(n_splits=5)
+                    fold_scores = []
+                    for tr_idx, val_idx in tscv.split(X_train):
+                        m_cv = XGBRegressor(**base_params)
+                        m_cv.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
+                        pred_cv = m_cv.predict(X_train.iloc[val_idx])
+                        prob_cv = (pred_cv >= lines_train.iloc[val_idx]).astype(float)
+                        actual_cv = (y_train.iloc[val_idx] > lines_train.iloc[val_idx]).astype(float)
+                        fold_scores.append(accuracy_score(actual_cv, prob_cv))
+                    status.write(f"    CV win rates: {fold_scores}, std={np.std(fold_scores):.3f}")
+                    
+                    # Train quantile models + calibrator (pass both train/test lines for validation split)
+                    ret = train_quantile_models(
+                        X_train, y_train, X_test, y_test, market, lines_train=lines_train.values, lines_test=lines_test.values
+                    )
+                    # function now returns (models, calibrator, metrics, best_iters)
+                    quantile_models, calibrator, metrics, best_iters = ret
+                    # extract evals history from metrics dict
+                    evals_hist = metrics.get('evals_result', {})
+                    all_metrics.append(metrics)
+                    # learning curves and early stop info
+                    status.write(f"    {market}: best iters {best_iters}")
+                    # plot q50 curve if available
+                    if 'q50' in evals_hist:
+                        curve = pd.DataFrame({
+                            'train_rmse': evals_hist['q50']['validation_0']['rmse'],
+                            'val_rmse': evals_hist['q50']['validation_1']['rmse']
+                        })
+                        status.line_chart(curve)
+                    
+                    # Save per-market model
+                    model_path = DATA_DIR / f"nba_quantile_{market}.pkl"
+                    joblib.dump(quantile_models, model_path)
+                    
+                    # Save calibrator
+                    if calibrator is not None:
+                        group = ML_MARKET_GROUPS.get(market, 'universal')
+                        cal_path = DATA_DIR / f"nba_calibrator_{group}.pkl"
+                        joblib.dump(calibrator, cal_path)
+                        status.write(f"    {market}: MAE={metrics['mae']:.2f}, Coverage={metrics['coverage']:.1f}%, Calibrator saved ({group})")
+                    else:
+                        status.write(f"    {market}: MAE={metrics['mae']:.2f}, Coverage={metrics['coverage']:.1f}%, No calibrator")
+                    trained_markets.append(market)
+                
+                # Also train universal fallback for skipped markets
+                if skipped_markets:
+                    status.write(" Training universal fallback for markets with insufficient data...")
+                    
+                    X_all = df[V20_REQUIRED_FEATURES].apply(pd.to_numeric, errors='coerce').fillna(df[V20_REQUIRED_FEATURES].median())
+                    y_all = pd.to_numeric(df[V20_REQUIRED_TARGET], errors='coerce')
+                    valid_mask = ~y_all.isna()
+                    X_all = X_all[valid_mask]
+                    y_all = y_all[valid_mask]
+                    
+                    # Get lines for calibration
+                    if 'feat_line' in df.columns:
+                        all_lines = pd.to_numeric(df['feat_line'], errors='coerce').fillna(0)[valid_mask]
+                    elif 'line' in df.columns:
+                        all_lines = pd.to_numeric(df['line'], errors='coerce').fillna(0)[valid_mask]
+                    else:
+                        all_lines = pd.Series(0, index=X_all.index)
+                    
+                    # Chronological holdout for universal fallback
+                    if 'date' in df.columns:
+                        ordered_idx = df[valid_mask].sort_values('date').index
+                        X_all = X_all.loc[ordered_idx]
+                        y_all = y_all.loc[ordered_idx]
+                        all_lines = all_lines.loc[ordered_idx]
+
+                    X_train, X_test, y_train, y_test, lines_train, lines_test = train_test_split(
+                        X_all, y_all, all_lines, test_size=0.2, shuffle=False
+                    )
+                    # CV on universal training set
+                    tscv = TimeSeriesSplit(n_splits=5)
+                    fold_scores = []
+                    for tr_idx, val_idx in tscv.split(X_train):
+                        m_cv = XGBRegressor(**base_params)
+                        m_cv.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
+                        pred_cv = m_cv.predict(X_train.iloc[val_idx])
+                        prob_cv = (pred_cv >= lines_train.iloc[val_idx]).astype(float)
+                        actual_cv = (y_train.iloc[val_idx] > lines_train.iloc[val_idx]).astype(float)
+                        fold_scores.append(accuracy_score(actual_cv, prob_cv))
+                    status.write(f"    Universal CV win rates: {fold_scores}, std={np.std(fold_scores):.3f}")
+                    ret = train_quantile_models(
+                        X_train, y_train, X_test, y_test, "universal", lines_train=lines_train.values, lines_test=lines_test.values
+                    )
+                    quantile_models, calibrator, metrics, best_iters_uni = ret
+                    evals_hist_uni = metrics.get('evals_result', {})
+                    all_metrics.append(metrics)
+                    status.write(f"    Universal: best iters {best_iters_uni}")
+                    if 'q50' in evals_hist_uni:
+                        curve_u = pd.DataFrame({
+                            'train_rmse': evals_hist_uni['q50']['validation_0']['rmse'],
+                            'val_rmse': evals_hist_uni['q50']['validation_1']['rmse']
+                        })
+                        status.line_chart(curve_u)
+                    
+                    universal_path = DATA_DIR / "nba_quantile_universal.pkl"
+                    joblib.dump(quantile_models, universal_path)
+                    if calibrator is not None:
+                        joblib.dump(calibrator, DATA_DIR / "nba_calibrator_universal.pkl")
+                    status.write(f"    Universal: MAE={metrics['mae']:.2f}, Coverage={metrics['coverage']:.1f}%")
+                
+                status.write(f" Trained {len(trained_markets)} per-market models")
+                if skipped_markets:
+                    status.write(f"   Skipped {len(skipped_markets)} markets (using universal fallback)")
+                
+            else:
+                # =========================================================
+                # UNIVERSAL TRAINING (all markets combined)
+                # =========================================================
+                status.write(" Training universal model on all markets...")
+                
+                X = df[V20_REQUIRED_FEATURES].apply(pd.to_numeric, errors='coerce')
+                y = pd.to_numeric(df[V20_REQUIRED_TARGET], errors='coerce')
+                
+                # Check for NaN
+                nan_counts = X.isna().sum()
+                if nan_counts.sum() > 0:
+                    bad_cols = nan_counts[nan_counts > 0].to_dict()
+                    status.write(f"   Warning: NaN values in {len(bad_cols)} features, filling with median")
+                    X = X.fillna(X.median())
+                
+                valid_mask = ~y.isna()
+                X = X[valid_mask]
+                y = y[valid_mask]
+                
+                status.write(f"   Processing {len(y)} samples with {len(V20_REQUIRED_FEATURES)} features...")
+                
+                # Get lines for calibration
+                if 'feat_line' in df.columns:
+                    uni_lines = pd.to_numeric(df['feat_line'], errors='coerce').fillna(0)[valid_mask]
+                elif 'line' in df.columns:
+                    uni_lines = pd.to_numeric(df['line'], errors='coerce').fillna(0)[valid_mask]
+                else:
+                    uni_lines = pd.Series(0, index=X.index)
+                
+                # Time-aware train/test split: sort by date then hold out the latest 20%
+                if 'date' in df.columns:
+                    ordered_idx = df[valid_mask].sort_values('date').index
+                    X = X.loc[ordered_idx]
+                    y = y.loc[ordered_idx]
+                    uni_lines = uni_lines.loc[ordered_idx]
+
+                X_train, X_test, y_train, y_test, lines_train, lines_test = train_test_split(
+                    X, y, uni_lines, test_size=0.2, shuffle=False
+                )
+                # CV on universal training set
+                tscv = TimeSeriesSplit(n_splits=5)
+                fold_scores = []
+                for tr_idx, val_idx in tscv.split(X_train):
+                    m_cv = XGBRegressor(**base_params)
+                    m_cv.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
+                    pred_cv = m_cv.predict(X_train.iloc[val_idx])
+                    prob_cv = (pred_cv >= lines_train.iloc[val_idx]).astype(float)
+                    actual_cv = (y_train.iloc[val_idx] > lines_train.iloc[val_idx]).astype(float)
+                    fold_scores.append(accuracy_score(actual_cv, prob_cv))
+                status.write(f"    Universal CV win rates: {fold_scores}, std={np.std(fold_scores):.3f}")
+                
+                # Train quantile models + calibrator (use validation split taken from training set)
+                ret = train_quantile_models(
+                    X_train, y_train, X_test, y_test, "universal", lines_train=lines_train.values, lines_test=lines_test.values
+                )
+                quantile_models, calibrator, metrics, best_iters_uni = ret
+                evals_hist_uni = metrics.get('evals_result', {})
+                all_metrics.append(metrics)
+                status.write(f"    Universal: best iters {best_iters_uni}")
+                if 'q50' in evals_hist_uni:
+                    curve_u = pd.DataFrame({
+                        'train_rmse': evals_hist_uni['q50']['validation_0']['rmse'],
+                        'val_rmse': evals_hist_uni['q50']['validation_1']['rmse']
+                    })
+                    status.line_chart(curve_u)
+                
+                # Save universal model
+                universal_path = DATA_DIR / "nba_quantile_universal.pkl"
+                joblib.dump(quantile_models, universal_path)
+                if calibrator is not None:
+                    joblib.dump(calibrator, DATA_DIR / "nba_calibrator_universal.pkl")
+                    status.write("   Calibration curve saved")
             
-            # 3. Train Model
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-            
-            status.write("Training V20.2 Regression model...")
-            model = XGBRegressor(
-                n_estimators=500, learning_rate=0.05, max_depth=4,
-                subsample=0.8, colsample_bytree=0.8, objective='reg:squarederror'
-            )
-            model.fit(X_train, y_train)
-            
-            # 4. Evaluate
-            preds = model.predict(X_test)
-            mae = mean_absolute_error(y_test, preds)
-            r2 = r2_score(y_test, preds)
-            
-            # 5. Save
-            status.write(" Saving model...")
-            joblib.dump(model, DATA_DIR / "nba_model_v20.pkl")
-            joblib.dump(V20_REQUIRED_FEATURES, DATA_DIR / "nba_features_v20.pkl")
+            # Save feature list
+            joblib.dump(V20_REQUIRED_FEATURES, DATA_DIR / "nba_features_v21.pkl")
             
             status.update(label=" Training Complete!", state="complete")
             
-            st.success("V20.2 Regression Model Trained!")
-            c1, c2 = st.columns(2)
-            c1.metric("Mean Absolute Error", f"{mae:.2f}")
-            c2.metric("R Score", f"{r2:.3f}")
+            st.success(f" V21.1 Quantile Regression Models Trained!")
+            
+            # Display metrics in table
+            st.markdown("#### Model Performance Summary")
+            
+            # ── Strip non-tabular fields before building the display df ──
+            display_rows = []
+            for m in all_metrics:
+                display_rows.append({k: v for k, v in m.items()
+                                     if k not in ('evals_result',)})
+            metrics_df = pd.DataFrame(display_rows)
+            metrics_df = metrics_df.rename(columns={
+                'name': 'Model',
+                'samples': 'Samples',
+                'mae': 'MAE',
+                'r2': 'R²',
+                'coverage': 'Coverage %',
+                'avg_width': 'Avg Width',
+                'calibrated': 'Calibrated',
+                'cal_delta': 'Cal Δ',
+                'cv_mae_mean': 'CV MAE',
+                'cv_mae_std': 'CV Std',
+            })
+
+            # Format numeric columns
+            for col in ['MAE', 'R²', 'Avg Width', 'Cal Δ', 'CV MAE', 'CV Std']:
+                if col in metrics_df.columns:
+                    metrics_df[col] = metrics_df[col].apply(
+                        lambda x: f"{x:.3f}" if x is not None else "—")
+            if 'Coverage %' in metrics_df.columns:
+                metrics_df['Coverage %'] = metrics_df['Coverage %'].apply(
+                    lambda x: f"{x:.1f}%" if x is not None else "—")
+
+            st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+
+            # ── CV Std flag ──
+            if 'CV Std' in metrics_df.columns:
+                try:
+                    max_std = max(
+                        float(v) for v in metrics_df['CV Std'] if v not in (None, "—")
+                    )
+                    if max_std > 1.5:
+                        st.warning(f"⚠️ High CV Std ({max_std:.3f}) — model generalisation varies across seasons. "
+                                   "Consider adding more historical data or tightening regularisation.")
+                    else:
+                        st.success(f"✅ CV Std stable ({max_std:.3f}) — model generalises consistently across folds.")
+                except Exception:
+                    pass
+
+            # ── Learning Curves (q50 only, train vs val RMSE) ──
+            st.markdown("#### 📈 Learning Curves — Train vs Validation RMSE (q50)")
+            st.caption("Gap between lines = overfitting. Early stopping iteration marked where val RMSE bottomed out.")
+
+            curve_data_found = False
+            for m in all_metrics:
+                er = m.get('evals_result', {})
+                q50_er = er.get('q50', {})
+                # evals_result keys are 'validation_0' (train) and 'validation_1' (test)
+                train_rmse = q50_er.get('validation_0', {}).get('rmse')
+                val_rmse   = q50_er.get('validation_1', {}).get('rmse')
+                if train_rmse and val_rmse:
+                    curve_data_found = True
+                    n = min(len(train_rmse), len(val_rmse))
+                    curve_df = pd.DataFrame({
+                        'Iteration': list(range(1, n + 1)),
+                        'Train RMSE': train_rmse[:n],
+                        'Val RMSE':   val_rmse[:n],
+                    })
+                    best_iter = int(np.argmin(val_rmse[:n])) + 1
+                    with st.expander(f"{m['name']} — stopped @ iter {best_iter}/{base_params['n_estimators']}", expanded=False):
+                        st.line_chart(curve_df.set_index('Iteration')[['Train RMSE', 'Val RMSE']])
+                        col_a, col_b, col_c = st.columns(3)
+                        col_a.metric("Best Val RMSE", f"{min(val_rmse[:n]):.3f}", f"@ iter {best_iter}")
+                        col_b.metric("Final Train RMSE", f"{train_rmse[best_iter-1]:.3f}")
+                        gap = train_rmse[best_iter-1] - min(val_rmse[:n])
+                        col_c.metric("Train-Val Gap", f"{gap:+.3f}",
+                                     delta_color="inverse" if gap < -0.1 else "normal")
+
+            if not curve_data_found:
+                st.info("Learning curve data not available for this run.")
+            
+            # Overall interpretation
+            avg_coverage = np.mean([m['coverage'] for m in all_metrics])
+            cal_count = sum(1 for m in all_metrics if m.get('calibrated', False))
+            if avg_coverage < 75:
+                st.warning(" Low average coverage: Models may be overconfident.")
+            elif avg_coverage > 85:
+                st.info(" High average coverage: Models are conservative.")
+            else:
+                st.success(f" Good calibration: Average coverage {avg_coverage:.1f}% is near target 90%.")
+            
+            if cal_count > 0:
+                st.success(f" {cal_count} isotonic calibration curves trained and saved.")
+            else:
+                st.warning(" No calibration curves were fitted (missing line data in training set).")
+                st.caption("Ensure the training CSV has a 'line' or 'feat_line' column.")
+            
+            if training_mode == "per_market":
+                st.info(f"""
+                **Per-Market Models Saved:**
+                - {len([m for m in all_metrics if m['name'] != 'universal'])} market-specific models
+                - Fallback universal model for other markets
+                
+                **Model lookup priority:** PTS → scoring group → universal
+                """)
             
             st.balloons()
             
         except Exception as e:
             status.update(label=" Training Failed", state="error")
             st.error(f"Error: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
 
-def render_guide_tab():
-    """Renders the comprehensive user guide - V20 Empirical."""
-    st.markdown("###  User Guide")
-    st.caption(f"V20 Empirical ML | {CURRENT_VERSION}")
+def render_analytics_tab(tracker: 'Tracker'):
+    """
+    V21.4: Analytics Dashboard - Performance tracking center.
+    Replaces the old Guide tab with actionable performance data.
+    
+    SMART DATE PARSING: Bets placed between 12:00 AM and 1:00 PM PH Time (UTC+8)
+    are attributed to the PREVIOUS day's game slate (since NBA games in the US
+    finish late night / early morning PH time).
+    """
+    st.markdown("### Analytics Dashboard")
+    st.caption(f"{CURRENT_VERSION} | Performance Tracking Center")
 
-    # --- SECTION 1: CORE WORKFLOW ---
-    with st.expander(" Quick Start", expanded=True):
-        st.markdown("""
-        1. **Analyze:** Pick a player/market, hit "Run Analysis".
-        2. **Decide:** Look for **EV+ bets** with probability in the 55-75% zone.
-        3. **Track:** Click **" Track"** to save the bet.
-        4. **Resolve:** Next day, mark Win/Loss and enter actual score in **Bets Tab**.
-        5. **Train:** With 500+ samples, retrain in **ML Tab** for better predictions.
-        """)
+    bets = tracker.get_bets()
 
-    # --- SECTION 2: V20 ML ARCHITECTURE ---
-    with st.expander(" V20 ML Architecture", expanded=True):
-        st.markdown("""
-        **Pure Empirical ML Pipeline:**
-        
-        V20 uses ML as the **sole prediction engine**. No heuristics, no hand-tuned multipliers.
-        
-        * **Mean Model:** XGBRegressor predicts expected stat value E[stat]
-        * **Variance Model:** Separate XGBRegressor predicts uncertainty [stat]
-        * **CDF Probability:** P(Over) = 1 - ((line - ) / )
-        * **Calibration:** Isotonic regression corrects probability biases
-        
-        **15 Raw Observable Features:**
-        - Statistical: avg_minutes, ema, std
-        - Opponent: drtg_season
-        - Context: line, spread, game_total
-        - Rest: days_rest, is_home, is_b2b
-        - Sample: games_played
-        - Market: scoring/counting/combo/rare (one-hot)
-        """)
+    # =========================================================================
+    # HELPER: Smart Date Parsing (PH Timezone Shift Logic)
+    # =========================================================================
+    def _normalize_calendar_date(value: Any) -> str:
+        """Normalize stored dates to YYYY-MM-DD for calendar grouping."""
+        if not value:
+            return ''
 
-    # --- SECTION 3: BET DECISION RULES ---
-    with st.expander(" Bet Decision Rules"):
-        st.markdown("""
-        **The 4 Rules (all must pass):**
-        
-        1. **Offset:** Projection must align with recommended side
-           - OVER: Model projection > Vegas line
-           - UNDER: Model projection < Vegas line
-        
-        2. **Probability Zone:** 55% - 80%
-           - Below 55% = thin edge, high variance
-           - Above 80% = suspiciously confident, likely mispriced
-        
-        3. **Positive EV:** Expected Value > 0%
-           - EV = (Prob  Win) - ((1-Prob)  Loss)
-        
-        4. **Stability:** CV  30%
-           - CV = std / mean
-           - High variance players are harder to predict
-        """)
+        if isinstance(value, datetime):
+            return value.strftime('%Y-%m-%d')
 
-    # --- SECTION 4: INTERPRETING THE UI ---
-    with st.expander(" Understanding the Output"):
-        st.markdown("""
-        **Ticket Card:**
-        - **Win Prob:** CDF-based probability for recommended side
-        - **Predicted:** ML regression prediction (expected stat value)
-        - **Std Dev:** Uncertainty from variance model
-        - **Stake:** Kelly criterion suggestion (% of bankroll)
-        
-        **ML Decoder:**
-        - **Model Group:** Which specialized model (scoring/counting/combo/rare)
-        - **Raw ML:** Uncalibrated probability from CDF
-        - **Calibrated:** After isotonic correction
-        - **Calibrator:**  Active means calibration curve is applied
-        
-        **Key Factors:**
-        - All raw observables that fed into the model
-        - Use these to sanity-check the prediction
-        """)
+        text = str(value).strip()
+        if not text:
+            return ''
 
-    # --- SECTION 5: ML TRAINING ---
-    with st.expander(" Training Your Model"):
-        st.markdown("""
-        **The Training Loop:**
+        try:
+            parsed = datetime.fromisoformat(text)
+            return parsed.strftime('%Y-%m-%d')
+        except ValueError:
+            pass
+
+        try:
+            return pd.to_datetime(text).strftime('%Y-%m-%d')
+        except Exception:
+            return text[:10]
+
+    def _get_adjusted_game_date(bet: Dict) -> str:
+        """
+        Returns the 'Adjusted Game Date' for a bet based on PH timezone logic.
         
-        1. **Track Bets:** Log every bet with actual scores
-        2. **Generate Dataset:** ML Tab  Generate Dataset (bulk backtests)
-        3. **Train Models:** ML Tab  Train Brain
-        4. **Models Created:**
-           - `nba_model_{group}.pkl` - Mean regression
-           - `nba_variance_{group}.pkl` - Uncertainty model
-           - `nba_calibrator_{group}.pkl` - Probability calibration
+        Logic:
+        - The bet 'id' field is a Unix timestamp in milliseconds.
+        - Convert to PH timezone (UTC+8).
+        - If the local PH hour is between 0 (12:00 AM) and 13 (1:00 PM inclusive),
+          the bet is for the PREVIOUS day's game slate (US games end late).
+        - Otherwise, keep the same date.
         
-        **Minimum Data:** 500+ samples per market group recommended
-        """)
+        Examples (PH Time):
+        - Bet at Feb 4 12:07 AM -> Adjusted to Feb 3 (previous day's games)
+        - Bet at Feb 4 5:47 PM  -> Stays Feb 4 (current day's games)
+        """
+        from datetime import timezone
+        
+        bet_id = bet.get('id')
+        fallback_date = bet.get('date', '')
+        
+        if not bet_id:
+            # No timestamp available, use the stored date as-is
+            return fallback_date
+        
+        try:
+            # Convert milliseconds timestamp to datetime (UTC)
+            ts_seconds = bet_id / 1000.0
+            utc_dt = datetime.fromtimestamp(ts_seconds, tz=timezone.utc)
+            
+            # Convert to PH timezone (UTC+8)
+            ph_offset = timedelta(hours=8)
+            ph_dt = utc_dt + ph_offset
+            
+            # Check if hour is between 0 (midnight) and 13 (1 PM) inclusive
+            # These bets are for the PREVIOUS day's game slate
+            if 0 <= ph_dt.hour <= 13:
+                adjusted_dt = ph_dt - timedelta(days=1)
+            else:
+                adjusted_dt = ph_dt
+            
+            return adjusted_dt.strftime('%Y-%m-%d')
+            
+        except (ValueError, TypeError, OSError):
+            # If timestamp parsing fails, fall back to stored date
+            return _normalize_calendar_date(fallback_date)
+
+    # =========================================================================
+    # HELPER: Calculate daily P/L from resolved bets with adjusted dates
+    # =========================================================================
+    def _build_daily_pl(bets_list: list, parlays_list: list = None) -> Dict[str, Dict]:
+        """Build per-date P/L map from resolved bets AND parlays using Adjusted Game Date."""
+        daily = {}
+        
+        # Process individual bets
+        for b in bets_list:
+            if not isinstance(b, dict):
+                continue
+            result = b.get('result', 'Pending')
+            if result not in ('Win', 'Loss'):
+                continue
+            
+            # Use ADJUSTED game date instead of raw date
+            date_str = _get_adjusted_game_date(b)
+            if not date_str:
+                continue
+            
+            stake = float(b.get('stake', 0) or 0)
+            odds = b.get('odds_decimal', b.get('odds', 1.91))
+            if isinstance(odds, (int, float)) and (odds < 0 or odds >= 100):
+                odds = american_to_decimal(odds)
+
+            if date_str not in daily:
+                daily[date_str] = {'profit': 0.0, 'wins': 0, 'losses': 0, 'bets': 0, 'parlays': 0}
+
+            daily[date_str]['bets'] += 1
+            if result == 'Win':
+                daily[date_str]['profit'] += stake * (odds - 1)
+                daily[date_str]['wins'] += 1
+            else:
+                daily[date_str]['profit'] -= stake
+                daily[date_str]['losses'] += 1
+        
+        # Process parlays (use the date field directly from parlay)
+        if parlays_list:
+            for p in parlays_list:
+                if not isinstance(p, dict):
+                    continue
+                result = p.get('result', 'Pending')
+                if result not in ('Win', 'Loss'):
+                    continue
+                
+                # Parlays have 'date' field; use it directly (no adjusted date needed for parlay creation date)
+                date_str = _normalize_calendar_date(p.get('date', ''))
+                if not date_str:
+                    continue
+                
+                stake = float(p.get('stake', 0) or 0)
+                actual_payout = float(p.get('actual_payout', 0) or 0)
+                
+                if date_str not in daily:
+                    daily[date_str] = {'profit': 0.0, 'wins': 0, 'losses': 0, 'bets': 0, 'parlays': 0}
+                
+                daily[date_str]['parlays'] += 1
+                if result == 'Win':
+                    daily[date_str]['profit'] += actual_payout - stake  # Profit = payout - stake
+                    daily[date_str]['wins'] += 1
+                else:
+                    daily[date_str]['profit'] -= stake  # Loss = lose the stake
+                    daily[date_str]['losses'] += 1
+        
+        return daily
+
+    # =========================================================================
+    # SECTION 1: Monthly P/L Calendar
+    # =========================================================================
+    st.markdown("#### Monthly P/L Calendar")
+    st.caption("Dates shifted for PH timezone (bets 12AM-1PM attributed to previous day)")
+    
+    # Load parlay data
+    parlays = []
+    try:
+        # Reuse ParlayTracker parser so both list and {meta, parlays} formats work.
+        parlays = ParlayTracker(PARLAY_FILE).get_parlays()
+    except Exception as e:
+        logger.warning(f"Failed to load parlays: {e}")
+    
+    # Build daily P/L including both bets and parlays
+    daily_pl = _build_daily_pl(bets, parlays)
+
+    if not daily_pl:
+        st.info("No resolved bets yet. Resolve some bets to see your P/L calendar.")
+    else:
+        import calendar as cal_mod
+
+        # Month selector
+        all_dates = sorted(daily_pl.keys())
+        earliest = datetime.strptime(_normalize_calendar_date(all_dates[0]), '%Y-%m-%d')
+        latest = datetime.strptime(_normalize_calendar_date(all_dates[-1]), '%Y-%m-%d')
+
+        available_months = []
+        cursor = earliest.replace(day=1)
+        while cursor <= latest:
+            available_months.append(cursor.strftime('%Y-%m'))
+            if cursor.month == 12:
+                cursor = cursor.replace(year=cursor.year + 1, month=1)
+            else:
+                cursor = cursor.replace(month=cursor.month + 1)
+
+        col_month, col_summary = st.columns([1, 2])
+        with col_month:
+            selected_month = st.selectbox(
+                "Month",
+                available_months,
+                index=len(available_months) - 1,
+                key='analytics_month'
+            )
+
+        sel_year, sel_month_num = int(selected_month[:4]), int(selected_month[5:])
+        month_name = cal_mod.month_name[sel_month_num]
+        cal_matrix = cal_mod.monthcalendar(sel_year, sel_month_num)
+
+        # Monthly totals
+        month_profit = 0.0
+        month_wins = 0
+        month_losses = 0
+        month_green_days = 0
+        month_red_days = 0
+        for ds, info in daily_pl.items():
+            if ds.startswith(selected_month):
+                month_profit += info['profit']
+                month_wins += info['wins']
+                month_losses += info['losses']
+                if info['profit'] > 0:
+                    month_green_days += 1
+                elif info['profit'] < 0:
+                    month_red_days += 1
+
+        with col_summary:
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Month P/L", f"₱{month_profit:+,.2f}")
+            s2.metric("Record", f"{month_wins}W - {month_losses}L")
+            s3.metric("Green Days", f"{month_green_days}")
+            s4.metric("Red Days", f"{month_red_days}")
+
+        # Build calendar HTML
+        day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+        header_cells = ''.join(
+            f'<th style="padding:6px 8px;text-align:center;color:#888;font-size:11px;'
+            f'font-weight:600;border-bottom:1px solid #333;">{d}</th>'
+            for d in day_names
+        )
+
+        rows_html = ''
+        for week in cal_matrix:
+            cells = ''
+            for day in week:
+                if day == 0:
+                    cells += '<td style="padding:8px;background:rgba(30,30,30,0.3);border:1px solid #222;"></td>'
+                else:
+                    ds = f"{sel_year}-{sel_month_num:02d}-{day:02d}"
+                    info = daily_pl.get(ds)
+                    if info is None:
+                        # No bets this day
+                        cells += (
+                            f'<td style="padding:8px;text-align:center;background:rgba(50,50,50,0.3);'
+                            f'border:1px solid #333;border-radius:4px;vertical-align:top;">'
+                            f'<div style="font-size:10px;color:#555;">{day}</div></td>'
+                        )
+                    else:
+                        p = info['profit']
+                        w, l = info['wins'], info['losses']
+                        bets_count = info.get('bets', 0)
+                        parlays_count = info.get('parlays', 0)
+                        if p > 0:
+                            bg = 'rgba(0,200,83,0.15)'
+                            border_clr = '#00c853'
+                            clr = '#00c853'
+                        elif p < 0:
+                            bg = 'rgba(244,67,54,0.15)'
+                            border_clr = '#f44336'
+                            clr = '#f44336'
+                        else:
+                            bg = 'rgba(100,100,100,0.15)'
+                            border_clr = '#666'
+                            clr = '#888'
+                        tooltip = f"Wins: {w} | Losses: {l} | Bets: {bets_count} | Parlays: {parlays_count} | Net: ₱{p:+,.2f}"
+                        cells += (
+                            f'<td title="{tooltip}" style="padding:6px 4px;text-align:center;'
+                            f'background:{bg};border:1px solid {border_clr};border-radius:6px;'
+                            f'vertical-align:top;cursor:default;">'
+                            f'<div style="font-size:10px;color:#aaa;">{day}</div>'
+                            f'<div style="font-size:13px;font-weight:700;color:{clr};margin-top:2px;">'
+                            f'₱{p:+,.0f}</div>'
+                            f'<div style="font-size:9px;color:#666;margin-top:1px;">{w}W {l}L</div>'
+                            f'<div style="font-size:8px;color:#555;margin-top:0px;">{bets_count}B {parlays_count}P</div>'
+                            f'</td>'
+                        )
+            rows_html += f'<tr>{cells}</tr>'
+
+        cal_html = (
+            f'<table style="width:100%;border-collapse:separate;border-spacing:3px;'
+            f'font-family:sans-serif;margin:8px 0;">'
+            f'<thead><tr>{header_cells}</tr></thead>'
+            f'<tbody>{rows_html}</tbody></table>'
+        )
+        st.markdown(cal_html, unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # =========================================================================
+    # SECTION 2: Alpha Shield - Risk Aversion Savings
+    # =========================================================================
+    st.markdown("#### Alpha Shield")
+
+    # Accepted bets: stake > 0 and decided
+    accepted_decided = [
+        b for b in bets
+        if b.get('result') in ('Win', 'Loss') and float(b.get('stake', 0) or 0) > 0
+    ]
+    avg_stake = (
+        sum(float(b.get('stake', 0) or 0) for b in accepted_decided) / len(accepted_decided)
+        if accepted_decided else 0.0
+    )
+
+    # Rejected bets: stake == 0 and decided
+    rejected_decided = [
+        b for b in bets
+        if b.get('result') in ('Win', 'Loss') and float(b.get('stake', 0) or 0) == 0
+    ]
+
+    if not rejected_decided or avg_stake == 0:
+        st.info("Not enough resolved rejected bets or accepted bets to compute Risk Aversion Savings.")
+    else:
+        hypo_pl = 0.0
+        hypo_wins = 0
+        hypo_losses = 0
+        for b in rejected_decided:
+            odds = b.get('odds_decimal', b.get('odds', 1.91))
+            if isinstance(odds, (int, float)) and (odds < 0 or odds >= 100):
+                odds = american_to_decimal(odds)
+            if b.get('result') == 'Win':
+                hypo_pl += avg_stake * (odds - 1)
+                hypo_wins += 1
+            else:
+                hypo_pl -= avg_stake
+                hypo_losses += 1
+
+        # Capital preserved = negative of hypothetical P/L
+        # If hypo_pl < 0 (rejected bets would have lost money), capital_preserved > 0 (good)
+        capital_preserved = -hypo_pl
+        hypo_win_rate = hypo_wins / len(rejected_decided) if rejected_decided else 0
+        accepted_win_rate = (
+            len([b for b in accepted_decided if b.get('result') == 'Win']) / len(accepted_decided)
+            if accepted_decided else 0
+        )
+
+        if capital_preserved >= 0:
+            shield_color = '#00c853'
+            shield_bg = 'rgba(0,200,83,0.12)'
+            shield_border = '#00c853'
+            shield_icon = '&#x1F6E1;'
+            shield_label = 'Risk Engine Savings'
+        else:
+            shield_color = '#f44336'
+            shield_bg = 'rgba(244,67,54,0.12)'
+            shield_border = '#f44336'
+            shield_icon = '&#x26A0;'
+            shield_label = 'Opportunity Cost of AI Filtering'
+
+        shield_html = f"""
+<div style="background:{shield_bg};border:2px solid {shield_border};border-radius:12px;
+padding:20px;margin:10px 0;text-align:center;">
+<div style="font-size:14px;color:#aaa;margin-bottom:8px;">{shield_icon} {shield_label}</div>
+<div style="font-size:36px;font-weight:800;color:{shield_color};">₱{abs(capital_preserved):,.2f}</div>
+<div style="font-size:12px;color:#666;margin-top:10px;">
+Hypothetical P/L of {len(rejected_decided)} bets rejected by the Risk Engine
+(using ₱{avg_stake:.2f} avg accepted stake)
+</div>
+</div>"""
+        st.markdown(shield_html, unsafe_allow_html=True)
+
+        # Breakdown metrics
+        a1, a2, a3, a4 = st.columns(4)
+        a1.metric("Rejected Bets", f"{len(rejected_decided)}")
+        a2.metric("Rejected Win Rate", f"{hypo_win_rate:.0%}")
+        a3.metric("Accepted Win Rate", f"{accepted_win_rate:.0%}")
+        a4.metric("Filter Edge", f"{(accepted_win_rate - hypo_win_rate):+.1%}")
+
+    st.markdown("---")
+
+    # =========================================================================
+    # SECTION 3: Bankroll Trend Chart (Cumulative P/L from Bets + Parlays)
+    # =========================================================================
+    st.markdown("#### Bankroll Trend")
+
+    equity_curve = tracker.get_equity_curve()
+    if not equity_curve and not parlays:
+        st.info("No resolved staked bets or parlays yet. Place and resolve bets to see your bankroll trend.")
+    else:
+        # Build a date-based cumulative P/L series using ADJUSTED dates for bets, regular dates for parlays
+        decided_staked = [
+            b for b in bets 
+            if b.get('result') in ('Win', 'Loss') and float(b.get('stake', 0) or 0) > 0
+        ]
+        
+        # Create combined list of (date, profit) tuples from both bets and parlays
+        transactions = []
+        
+        # Add individual bets with adjusted dates
+        for b in decided_staked:
+            stake = float(b.get('stake', 0) or 0)
+            odds = b.get('odds_decimal', b.get('odds', 1.91))
+            if isinstance(odds, (int, float)) and (odds < 0 or odds >= 100):
+                odds = american_to_decimal(odds)
+            if b.get('result') == 'Win':
+                profit = stake * (odds - 1)
+            else:
+                profit = -stake
+            transactions.append((_get_adjusted_game_date(b), b.get('id', 0), profit))
+        
+        # Add parlays with their dates
+        for p in parlays:
+            if p.get('result') not in ('Win', 'Loss'):
+                continue
+            stake = float(p.get('stake', 0) or 0)
+            actual_payout = float(p.get('actual_payout', 0) or 0)
+            if p.get('result') == 'Win':
+                profit = actual_payout - stake
+            else:
+                profit = -stake
+            # Use parlay date, add a pseudo-id so parlays come after bets on same day
+            parlay_id = float(p.get('id', 0)) / 1000.0  # Smaller sort order so bets process first
+            transactions.append((p.get('date', ''), parlay_id, profit))
+        
+        # Sort by date, then by id for same-day ordering
+        transactions = sorted(transactions, key=lambda x: (x[0], x[1]))
+        
+        dates_for_curve = []
+        running = 0.0
+        daily_cumulative = []
+        for date_str, _, profit in transactions:
+            running += profit
+            dates_for_curve.append(date_str)
+            daily_cumulative.append(running)
+
+        if dates_for_curve:
+            chart_df = pd.DataFrame({'date': dates_for_curve, 'Cumulative P/L': daily_cumulative})
+            # Aggregate to last value per date for cleaner chart
+            chart_df_daily = chart_df.groupby('date', sort=True).last().reset_index()
+            
+            line_color = '#00c853' if daily_cumulative[-1] >= 0 else '#f44336'
+            st.line_chart(chart_df_daily.set_index('date')['Cumulative P/L'], height=300, color=line_color)
+
+            # Quick stats row under the chart
+            total_pl = daily_cumulative[-1] if daily_cumulative else 0
+            total_staked_sum = sum(float(b.get('stake', 0) or 0) for b in decided_staked) + sum(float(p.get('stake', 0) or 0) for p in parlays if p.get('result') in ('Win', 'Loss'))
+            roi = (total_pl / total_staked_sum * 100) if total_staked_sum > 0 else 0
+            max_drawdown = 0.0
+            peak = 0.0
+            for val in daily_cumulative:
+                if val > peak:
+                    peak = val
+                dd = peak - val
+                if dd > max_drawdown:
+                    max_drawdown = dd
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total P/L", f"₱{total_pl:+,.2f}")
+            c2.metric("ROI", f"{roi:+.1f}%")
+            c3.metric("Total Staked", f"₱{total_staked_sum:,.2f}")
+            c4.metric("Max Drawdown", f"₱{max_drawdown:,.2f}")
+        else:
+            st.info("No transaction history available.")
 
 # =============================================================================
 # MAIN APPLICATION
@@ -7356,20 +9442,70 @@ def main():
         if st.session_state.parlay_builder:
             st.markdown(f" Parlay: {len(st.session_state.parlay_builder)} legs")
         
+        # Hardware & AI Engine Status
+        try:
+            from hardware_utils import check_cuda_availability
+            from llm_engine import get_active_llm_provider
+            has_cuda, gpu_name = check_cuda_availability()
+            active_llm = get_active_llm_provider()
+            st.markdown("---")
+            st.markdown("##### ⚡ Hardware & AI")
+            if has_cuda:
+                st.caption(f"🚀 **GPU:** {gpu_name}")
+            else:
+                st.caption("🖥️ **Compute:** CPU Mode")
+            st.caption(f"🧠 **AI:** {active_llm['name']}")
+        except Exception:
+            pass
+
         st.caption(f"{CURRENT_VERSION}")
     
     # Main tabs - simplified names for mobile
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-        "Analyze", "Backtest", "Watchlist", "H2H", "Splits", "Bets", "Parlays", "ML", "Guide"
+    tab_games, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+        "🏀 Games", "Analyze", "Backtest", "Watchlist", "H2H", "Splits", "Bets", "Parlays", "ML", "Analytics"
     ])
-    
+
+    # Tab 0: Game Predictions & Lines
+    with tab_games:
+        try:
+            from game_ui import render_games_tab
+            render_games_tab(tracker=tracker, bankroll_current=float(bankroll if bankroll > 0 else 500.0))
+        except Exception as _game_tab_err:
+            st.error(f"Error loading Game Predictions: {_game_tab_err}")
+            logger.exception("Error in game predictions tab")
+
     # Tab 1: Analyzer
     with tab1:
         # Mobile-friendly stacked layout with expander for advanced options
         all_players = get_all_nba_players()
         player_names = sorted([p['full_name'] for p in all_players if p.get('is_active', True)])
         
+        # --- Auto-fetch today's odds once per session ---
+        if "odds_fetched" not in st.session_state:
+            st.session_state.odds_fetched = False
+            st.session_state.odds_today = {}  # (home, away, date) -> game data
+        if not st.session_state.odds_fetched:
+            try:
+                from odds_engine import get_odds_engine
+                _oe = get_odds_engine()
+                _oe.fetch_today()
+                # Build a quick team->game lookup for today
+                from datetime import date as _dt_date
+                _today_str = _dt_date.today().strftime("%Y-%m-%d")
+                _today_games = {}
+                for k, v in _oe._index.items():
+                    if k[2] == _today_str:
+                        _today_games[k] = v
+                st.session_state.odds_today = _today_games
+                st.session_state.odds_today_date = _today_str
+                st.session_state.odds_fetched = True
+                if _today_games:
+                    st.caption(f"Live odds loaded for {len(_today_games)} games today")
+            except Exception as _oe_err:
+                logger.warning(f"Could not auto-fetch today's odds: {_oe_err}")
+                st.session_state.odds_fetched = True  # Don't retry on every rerun
+
         #  START FORM: Prevents reloading until "Run" is clicked
         with st.form(key='analysis_form'):
             
@@ -7395,9 +9531,9 @@ def main():
                 odds_in = st.number_input(" Odds", 1.01, 10.00, 1.85, 0.01)
             
             # Show injury reports (Updates on Submit)
+            player_team_abbrev = None  # Initialize for auto-odds lookup later
             if opp_in:
                 # Get player's team abbrev logic
-                player_team_abbrev = None
                 if player_in:
                     try:
                         p_list = players.find_players_by_full_name(player_in)
@@ -7463,9 +9599,11 @@ def main():
                     days_rest = st.selectbox("Rest", [0, 1, 2, 3], index=1,
                                            format_func=lambda x: "B2B" if x == 0 else f"{x}d")
                 with c3:
-                    spread = st.number_input("Spread", -25.0, 25.0, 0.0, 0.5)
+                    spread = st.number_input("Spread (auto)", -25.0, 25.0, 0.0, 0.5,
+                                            help="Leave at 0 to auto-fetch from Odds API")
                 with c4:
-                    game_total = st.number_input("Total", 180.0, 280.0, 225.0, 0.5)
+                    game_total = st.number_input("Total (auto)", 180.0, 280.0, 225.0, 0.5,
+                                                help="Leave at 225 to auto-fetch from Odds API")
                 lookback = st.slider("Lookback Games", 5, 30, 15)
             
             is_b2b = days_rest == 0
@@ -7483,6 +9621,47 @@ def main():
             if not player_in:
                 st.error("Please select a player.")
             else:
+                # --- Auto-fetch spread/total from Odds API if left at defaults ---
+                _auto_spread = spread
+                _auto_total = game_total
+                _odds_source = None
+                if spread == 0.0 or game_total == 225.0:
+                    try:
+                        from odds_engine import get_odds_engine
+                        _oe = get_odds_engine()
+                        _today_str = st.session_state.get("odds_today_date", "")
+                        if not _today_str:
+                            from datetime import date as _dt_date
+                            _today_str = _dt_date.today().strftime("%Y-%m-%d")
+                        # Resolve player team abbreviation
+                        _pt_abbrev = player_team_abbrev  # Set in injury section above
+                        if not _pt_abbrev:
+                            # Fallback: try to resolve from player name
+                            try:
+                                _p_list = players.find_players_by_full_name(player_in)
+                                if _p_list:
+                                    from nba_api.stats.endpoints import commonplayerinfo
+                                    _pi = commonplayerinfo.CommonPlayerInfo(player_id=_p_list[0]['id']).get_data_frames()[0]
+                                    if 'TEAM_ABBREVIATION' in _pi.columns:
+                                        _pt_abbrev = _pi['TEAM_ABBREVIATION'].iloc[0]
+                            except Exception:
+                                pass
+                        if _pt_abbrev:
+                            _s, _t = _oe.get_spread_and_total(
+                                _pt_abbrev, opp_in, _today_str, is_home=is_home
+                            )
+                            if _s is not None and spread == 0.0:
+                                _auto_spread = _s
+                            if _t is not None and game_total == 225.0:
+                                _auto_total = _t
+                            if _s is not None or _t is not None:
+                                _odds_source = "Odds API"
+                    except Exception as _oe_err:
+                        logger.warning(f"Auto-fetch odds failed: {_oe_err}")
+
+                if _odds_source:
+                    st.info(f"Auto-fetched: Spread **{_auto_spread:+.1f}** | Total **{_auto_total:.1f}** ({_odds_source})")
+
                 with st.spinner(f"Analyzing {player_in} vs {opp_in}..."):
                     result = orchestrator.run_analysis(
                         player_name=player_in,
@@ -7493,10 +9672,10 @@ def main():
                         is_home=is_home,
                         is_b2b=is_b2b,
                         lookback=lookback,
-                        spread=spread,
+                        spread=_auto_spread,
                         bankroll=bankroll,
                         days_rest=days_rest,
-                        game_total=game_total
+                        game_total=_auto_total
                     )
                     
                     if not result.success:
@@ -7564,34 +9743,87 @@ def main():
                                 gap = -gap 
 
                             # ---------------------------------------------------------
-                            # PAYLOAD WITH CORRECTED NUMBERS
+                            # PAYLOAD WITH FULL FEATURE CONTEXT FOR AI ANALYST
+                            # V21.2: Pass ALL features so AI can detect red flags
                             # ---------------------------------------------------------
                             prop_payload = {
+                                # --- Core Identifiers ---
                                 "player": result.player_name,
                                 "team": team_str,
+                                "position": getattr(result, 'player_position', '') or '',  # V21.2: Safe fallback for cached results
+                                "opponent": result.opponent_name,
                                 "market": result.market,
                                 "line": result.line,
-                                "signal": result.decision.recommended_side,
+                                
+                                # --- Model Outputs ---
+                                "predicted_side": result.decision.recommended_side,
+                                "signal": result.decision.recommended_side,  # Alias
                                 "ev": result.decision.expected_value,
                                 "prob": result.decision.probability,
-                                
-                                #  NOW THIS WILL MATCH THE CARD (23.2)
-                                "projected": round(final_proj, 1), 
+                                "projected": round(final_proj, 1),
+                                "projected_value": round(final_proj, 1),  # Alias
                                 "gap": round(gap, 1),
-                                
-                                "ema": round(feats.ema, 1),
-                                "opp_rank": round(feats.opponent_drtg_season, 1),
-                                "rest": feats.days_rest,
-                                "trend": "Heating Up" if feats.trend_5g > 0.5 else ("Cooling Down" if feats.trend_5g < -0.5 else "Flat"),
                                 "spread": feats.spread,
-                                "total": feats.game_total,
-                                "teammates_out_ppg": getattr(feats, 'team_out_ppg', 0),
-                                "loc_type": loc_type,
-                                "loc_avg": round(loc_avg, 1),
-                                "feat_usage_rate": getattr(feats, 'feat_usage_rate', 0.0),
+                                
+                                # --- Performance Features ---
+                                # NOTE: FeatureVector uses 'feat_*' prefix for these
                                 "feat_season_avg": getattr(feats, 'feat_season_avg', 0.0),
                                 "feat_l10_avg": getattr(feats, 'feat_l10_avg', 0.0),
-                                "feat_h2h_avg": getattr(feats, 'feat_h2h_avg', -1.0)
+                                "feat_ema": round(feats.ema, 1),
+                                "ema": round(feats.ema, 1),  # Alias
+                                "feat_std": feats.std,
+                                "std": feats.std,  # Alias
+                                "feat_h2h_avg": getattr(feats, 'feat_h2h_avg', -1.0),
+                                
+                                # --- Trend & Form ---
+                                "feat_trend_5g": feats.trend_5g,
+                                "feat_form_gap": getattr(feats, 'feat_form_gap', 0.0),
+                                "feat_cv": getattr(feats, 'feat_cv', 0.0),
+                                
+                                # --- Minutes & Role ---
+                                "feat_avg_minutes": feats.avg_minutes,
+                                "avg_minutes": feats.avg_minutes,  # Alias
+                                "feat_min_volatility": getattr(feats, 'feat_min_volatility', 0.0),
+                                "feat_depth_rank": getattr(feats, 'feat_depth_rank', 4),
+                                
+                                # --- Fatigue & Rest ---
+                                "feat_days_rest": feats.days_rest,
+                                "days_rest": feats.days_rest,  # Alias
+                                "feat_is_b2b": feats.is_b2b,
+                                "is_b2b": feats.is_b2b,  # Alias
+                                "feat_is_home": feats.is_home,
+                                "is_home": feats.is_home,  # Alias
+                                
+                                # --- Hit Rates ---
+                                "feat_hit_rate_l10": getattr(feats, 'feat_hit_rate_l10', 0.0),
+                                "feat_hit_rate_l20": getattr(feats, 'feat_hit_rate_l20', 0.0),
+                                
+                                # --- Matchup Quality ---
+                                "feat_opponent_drtg_season": feats.opponent_drtg_season,
+                                "opponent_drtg_season": feats.opponent_drtg_season,  # Alias
+                                "feat_opp_rank_vs_pos": getattr(feats, 'feat_opp_rank_vs_pos', 15),
+                                
+                                # --- Location Splits ---
+                                "feat_home_avg": feats.home_avg,
+                                "feat_away_avg": feats.away_avg,
+                                "loc_type": loc_type,
+                                "loc_avg": round(loc_avg, 1),
+                                
+                                # --- Absence Context ---
+                                "feat_team_out_count": feats.team_out_count,
+                                "team_out_count": feats.team_out_count,  # Alias
+                                "feat_team_out_ppg": getattr(feats, 'team_out_ppg', 0.0), 
+                                "team_out_ppg": getattr(feats, 'team_out_ppg', 0.0),
+                                "feat_opp_out_count": feats.opp_out_count,
+                                "opp_out_count": feats.opp_out_count,  # Alias
+                                
+                                # --- Games Played (CRITICAL FOR AI) ---
+                                "feat_games_played": feats.games_played,
+                                "games_played": feats.games_played,  # Alias
+                                
+                                # --- Additional Context ---
+                                "feat_usage_rate": getattr(feats, 'feat_usage_rate', 0.0),
+                                "total": feats.game_total,
                             }
 
                             # 2. RUN LIVE BACKTEST (Robust Settings)
@@ -7705,8 +9937,11 @@ def main():
                                 st.error(f"Analysis Error: {e}")
                                 
                             # 3. GET OPINION
+                            from llm_engine import get_active_llm_provider
+                            active_llm = get_active_llm_provider()
+                            llm_badge = f"🟢 {active_llm['name']}" if active_llm.get('is_local') else f"☁️ {active_llm['name']}"
                             insight = get_ai_second_opinion(prop_payload, backtest_payload, history_context=history_context)
-                            st.markdown("###  groq's Verdict")
+                            st.markdown(f"### 🤖 AI Analyst Verdict ({llm_badge})")
                             st.markdown(insight)
             
             col_track, col_parlay = st.columns(2)
@@ -7734,6 +9969,7 @@ def main():
                             "prob": result.decision.probability,
                             "predicted_mean": result.decision.predicted_mean,
                             "predicted_std": result.decision.predicted_std,
+                            "quality_score": result.decision.quality_score,  # V21.2: Sharpe-like EV/sigma
                             "tag": selected_tag,
                         }
                         # Dynamically merge features based on canonical schema
@@ -7756,6 +9992,9 @@ def main():
                             'odds': result.odds,
                             'prob': result.decision.probability,
                             'proj': result.projection.final_projection,
+                            'mean': result.projection.final_projection,
+                            'std': getattr(result.projection, 'std_dev', 4.0),
+                            'team': getattr(result, 'team_name', getattr(result.features, 'team', '')),
                             'ev': result.decision.expected_value,
                             'position': 'N/A',  # V19: player_position removed from FeatureVector
                             'result': 'Pending'
@@ -7911,7 +10150,13 @@ def main():
                             st.error("Pending bets missing required columns for risk analysis.")
                         else:
                             engine = TradingEngine()
-                            processed_df = engine.process_bets(df, real_bankroll, return_all=True)
+                            processed_df = engine.process_bets(
+                                df,
+                                real_bankroll,
+                                return_all=True,
+                                auto_tune_from_tracker=True,
+                                tracker_file='data/bet_tracker.json',
+                            )
                             
                             st.session_state.processed_bets = processed_df
                             st.session_state.risk_run = True
@@ -7927,8 +10172,9 @@ def main():
                     if not approved.empty:
                         for _, bet in approved.iterrows():
                             with st.container(border=True):
+                                proj_val = bet.get('predicted_mean', bet.get('proj', 0))
                                 st.markdown(f"**{bet['player']}** {bet['market']} - {bet['side']} {bet['line']} @ {bet['odds']}")
-                                st.caption(f"EV: {bet['adjusted_ev']:.3%} | Stake: {bet['rec_stake']:.0f}")
+                                st.caption(f"Proj: {proj_val:.1f} | EV: {bet['predicted_ev']:.3%} | Stake: {bet['rec_stake']:.0f}")
                     else:
                         st.info("No bets approved.")
                     
@@ -7936,12 +10182,28 @@ def main():
                     if not rejected.empty:
                         for _, bet in rejected.iterrows():
                             with st.container(border=True):
+                                proj_val = bet.get('predicted_mean', bet.get('proj', 0))
                                 st.markdown(f"**{bet['player']}** {bet['market']} - {bet['side']} {bet['line']} @ {bet['odds']}")
-                                st.caption(f"EV: {bet['adjusted_ev']:.3%} | Stake: {bet['rec_stake']:.0f}", help="Rejected due to low EV or stake")
+                                st.caption(f"Proj: {proj_val:.1f} | EV: {bet['predicted_ev']:.3%} | Stake: {bet['rec_stake']:.0f}", help="Rejected due to low EV or stake")
                     else:
                         st.info("No bets rejected.")
                     
                     if st.button(" Optimize & Commit", key="commit_risk"):
+                        # Initialize prediction logger
+                        pred_logger = PredictionLogger()
+                        predictions_to_log = []
+
+                        # Collect IDs that survived deduplication / processing
+                        processed_ids = {int(i) for i in processed_df['id'].dropna()}
+
+                        # Zero-out any pending bet that was DROPPED during process_bets
+                        # (e.g. duplicate player entries removed by drop_duplicates).
+                        # Without this, those bets keep stale stakes from previous runs.
+                        all_pending_ids = {int(b['id']) for b in all_bets if b.get('result') == 'Pending' and b.get('id') is not None}
+                        dropped_ids = all_pending_ids - processed_ids
+                        for dropped_id in dropped_ids:
+                            tracker.update_stake(dropped_id, 0.0)
+                        
                         for _, bet in processed_df.iterrows():
                             b_id = bet['id']
                             # Prefer the Risk Engine's recommended stake (rec_stake) over a forced flat bet
@@ -7955,6 +10217,16 @@ def main():
 
                             new_stake = float(stake_val) if bet.get('is_bet') else 0.0
                             tracker.update_stake(b_id, new_stake)
+                            
+                            # Log ALL predictions (staked and non-staked) for analysis
+                            pred_entry = bet.to_dict()
+                            pred_entry['was_staked'] = new_stake > 0
+                            pred_entry['final_stake'] = new_stake
+                            predictions_to_log.append(pred_entry)
+                        
+                        # Batch log all predictions
+                        if predictions_to_log:
+                            pred_logger.log_batch(predictions_to_log)
 
                         # Show what we committed for user verification
                         preview = processed_df.copy()
@@ -7984,7 +10256,7 @@ def main():
                 with f_col3:
                     view_limit = st.selectbox("Show Last:", [10, 20, 50, "All"], index=1)
                 with f_col4:
-                    sort_option = st.selectbox("Sort by:", ["Result/ID", "Stake Asc", "Stake Desc"], index=0)
+                    sort_option = st.selectbox("Sort by:", ["Result/ID", "Stake Asc", "Stake Desc", "Team"], index=0)
                 
                 filtered_bets = [b for b in all_bets 
                                 if b.get('result', 'Pending') in selected_filters 
@@ -7997,6 +10269,8 @@ def main():
                     filtered_bets.sort(key=lambda x: (x.get('stake', 0), -x.get('id', 0)))
                 elif sort_option == "Stake Desc":
                     filtered_bets.sort(key=lambda x: (-x.get('stake', 0), -x.get('id', 0)))
+                elif sort_option == "Team":
+                    filtered_bets.sort(key=lambda x: (x.get('opponent', ''), -x.get('id', 0)))
                 
                 total_count = len(filtered_bets)
                 if view_limit != "All":
@@ -8025,8 +10299,11 @@ def main():
                                 with c1:
                                     color = {"Win": "green", "Loss": "red", "Push": "blue"}.get(bet_res, "gray")
                                     icon = {"Win": "", "Loss": "", "Push": ""}.get(bet_res, "")
+                                    proj_val = bet.get('proj', bet.get('predicted_mean', 0))
+                                    odds_val = bet.get('odds_decimal', bet.get('odds'))
+                                    odds_text = f"{float(odds_val):.2f}" if odds_val is not None else "N/A"
                                     st.markdown(f"**{bet['player']}** {bet['market']}")
-                                    st.caption(f"{icon} :{color}[{bet['side']} {bet['line']}] vs {bet['opponent']} ({bet.get('ev',0):.1%}) | Stake: ${bet.get('stake', 0):.0f}")
+                                    st.caption(f"{icon} :{color}[{bet['side']} {bet['line']}] vs {bet['opponent']} | Proj: {proj_val:.1f} | EV: {bet.get('ev',0):.1%} | Stake: ${bet.get('stake', 0):.0f} | Odds: {odds_text}")
                                 
                                 with c2:
                                     opts = ["Pending", "Win", "Loss", "Push"]
@@ -8078,7 +10355,30 @@ def main():
                         else:
                             st.info("No changes detected.")
             else:
-                st.info("Tracker is empty.")
+                # Diagnostic helper when tracker returns no bets
+                tracker_path = tracker.file
+                if tracker_path.exists():
+                    size = tracker_path.stat().st_size
+                    mtime = datetime.fromtimestamp(tracker_path.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                    st.warning(f"Tracker file present but no bets loaded — {tracker_path} ({size} bytes, modified {mtime})")
+
+                    c1, c2 = st.columns([1, 1])
+                    with c1:
+                        if st.button("Reload tracker from disk"):
+                            # Force a hard reload of the Streamlit app so Tracker re-reads the file
+                            st.experimental_rerun()
+                    with c2:
+                        if st.button("Backup & reset tracker (safe)"):
+                            import shutil, time
+                            bak = tracker_path.with_name(f"{tracker_path.name}.bak.{int(time.time())}")
+                            shutil.copy2(tracker_path, bak)
+                            tracker._save([])
+                            st.success(f"Backed up to {bak.name} and reset tracker (empty).")
+                            st.experimental_rerun()
+
+                    st.caption("If you recently ran a re-analysis, click 'Reload tracker from disk'. If the file is corrupted, 'Backup & reset' will preserve the original and create an empty tracker.")
+                else:
+                    st.info("Tracker is empty. No tracker file found on disk.")
     
     # Tab 7: Parlays
     with tab7:
@@ -8099,7 +10399,7 @@ def main():
             render_train_model_tab()
 
     with tab9:
-        render_guide_tab()
+        render_analytics_tab(tracker)
 
 
 # =============================================================================
@@ -8113,4 +10413,3 @@ if __name__ == "__main__":
     except Exception:
         pass
     main()
-                

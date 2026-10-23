@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NBA BetLab — Data-Driven Betting Intelligence</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;600;700&family=Barlow:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    :root {
+      --bg:        #080d1a;
+      --surface:   #0f172a;
+      --surface-2: #1e293b;
+      --border:    rgba(255,255,255,0.07);
+      --text:      #f1f5f9;
+      --text-sub:  #64748b;
+      --accent:    #f58220;
+      --accent-lo: rgba(245,130,32,0.15);
+      --green:     #10b981;
+      --red:       #ef4444;
+      --phone-w:   300px;
+      --phone-h:   628px;
+    }
+
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Barlow', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      overflow-x: hidden;
+      line-height: 1.6;
+    }
+
+    /* Subtle noise texture */
+    body::after {
+      content: '';
+      position: fixed; inset: 0; z-index: 0;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+      pointer-events: none;
+      opacity: 0.6;
+    }
+
+    /* Ambient blobs */
+    .blobs { position: fixed; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; }
+    .blob {
+      position: absolute; border-radius: 50%;
+      filter: blur(100px); opacity: 0.18;
+      animation: drift 25s ease-in-out infinite alternate;
+    }
+    .blob-1 { width: 600px; height: 600px; background: #7c3aed; top: -200px; left: -150px; }
+    .blob-2 { width: 500px; height: 500px; background: var(--accent); bottom: -150px; right: -100px; animation-delay: -8s; }
+    @keyframes drift { to { transform: translate(40px, 60px); } }
+
+    /* ── NAV ── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      padding: 18px 6%;
+      display: flex; justify-content: space-between; align-items: center;
+      background: rgba(8,13,26,0.75);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+    }
+    .nav-brand {
+      font-family: 'Oswald', sans-serif;
+      font-size: 1.3rem; font-weight: 700;
+      color: var(--accent);
+      letter-spacing: 3px; text-transform: uppercase;
+    }
+    .nav-links { display: flex; gap: 28px; }
+    .nav-links a {
+      color: var(--text-sub); text-decoration: none;
+      font-size: 0.8rem; font-weight: 700;
+      letter-spacing: 1px; text-transform: uppercase;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--text); }
+
+    /* ── PAGE WRAP ── */
+    .wrap {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 0 6%;
+      position: relative; z-index: 1;
+    }
+
+    /* ── HERO ── */
+    #hero {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      align-items: center;
+      gap: 60px;
+      padding-top: 80px;
+    }
+
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: var(--accent-lo);
+      border: 1px solid rgba(245,130,32,0.3);
+      padding: 6px 14px; border-radius: 100px;
+      font-size: 0.7rem; font-weight: 700;
+      letter-spacing: 1.5px; text-transform: uppercase;
+      color: var(--accent); margin-bottom: 22px;
+    }
+    .eyebrow-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--accent);
+      animation: blink 2s infinite;
+    }
+    @keyframes blink {
+      0%,100% { opacity: 1; } 50% { opacity: 0.3; }
+    }
+
+    h1 {
+      font-family: 'Oswald', sans-serif;
+      font-size: clamp(2.8rem, 4.2vw, 4rem);
+      font-weight: 700; line-height: 1.05;
+      text-transform: uppercase; letter-spacing: 1px;
+      color: var(--text); margin-bottom: 20px;
+    }
+    h1 em { font-style: normal; color: var(--accent); }
+
+    .hero-desc {
+      font-size: 1.05rem; color: var(--text-sub);
+      line-height: 1.75; max-width: 460px;
+      margin-bottom: 32px;
+    }
+
+    .btn-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 40px; }
+    .btn {
+      display: inline-flex; align-items: center; gap: 10px;
+      padding: 13px 26px; border-radius: 10px;
+      font-family: 'Barlow', sans-serif;
+      font-weight: 700; font-size: 0.9rem;
+      text-decoration: none; border: none;
+      cursor: pointer; transition: all 0.2s;
+    }
+    .btn-primary {
+      background: var(--accent); color: #08070a;
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 8px 28px rgba(245,130,32,0.3); }
+    .btn-ghost {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-sub);
+    }
+    .btn-ghost:hover { border-color: rgba(255,255,255,0.18); color: var(--text); }
+
+    .trust-row {
+      display: flex; gap: 20px; flex-wrap: wrap;
+      padding-top: 28px; border-top: 1px solid var(--border);
+    }
+    .trust-item {
+      display: flex; align-items: center; gap: 7px;
+      font-size: 0.82rem; color: var(--text-sub);
+    }
+    .trust-item i { color: var(--green); font-size: 0.75rem; }
+
+    /* ── PHONE MOCKUP ── */
+    .phone-col {
+      display: flex; justify-content: center; align-items: center;
+    }
+    .phone-scene { position: relative; }
+
+    /* Glow behind phone */
+    .phone-scene::before {
+      content: '';
+      position: absolute;
+      width: 340px; height: 340px; border-radius: 50%;
+      background: radial-gradient(circle, rgba(245,130,32,0.12) 0%, transparent 70%);
+      top: 50%; left: 50%; transform: translate(-50%,-50%);
+      pointer-events: none;
+    }
+
+    .phone-shell {
+      width: var(--phone-w);
+      height: var(--phone-h);
+      background: linear-gradient(160deg, #1c2540 0%, #0d111e 100%);
+      border-radius: 46px;
+      padding: 10px;
+      position: relative;
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,0.09),
+        0 0 0 3px #060810,
+        0 50px 120px rgba(0,0,0,0.65),
+        inset 0 1px 0 rgba(255,255,255,0.08);
+    }
+
+    /* Power button */
+    .phone-shell::before {
+      content: '';
+      position: absolute; right: -3px; top: 130px;
+      width: 3px; height: 55px;
+      background: #1a2238; border-radius: 0 3px 3px 0;
+    }
+    /* Vol buttons */
+    .phone-shell::after {
+      content: '';
+      position: absolute; left: -3px; top: 110px;
+      width: 3px; height: 36px;
+      background: #1a2238; border-radius: 3px 0 0 3px;
+      box-shadow: 0 50px 0 #1a2238;
+    }
+
+    .phone-screen {
+      width: 100%; height: 100%;
+      border-radius: 38px;
+      overflow: hidden;
+      background: #111827;
+    }
+
+    /* Punch-hole camera */
+    .phone-screen::before {
+      content: '';
+      position: absolute;
+      top: 18px; left: 50%; transform: translateX(-50%);
+      width: 9px; height: 9px;
+      background: #060810; border-radius: 50%;
+      z-index: 20;
+    }
+
+    /* ── APP UI ── */
+    .app {
+      width: 100%; height: 100%;
+      display: flex; flex-direction: column;
+      font-family: 'Barlow', sans-serif;
+      background: #111827;
+      font-size: 14px;
+    }
+
+    .app-header {
+      padding: 34px 14px 0;
+      background: #111827;
+      flex-shrink: 0;
+    }
+    .app-header-row {
+      display: flex; justify-content: space-between; align-items: center;
+      margin-bottom: 10px;
+    }
+    .app-name {
+      font-family: 'Oswald', sans-serif;
+      font-size: 1.1rem; font-weight: 700;
+      color: #fff; letter-spacing: 2px; text-transform: uppercase;
+    }
+    .app-datestamp {
+      font-size: 0.58rem; color: #4b5563; font-weight: 700;
+      letter-spacing: 0.5px; text-transform: uppercase;
+    }
+
+    .app-tabs {
+      display: flex; border-bottom: 1px solid #1f2937;
+    }
+    .app-tab {
+      flex: 1; text-align: center;
+      padding: 7px 4px 8px;
+      font-size: 0.6rem; font-weight: 700;
+      letter-spacing: 0.8px; text-transform: uppercase;
+      color: #374151; cursor: pointer;
+    }
+    .app-tab.on {
+      color: var(--accent);
+      border-bottom: 2px solid var(--accent);
+      margin-bottom: -1px;
+    }
+
+    .app-body {
+      flex: 1; padding: 10px 10px 8px;
+      display: flex; flex-direction: column; gap: 7px;
+      overflow: hidden;
+    }
+
+    /* Summary strip */
+    .summary-card {
+      background: linear-gradient(135deg, #1d2840, #131c2e);
+      border: 1px solid #2d3a55;
+      border-radius: 12px;
+      padding: 10px 12px;
+      display: flex; justify-content: space-between; align-items: center;
+      flex-shrink: 0;
+    }
+    .s-pl {
+      font-size: 1.35rem; font-weight: 800;
+      color: var(--green); line-height: 1;
+    }
+    .s-sub {
+      font-size: 0.55rem; color: #4b5563;
+      margin-top: 3px; font-weight: 600;
+    }
+    .s-badge {
+      background: rgba(16,185,129,0.12);
+      border: 1px solid rgba(16,185,129,0.2);
+      padding: 4px 9px; border-radius: 20px;
+      font-size: 0.58rem; font-weight: 700;
+      color: #34d399;
+    }
+
+    /* Picks list */
+    .picks-label {
+      font-size: 0.58rem; font-weight: 700;
+      letter-spacing: 1px; text-transform: uppercase;
+      color: #374151; flex-shrink: 0;
+    }
+
+    .pick {
+      background: #1a2438;
+      border: 1px solid #243050;
+      border-radius: 10px;
+      padding: 8px 10px;
+      display: flex; align-items: center; gap: 8px;
+      flex-shrink: 0;
+    }
+    .pick-av {
+      width: 28px; height: 28px;
+      border-radius: 8px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.62rem; font-weight: 800; flex-shrink: 0;
+    }
+    .pick-info { flex: 1; min-width: 0; }
+    .pick-name {
+      font-size: 0.68rem; font-weight: 700; color: #e5e7eb;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .pick-meta {
+      font-size: 0.55rem; color: #4b5563; margin-top: 1px;
+    }
+    .pick-right { text-align: right; flex-shrink: 0; }
+    .pick-badge {
+      display: inline-block; padding: 2px 7px;
+      border-radius: 6px; font-size: 0.58rem;
+      font-weight: 800; letter-spacing: 0.5px;
+      text-transform: uppercase; margin-bottom: 2px;
+    }
+    .b-over  { background: rgba(16,185,129,0.15); color: #34d399; }
+    .b-under { background: rgba(239,68,68,0.15);  color: #f87171; }
+    .pick-conf { font-size: 0.52rem; color: #4b5563; }
+
+    /* ── SECTIONS ── */
+    .section { padding: 96px 0; position: relative; z-index: 1; }
+
+    .section-eyebrow {
+      font-size: 0.72rem; font-weight: 700;
+      letter-spacing: 2px; text-transform: uppercase;
+      color: var(--accent); margin-bottom: 10px;
+    }
+
+    h2 {
+      font-family: 'Oswald', sans-serif;
+      font-size: clamp(1.9rem, 3vw, 2.7rem);
+      font-weight: 700; text-transform: uppercase;
+      letter-spacing: 1px; color: var(--text);
+      margin-bottom: 14px;
+    }
+
+    .section-sub {
+      font-size: 1rem; color: var(--text-sub);
+      line-height: 1.7; max-width: 520px;
+      margin-bottom: 44px;
+    }
+
+    /* Feature cards */
+    .feat-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 18px;
+    }
+    .feat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px; padding: 26px;
+      transition: border-color 0.2s, transform 0.2s;
+    }
+    .feat-card:hover {
+      border-color: rgba(245,130,32,0.25);
+      transform: translateY(-3px);
+    }
+    .feat-icon {
+      width: 42px; height: 42px;
+      background: var(--accent-lo);
+      border: 1px solid rgba(245,130,32,0.2);
+      border-radius: 11px;
+      display: flex; align-items: center; justify-content: center;
+      color: var(--accent); font-size: 1rem;
+      margin-bottom: 14px;
+    }
+    .feat-card h3 {
+      font-family: 'Barlow', sans-serif;
+      font-size: 0.95rem; font-weight: 700;
+      color: var(--text); margin-bottom: 8px;
+      text-transform: none; letter-spacing: 0;
+    }
+    .feat-card p { font-size: 0.88rem; color: var(--text-sub); line-height: 1.6; margin: 0; }
+
+    /* Steps */
+    .steps { display: flex; flex-direction: column; gap: 0; max-width: 560px; }
+    .step {
+      display: flex; gap: 22px; position: relative; padding-bottom: 36px;
+    }
+    .step:last-child { padding-bottom: 0; }
+    .step-line {
+      position: absolute; left: 19px; top: 44px;
+      width: 2px; bottom: 0;
+      background: var(--border);
+    }
+    .step:last-child .step-line { display: none; }
+    .step-num {
+      width: 40px; height: 40px; border-radius: 50%;
+      border: 2px solid var(--accent);
+      display: flex; align-items: center; justify-content: center;
+      font-family: 'Oswald', sans-serif; font-weight: 700;
+      font-size: 1rem; color: var(--accent);
+      flex-shrink: 0; background: var(--bg); z-index: 1;
+    }
+    .step-body { padding-top: 7px; }
+    .step-body h3 {
+      font-family: 'Barlow', sans-serif; font-weight: 700;
+      font-size: 1.05rem; color: var(--text);
+      margin-bottom: 6px;
+      text-transform: none; letter-spacing: 0;
+    }
+    .step-body p { font-size: 0.9rem; color: var(--text-sub); line-height: 1.65; margin: 0; }
+
+    /* ── FOOTER ── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 48px 6% 32px;
+      position: relative; z-index: 1;
+    }
+    .footer-top {
+      max-width: 1280px; margin: 0 auto;
+      display: flex; justify-content: space-between;
+      align-items: flex-start; gap: 40px; flex-wrap: wrap;
+      padding-bottom: 40px; border-bottom: 1px solid var(--border);
+      margin-bottom: 24px;
+    }
+    .footer-brand {
+      font-family: 'Oswald', sans-serif;
+      font-size: 1.1rem; font-weight: 700;
+      color: var(--accent); letter-spacing: 3px;
+      text-transform: uppercase; margin-bottom: 8px;
+    }
+    .footer-tag { font-size: 0.85rem; color: var(--text-sub); max-width: 200px; line-height: 1.5; }
+    .footer-col h4 {
+      font-size: 0.7rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 1.5px;
+      color: var(--text-sub); margin-bottom: 14px;
+    }
+    .footer-col ul { list-style: none; display: flex; flex-direction: column; gap: 10px; }
+    .footer-col a { font-size: 0.88rem; color: var(--text-sub); text-decoration: none; transition: color 0.2s; }
+    .footer-col a:hover { color: var(--text); }
+    .footer-bottom {
+      max-width: 1280px; margin: 0 auto;
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 0.78rem; color: var(--text-sub); flex-wrap: wrap; gap: 12px;
+    }
+    .socials { display: flex; gap: 16px; }
+    .socials a { color: var(--text-sub); font-size: 1.1rem; text-decoration: none; transition: color 0.2s; }
+    .socials a:hover { color: var(--accent); }
+
+    /* ── RESPONSIVE ── */
+    @media (max-width: 900px) {
+      #hero { grid-template-columns: 1fr; padding-top: 100px; gap: 48px; }
+      .phone-col { order: -1; }
+      .hero-desc { max-width: 100%; }
+    }
+    @media (max-width: 580px) {
+      .nav-links { display: none; }
+      :root { --phone-w: 260px; --phone-h: 546px; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="blobs">
+  <div class="blob blob-1"></div>
+  <div class="blob blob-2"></div>
+</div>
+
+<nav>
+  <span class="nav-brand">NBA BetLab</span>
+  <div class="nav-links">
+    <a href="#features">Features</a>
+    <a href="#how-it-works">How It Works</a>
+    <a href="https://github.com/danmikel1" target="_blank">GitHub</a>
+  </div>
+</nav>
+
+<div class="wrap">
+
+  <!-- ── HERO ── -->
+  <section id="hero">
+    <div>
+      <div class="eyebrow">
+        <span class="eyebrow-dot"></span>
+        Machine Learning · NBA Analytics
+      </div>
+      <h1>Stop Guessing.<br><em>Start Winning.</em></h1>
+      <p class="hero-desc">
+        XGBoost-powered prop predictions, real-time Vegas odds, and Kelly criterion sizing —
+        all wired together in an open-source Python pipeline.
+      </p>
+      <div class="btn-row">
+        <a href="#features" class="btn btn-primary"><i class="fas fa-chart-line"></i> See Features</a>
+        <a href="https://github.com/danmikel1" target="_blank" class="btn btn-ghost"><i class="fab fa-github"></i> View Source</a>
+      </div>
+      <div class="trust-row">
+        <span class="trust-item"><i class="fas fa-check-circle"></i> XGBoost &amp; Scikit-learn</span>
+        <span class="trust-item"><i class="fas fa-check-circle"></i> Real-Time Odds API</span>
+        <span class="trust-item"><i class="fas fa-check-circle"></i> Feature Engineering</span>
+      </div>
+    </div>
+
+    <!-- PHONE -->
+    <div class="phone-col">
+      <div class="phone-scene">
+        <div class="phone-shell">
+          <div class="phone-screen">
+            <div class="app">
+
+              <div class="app-header">
+                <div class="app-header-row">
+                  <span class="app-name">BetLab</span>
+                  <span class="app-datestamp">May 21, 2026</span>
+                </div>
+                <div class="app-tabs">
+                  <div class="app-tab">Analyze</div>
+                  <div class="app-tab on">Picks</div>
+                  <div class="app-tab">Tracker</div>
+                </div>
+              </div>
+
+              <div class="app-body">
+
+                <div class="summary-card">
+                  <div>
+                    <div class="s-pl">₱+713</div>
+                    <div class="s-sub">Month P/L &nbsp;·&nbsp; 370W – 283L</div>
+                  </div>
+                  <div class="s-badge">▲ 56.7% Win Rate</div>
+                </div>
+
+                <div class="picks-label">Today's Picks &nbsp;·&nbsp; 5 props</div>
+
+                <div class="pick">
+                  <div class="pick-av" style="background:rgba(251,146,60,.15);color:#fb923c;">LJ</div>
+                  <div class="pick-info">
+                    <div class="pick-name">LeBron James</div>
+                    <div class="pick-meta">PTS &nbsp;·&nbsp; Line 22.5 &nbsp;·&nbsp; Model 27.1</div>
+                  </div>
+                  <div class="pick-right">
+                    <span class="pick-badge b-over">OVER</span>
+                    <div class="pick-conf">78% conf</div>
+                  </div>
+                </div>
+
+                <div class="pick">
+                  <div class="pick-av" style="background:rgba(96,165,250,.15);color:#60a5fa;">SC</div>
+                  <div class="pick-info">
+                    <div class="pick-name">Stephen Curry</div>
+                    <div class="pick-meta">3PM &nbsp;·&nbsp; Line 4.5 &nbsp;·&nbsp; Model 3.2</div>
+                  </div>
+                  <div class="pick-right">
+                    <span class="pick-badge b-under">UNDER</span>
+                    <div class="pick-conf">71% conf</div>
+                  </div>
+                </div>
+
+                <div class="pick">
+                  <div class="pick-av" style="background:rgba(52,211,153,.15);color:#34d399;">LD</div>
+                  <div class="pick-info">
+                    <div class="pick-name">Luka Dončić</div>
+                    <div class="pick-meta">AST &nbsp;·&nbsp; Line 8.5 &nbsp;·&nbsp; Model 10.8</div>
+                  </div>
+                  <div class="pick-right">
+                    <span class="pick-badge b-over">OVER</span>
+                    <div class="pick-conf">83% conf</div>
+                  </div>
+                </div>
+
+                <div class="pick">
+                  <div class="pick-av" style="background:rgba(167,139,250,.15);color:#a78bfa;">KD</div>
+                  <div class="pick-info">
+                    <div class="pick-name">Kevin Durant</div>
+                    <div class="pick-meta">REB &nbsp;·&nbsp; Line 6.5 &nbsp;·&nbsp; Model 5.1</div>
+                  </div>
+                  <div class="pick-right">
+                    <span class="pick-badge b-under">UNDER</span>
+                    <div class="pick-conf">66% conf</div>
+                  </div>
+                </div>
+
+                <div class="pick">
+                  <div class="pick-av" style="background:rgba(245,130,32,.15);color:#f58220;">JE</div>
+                  <div class="pick-info">
+                    <div class="pick-name">Joel Embiid</div>
+                    <div class="pick-meta">PTS &nbsp;·&nbsp; Line 29.5 &nbsp;·&nbsp; Model 33.2</div>
+                  </div>
+                  <div class="pick-right">
+                    <span class="pick-badge b-over">OVER</span>
+                    <div class="pick-conf">81% conf</div>
+                  </div>
+                </div>
+
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── FEATURES ── -->
+  <section id="features" class="section">
+    <div class="section-eyebrow">What It Does</div>
+    <h2>A Complete Edge System</h2>
+    <p class="section-sub">
+      NBA BetLab isn't a simple tip sheet. It's a full data pipeline built to identify
+      and act on market inefficiencies before lines close.
+    </p>
+    <div class="feat-grid">
+      <div class="feat-card">
+        <div class="feat-icon"><i class="fas fa-robot"></i></div>
+        <h3>Dual Prediction Models</h3>
+        <p>XGBoost models for both player props (points, rebounds, assists) and game-level outcomes — spreads and totals.</p>
+      </div>
+      <div class="feat-card">
+        <div class="feat-icon"><i class="fas fa-chart-bar"></i></div>
+        <h3>Live Market Integration</h3>
+        <p>Connects to The Odds API to pull real-time Vegas lines so your analysis is always based on current market data.</p>
+      </div>
+      <div class="feat-card">
+        <div class="feat-icon"><i class="fas fa-users-cog"></i></div>
+        <h3>Depth Chart Analysis</h3>
+        <p>Scrapes ESPN for depth chart updates and applies a "Next Man Up" model to adjust predictions for injuries automatically.</p>
+      </div>
+      <div class="feat-card">
+        <div class="feat-icon"><i class="fas fa-dollar-sign"></i></div>
+        <h3>Kelly Criterion Sizing</h3>
+        <p>EV-based filtering and adaptive Kelly criterion sizing optimize bet selection and bankroll management in every session.</p>
+      </div>
+      <div class="feat-card">
+        <div class="feat-icon"><i class="fas fa-file-invoice-dollar"></i></div>
+        <h3>CLV Tracking</h3>
+        <p>Capture closing lines and measure the true quality of each bet against the sharpest market data available.</p>
+      </div>
+      <div class="feat-card">
+        <div class="feat-icon"><i class="fas fa-database"></i></div>
+        <h3>Structured SQL Storage</h3>
+        <p>Relational schema for high-volume metric storage, enabling backtesting and trend analysis across full seasons of data.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── HOW IT WORKS ── -->
+  <section id="how-it-works" class="section">
+    <div class="section-eyebrow">Workflow</div>
+    <h2>Your Edge in 3 Steps</h2>
+    <p class="section-sub">
+      The full pipeline from raw data to a placed bet — automated, optimized, and repeatable every game day.
+    </p>
+    <div class="steps">
+      <div class="step">
+        <div class="step-line"></div>
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <h3>Fetch &amp; Analyze Data</h3>
+          <p>Pulls the latest games, odds, and player statuses from the NBA API and The Odds API to feed the prediction models with live inputs.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-line"></div>
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <h3>Identify Profitable Bets</h3>
+          <p>XGBoost models generate predictions and the trading engine filters for high-confidence, positive expected-value opportunities.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-line"></div>
+        <div class="step-num">3</div>
+        <div class="step-body">
+          <h3>Review &amp; Place Wagers</h3>
+          <p>Review daily picks with full confidence breakdowns and Kelly-sized recommendations, then bet with a genuine data-driven edge.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</div><!-- /wrap -->
+
+<footer>
+  <div class="footer-top">
+    <div>
+      <div class="footer-brand">NBA BetLab</div>
+      <p class="footer-tag">Data-driven betting intelligence. Stop guessing, start winning.</p>
+    </div>
+    <div class="footer-col">
+      <h4>Navigate</h4>
+      <ul>
+        <li><a href="#features">Features</a></li>
+        <li><a href="#how-it-works">How It Works</a></li>
+      </ul>
+    </div>
+    <div class="footer-col">
+      <h4>Resources</h4>
+      <ul>
+        <li><a href="https://github.com/danmikel1" target="_blank">Source Code</a></li>
+        <li><a href="https://www.linkedin.com/in/dan-mikel-llenares" target="_blank">LinkedIn</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-bottom">
+    <span>© 2026 NBA BetLab &nbsp;·&nbsp; Built by Dan Mikel Llenares</span>
+    <div class="socials">
+      <a href="https://github.com/danmikel1" target="_blank" aria-label="GitHub"><i class="fab fa-github"></i></a>
+      <a href="https://www.linkedin.com/in/dan-mikel-llenares" target="_blank" aria-label="LinkedIn"><i class="fab fa-linkedin"></i></a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,18 @@
+{
+  "min_ev": 0.02,
+  "max_ev": 0.30,
+  "min_prob": 0.55,
+  "prob_cap": 0.68,
+  "prob_shrink_factor": 0.85,
+  "min_qs": 0.005,
+  "max_qs": 0.035,
+  "kelly_fraction": 0.25,
+  "max_stake_pct": 0.03,
+  "min_stake_pct": 0.005,
+  "blocked_combos": [
+    ["PA", "OVER"]
+  ],
+  "sniper_mode": true,
+  "sniper_max_bets": 25,
+  "sniper_max_per_opponent": 2
+}

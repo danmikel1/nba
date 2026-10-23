@@ -1,0 +1,19 @@
+{
+  "PTS": {
+    "learning_rate": 0.05,
+    "max_depth": 3,
+    "min_child_weight": 8,
+    "subsample": 0.8,
+    "colsample_bytree": 0.9,
+    "reg_alpha": 1.0,
+    "reg_lambda": 1.0,
+    "gamma": 0.2
+  },
+  "_PTS_meta": {
+    "best_mae": 4.6687,
+    "baseline_mae": 4.6693,
+    "improvement_pct": 0.01,
+    "samples": 46179,
+    "tuned_at": "2026-10-22 21:07:32"
+  }
+}
