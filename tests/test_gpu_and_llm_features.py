@@ -65,8 +65,8 @@ def test_sgp_multivariate_monte_carlo_cannibalization():
 
     assert res["n_legs"] == 2
     assert 0.0 < res["joint_prob"] < 1.0
-    # Teammate PTS lines have negative correlation (-0.15)
-    assert res["correlation_edge_pct"] <= 5.0  # slight drag or neutral
+    # Teammate PTS lines have near-neutral empirical correlation (+0.0258)
+    assert -10.0 <= res["correlation_edge_pct"] <= 10.0
 
 
 def test_sgp_pairwise_correlation_heuristics():

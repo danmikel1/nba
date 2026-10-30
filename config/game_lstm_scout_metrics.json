@@ -1,0 +1,11 @@
+{
+  "architecture": "4-Gate LSTM with Exact BPTT (Team 8-Game Lookback)",
+  "samples": 40728,
+  "seq_len": 8,
+  "hidden_dim": 20,
+  "margin_oof_corr": 0.0114,
+  "margin_oof_mae_pts": 9.913,
+  "total_oof_corr": 0.0169,
+  "total_oof_mae_pts": 13.96,
+  "elapsed_sec": 63.38
+}
