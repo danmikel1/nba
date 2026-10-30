@@ -210,6 +210,10 @@ class FeatureVector:
     feat_min_volatility: float = -1.0
     feat_foul_rate: float = -1.0
     feat_cv: float = -1.0
+
+    # === V27: 4-GATE LSTM SEQUENTIAL FEATURE SCOUT (Tool #4) ===
+    feat_lstm_momentum: float = 0.0
+    feat_lstm_fatigue_gate: float = 0.5
     
     # === DATA QUALITY (audit only, not used in ML) ===
     data_quality: DataQuality = field(default_factory=DataQuality)

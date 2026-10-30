@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path("data")
 
 # Canonical feature columns — must match nba_prediction.py TRAINING_FEATURE_COLUMNS
-from nba_prediction import TRAINING_FEATURE_COLUMNS, ML_MARKET_GROUPS
+from core_models import TRAINING_FEATURE_COLUMNS, ML_MARKET_GROUPS
 
 from hardware_utils import get_xgboost_hardware_params
 
@@ -88,18 +88,17 @@ def train_quantile_models(X_train, y_train, X_test, y_test, model_name,
     quantile_models = {}
     best_iters = {}
     market_params = get_tuned_market_params(model_name)
-    merged_base = {**merged_base, **market_params}
+    merged_base = {**BASE_PARAMS, **market_params}
 
     for q, name in zip(QUANTILES, QUANTILE_NAMES):
-        use_early_stop = (name == 'q50')
         params = {
             **merged_base,
             'objective': 'reg:quantileerror',
             'quantile_alpha': q,
-            'eval_metric': 'mae',
+            'eval_metric': 'quantile',
+            'early_stopping_rounds': 25,
         }
-        if use_early_stop:
-            params['early_stopping_rounds'] = 25
+        use_early_stop = True
 
         model = XGBRegressor(**params)
         model.fit(

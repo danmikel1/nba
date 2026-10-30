@@ -307,27 +307,12 @@ class TradingEngine:
 
         return row
 
-    def _calibrate_prob(self, prob_raw: np.ndarray, prob_shrinkage: float, prob_cap: float) -> np.ndarray:
+    def _calibrate_prob(self, prob_raw: np.ndarray, prob_shrinkage: float = 1.0, prob_cap: float = 0.99) -> np.ndarray:
         """
-        Three-stage probability calibration — applied BEFORE EV/QS are computed
-        so that downstream ranking reflects corrected confidence, not inflated raw probs.
-
-        Stage 1 — global shrinkage toward 0.5 (pass-through when prob_shrinkage=1.0).
-        Stage 2 — hard cap at prob_cap (default 0.68).
-        Stage 3 — multiplicative shrinkage in the 60-68% overconfidence band.
-                   Replaces the old additive penalty (-0.12), which was fragile:
-                   a multiplicative pull toward 0.5 scales as the model drifts and
-                   doesn't risk pushing probs below the floor with a fixed constant.
+        Monotonic probability pass-through (zero hardcoded 60-68% shrinkage kink).
         """
         prob = 0.5 + (prob_raw - 0.5) * float(prob_shrinkage)
         prob = np.clip(prob, 1.0 - float(prob_cap), float(prob_cap))
-
-        # Multiplicative shrinkage in the overconfidence band
-        lo, hi = PROB_SHRINK_RANGE
-        band_mask = (prob >= lo) & (prob <= hi)
-        prob[band_mask] = 0.5 + (prob[band_mask] - 0.5) * PROB_SHRINK_FACTOR
-
-        # Safety floor after shrinkage
         prob = np.maximum(prob, 0.50)
         return prob
 

@@ -4,8 +4,9 @@ game_ui.py — Streamlit UI Component for Game-Level NBA Predictions & Betting
 Integrates game-level spread and total models directly into the Streamlit dashboard:
   - Live & upcoming game odds ingestion (The Odds API + ESPN fallback)
   - XGBoost Quantile Regression predictions (Spread & Over/Under)
+  - Sweet-Spot Edge Filtering (1.0 to 2.5 pts) to avoid >3.0 pt unpriced star-injury traps
   - Mathematical Edge and Fractional Kelly stake sizing
-  - One-click bet tracking directly into `Tracker` (bet_tracker.json)
+  - 1-click "🚀 Track Top Game Picks" batch button + per-card "➕ Track" buttons
   - Custom / hypothetical game predictor
   - Settled game outcomes and historical model performance tracking
 """
@@ -13,12 +14,16 @@ Integrates game-level spread and total models directly into the Streamlit dashbo
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import logging
 import math
+import time
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 from scipy import stats
+
+logger = logging.getLogger(__name__)
 
 from game_prediction import predict_game, GamePrediction, STD_TO_CSV
 from scripts.harvest_closing_odds import harvest_daily_odds, settle_games_for_date, HARVEST_DIR, SETTLED_CSV
@@ -98,21 +103,157 @@ def compute_win_prob_and_kelly(
     return win_prob, ev_pct, rec_stake
 
 
-def load_harvested_games(target_date: str) -> List[Dict[str, Any]]:
-    """Load cached odds file or trigger fresh harvest if missing."""
+def load_harvested_games(target_date: str, force_refresh: bool = False) -> List[Dict[str, Any]]:
+    """Load cached odds file or trigger fresh harvest if missing or lines are empty."""
     file_path = HARVEST_DIR / f"odds_{target_date}.json"
-    if file_path.exists():
+    if not force_refresh and file_path.exists():
         data = safe_json_load(file_path, default={})
-        games = data.get("games", [])
-        if games:
+        games = data if isinstance(data, list) else data.get("games", [])
+        if any(g.get("spread_home") is not None and g.get("total") is not None for g in games):
             return games
 
-    # If missing or empty, perform on-demand harvest
+    # If missing, empty, or missing lines, perform on-demand harvest
     try:
         return harvest_daily_odds(target_date)
     except Exception as e:
-        st.warning(f"Could not load live odds for {target_date}: {e}")
+        logger.warning(f"Could not load live odds for {target_date}: {e}")
         return []
+
+
+def score_slate_games(
+    valid_games: List[Dict[str, Any]],
+    bankroll: float = 1000.0,
+    kelly_fraction: float = 0.25,
+    min_edge: float = 1.0,
+    max_edge: float = 3.0,
+    road_ats_priority: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Scores all games on the slate and extracts actionable "Best Game Picks"
+    within the [min_edge, max_edge] sweet spot.
+
+    Returns:
+        (evaluated_games, best_bet_payloads)
+    """
+    evaluated_games: List[Dict[str, Any]] = []
+    best_bet_payloads: List[Dict[str, Any]] = []
+
+    for g in valid_games:
+        home = g.get("home_team", "")
+        away = g.get("away_team", "")
+        # Sportsbook spread_home is negative when home is favored (e.g. -4.5).
+        # game_prediction.py expects positive vegas_spread when home is favored (+4.5).
+        book_spread_home = float(g.get("spread_home", 0.0))
+        model_vegas_spread = -book_spread_home
+        total = float(g.get("total", 220.0))
+        ml_home = g.get("ml_home")
+        ml_away = g.get("ml_away")
+
+        pred = predict_game(
+            home=home,
+            away=away,
+            vegas_spread=model_vegas_spread,
+            vegas_total=total,
+            moneyline_home=ml_home,
+            moneyline_away=ml_away,
+        )
+        if not pred:
+            continue
+
+        # SPREAD evaluation
+        spread_edge = pred.spread_edge  # pred_margin - model_vegas_spread
+        abs_spread_edge = abs(spread_edge)
+        spread_pick_team = home if spread_edge > 0 else away
+        # Sportsbook line for the picked team:
+        spread_pick_line = book_spread_home if spread_edge > 0 else -book_spread_home
+        spread_side_str = f"{spread_pick_team} {spread_pick_line:+.1f}"
+        spread_prob, spread_ev, spread_stake = compute_win_prob_and_kelly(
+            edge_pts=abs_spread_edge,
+            std_dev=STD_SPREAD,
+            bankroll=bankroll,
+            kelly_fraction=kelly_fraction,
+        )
+
+        is_spread_sweet = (min_edge <= abs_spread_edge <= max_edge)
+        if road_ats_priority and spread_pick_team != away:
+            is_spread_sweet = False
+
+        if is_spread_sweet:
+            best_bet_payloads.append({
+                "date": g.get("date", datetime.now().strftime("%Y-%m-%d")),
+                "player": f"{away} @ {home}",
+                "market": "SPREAD",
+                "bet_type": "spread",
+                "side": spread_side_str,
+                "line": float(spread_pick_line),
+                "opening_line": float(spread_pick_line),
+                "closing_line": float(spread_pick_line),
+                "odds": -110,
+                "odds_decimal": STANDARD_DECIMAL_ODDS,
+                "predicted_mean": float(pred.pred_margin),
+                "predicted_std": float(STD_SPREAD),
+                "edge_pts": float(round(abs_spread_edge, 1)),
+                "ev": float(spread_ev),
+                "win_prob": float(spread_prob),
+                "stake": float(spread_stake if spread_stake > 0 else round(bankroll * 0.01, 2)),
+                "opponent": away if spread_pick_team == home else home,
+                "book": g.get("bookmaker", "DraftKings"),
+                "tag": "game_sniper" if spread_pick_team == away else "game_model",
+                "model_version": "game_xgb_v1",
+                "result": "Pending",
+                "tracked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+        # TOTAL evaluation
+        total_edge = pred.total_edge
+        abs_total_edge = abs(total_edge)
+        total_pick = "OVER" if total_edge > 0 else "UNDER"
+        total_side_str = f"{total_pick} {pred.vegas_total:.1f}"
+        total_prob, total_ev, total_stake = compute_win_prob_and_kelly(
+            edge_pts=abs_total_edge,
+            std_dev=STD_TOTAL,
+            bankroll=bankroll,
+            kelly_fraction=kelly_fraction,
+        )
+
+        is_total_sweet = (min_edge <= abs_total_edge <= max_edge)
+        if is_total_sweet:
+            best_bet_payloads.append({
+                "date": g.get("date", datetime.now().strftime("%Y-%m-%d")),
+                "player": f"{away} @ {home}",
+                "market": "TOTAL",
+                "bet_type": "total",
+                "side": total_side_str,
+                "line": float(pred.vegas_total),
+                "opening_line": float(pred.vegas_total),
+                "closing_line": float(pred.vegas_total),
+                "odds": -110,
+                "odds_decimal": STANDARD_DECIMAL_ODDS,
+                "predicted_mean": float(pred.pred_total),
+                "predicted_std": float(STD_TOTAL),
+                "edge_pts": float(round(abs_total_edge, 1)),
+                "ev": float(total_ev),
+                "win_prob": float(total_prob),
+                "stake": float(total_stake if total_stake > 0 else round(bankroll * 0.01, 2)),
+                "opponent": f"{away} vs {home}",
+                "book": g.get("bookmaker", "DraftKings"),
+                "tag": "game_model",
+                "model_version": "game_xgb_v1",
+                "result": "Pending",
+                "tracked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+        evaluated_games.append({
+            "game": g,
+            "pred": pred,
+            "book_spread_home": book_spread_home,
+            "is_spread_sweet": is_spread_sweet,
+            "is_total_sweet": is_total_sweet,
+        })
+
+    # Sort best picks by edge_pts descending
+    best_bet_payloads.sort(key=lambda x: x.get("edge_pts", 0.0), reverse=True)
+    return evaluated_games, best_bet_payloads
 
 
 def render_game_card(
@@ -123,6 +264,7 @@ def render_game_card(
     kelly_fraction: float,
     min_edge: float,
     card_index: int,
+    max_edge: float = 3.0,
 ):
     """Renders a styled prediction card for a single matchup with Spread and Total markets."""
     home = pred.home
@@ -132,13 +274,16 @@ def render_game_card(
     book = game.get("bookmaker", "Consensus")
     commence = game.get("commence_time", "")
 
-    # Calculate probabilities and Kelly stakes
+    # Sportsbook home spread (negative when home is favored)
+    book_spread_home = float(game.get("spread_home", -pred.vegas_spread))
+
     # SPREAD:
     spread_edge = pred.spread_edge
+    abs_s_edge = abs(spread_edge)
     spread_pick_team = home if spread_edge > 0 else away
-    spread_line = pred.vegas_spread if spread_edge > 0 else -pred.vegas_spread
+    spread_line = book_spread_home if spread_edge > 0 else -book_spread_home
     spread_prob, spread_ev, spread_stake = compute_win_prob_and_kelly(
-        edge_pts=abs(spread_edge),
+        edge_pts=abs_s_edge,
         std_dev=STD_SPREAD,
         bankroll=bankroll,
         kelly_fraction=kelly_fraction,
@@ -146,9 +291,10 @@ def render_game_card(
 
     # TOTAL:
     total_edge = pred.total_edge
+    abs_t_edge = abs(total_edge)
     total_pick = "OVER" if total_edge > 0 else "UNDER"
     total_prob, total_ev, total_stake = compute_win_prob_and_kelly(
-        edge_pts=abs(total_edge),
+        edge_pts=abs_t_edge,
         std_dev=STD_TOTAL,
         bankroll=bankroll,
         kelly_fraction=kelly_fraction,
@@ -163,113 +309,168 @@ def render_game_card(
         with h_col2:
             if commence:
                 try:
-                    dt = datetime.fromisoformat(commence.replace("Z", "+00:00"))
-                    st.caption(f"Tipoff: {dt.strftime('%I:%M %p UTC')}")
+                    dt_utc = datetime.fromisoformat(commence.replace("Z", "+00:00"))
+                    dt_pht = dt_utc + timedelta(hours=8)
+                    dt_et = dt_utc - timedelta(hours=4)
+                    st.caption(f"⏰ **Tipoff:** {dt_pht.strftime('%a %b %d • %I:%M %p')} PHT  \n*(US ET: {dt_et.strftime('%a %I:%M %p')})*")
                 except Exception:
-                    pass
+                    st.caption(f"Tipoff: {commence}")
 
         # Split into Spread and Total columns
         col_spread, col_total = st.columns(2)
 
         # ---------------- SPREAD COLUMN ----------------
         with col_spread:
-            st.markdown("##### 📏 Spread Market")
-            st.write(f"**Vegas Line:** `{home} {pred.vegas_spread:+.1f}`")
-            st.write(f"**Model Projection:** `{home} {pred.pred_margin:+.1f}` (80% CI: `{pred.pred_margin_q10:+.1f}` to `{pred.pred_margin_q90:+.1f}`)")
+            is_s_sweet = (min_edge <= abs_s_edge <= max_edge)
+            is_s_trap = (abs_s_edge > max_edge)
+            s_badge = (
+                " 🔥 **SWEET SPOT**"
+                if (is_s_sweet and spread_pick_team == away)
+                else (" ✅ **ACTIONABLE**" if is_s_sweet else (" ⚠️ **>3pt Injury Trap**" if is_s_trap else ""))
+            )
+            st.markdown(f"##### 📏 Spread Market{s_badge}")
+            st.write(f"**Vegas Spread:** `{home} {book_spread_home:+.1f}` (`{away} {-book_spread_home:+.1f}`)")
+            pred_home_spread = -pred.pred_margin
+            st.write(
+                f"**Model Fair Spread:** `{home} {pred_home_spread:+.1f}` "
+                f"(Proj Margin: `{pred.pred_margin:+.1f}`, 80% CI: `{pred.pred_margin_q10:+.1f}` to `{pred.pred_margin_q90:+.1f}`)"
+            )
 
-            edge_color = "green" if abs(spread_edge) >= min_edge else "gray"
-            st.markdown(f"**Edge:** :{edge_color}[`{spread_edge:+.1f} pts`] → **{pred.ats_pick}** ({pred.confidence_spread})")
+            edge_color = "green" if is_s_sweet else ("orange" if is_s_trap else "gray")
+            st.markdown(
+                f"**Edge:** :{edge_color}[`{spread_edge:+.1f} pts`] → **{spread_pick_team} {spread_line:+.1f}** ({pred.confidence_spread})"
+            )
             st.caption(f"Win Prob: `{spread_prob:.1%}` | EV: `{spread_ev:+.1%}` | Rec Stake: `${spread_stake:.2f}`")
 
             # One-click Track Spread Bet button
             spread_btn_key = f"track_spread_{home}_{away}_{card_index}"
-            if st.button(f"➕ Track {pred.ats_pick}", key=spread_btn_key, use_container_width=True):
-                bet_side = f"{spread_pick_team} {spread_line:+.1f}"
-                bet_data = {
-                    "date": game.get("date", datetime.now().strftime("%Y-%m-%d")),
-                    "player": f"{away} @ {home}",
-                    "market": "SPREAD",
-                    "bet_type": "spread",
-                    "side": bet_side,
-                    "line": float(spread_line),
-                    "odds": -110,
-                    "odds_decimal": STANDARD_DECIMAL_ODDS,
-                    "predicted_mean": float(pred.pred_margin),
-                    "predicted_std": float(STD_SPREAD),
-                    "ev": float(spread_ev),
-                    "win_prob": float(spread_prob),
-                    "stake": float(spread_stake),
-                    "opponent": away if spread_pick_team == home else home,
-                    "tag": "game_model",
-                    "model_version": "game_xgb_v1",
-                    "result": "Pending",
-                }
-                try:
-                    if hasattr(tracker, 'add_bet'):
-                        tracker.add_bet(bet_data)
-                    elif hasattr(tracker, 'log_bet'):
-                        tracker.log_bet(bet_data)
-                    else:
-                        tracker.save_bet(bet_data)
-                    st.success(f"Tracked Spread Bet: {bet_side} (${spread_stake:.0f})")
-                except Exception as e:
-                    st.error(f"Failed to track bet: {e}")
+            bet_side = f"{spread_pick_team} {spread_line:+.1f}"
+            spread_bet_data = {
+                "date": game.get("date", datetime.now().strftime("%Y-%m-%d")),
+                "player": f"{away} @ {home}",
+                "market": "SPREAD",
+                "bet_type": "spread",
+                "side": bet_side,
+                "line": float(spread_line),
+                "opening_line": float(spread_line),
+                "closing_line": float(spread_line),
+                "odds": -110,
+                "odds_decimal": STANDARD_DECIMAL_ODDS,
+                "predicted_mean": float(pred.pred_margin),
+                "predicted_std": float(STD_SPREAD),
+                "ev": float(spread_ev),
+                "win_prob": float(spread_prob),
+                "stake": float(spread_stake),
+                "opponent": away if spread_pick_team == home else home,
+                "tag": "game_model",
+                "model_version": "game_xgb_v1",
+                "result": "Pending",
+                "tracked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            existing_spread = tracker.is_duplicate_bet(spread_bet_data) if hasattr(tracker, "is_duplicate_bet") else None
+            if existing_spread:
+                st.button(f"✓ Tracked: {bet_side}", key=spread_btn_key, disabled=True, use_container_width=True)
+            else:
+                if st.button(f"➕ Track {bet_side}", key=spread_btn_key, use_container_width=True):
+                    try:
+                        if hasattr(tracker, 'save_bet'):
+                            tracker.save_bet(spread_bet_data)
+                        elif hasattr(tracker, 'add_bet'):
+                            tracker.add_bet(spread_bet_data)
+                        else:
+                            tracker.log_bet(spread_bet_data)
+                        st.toast(f"✅ Tracked Spread Bet: {bet_side} (${spread_stake:.0f})")
+                        time.sleep(0.3)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to track bet: {e}")
 
         # ---------------- TOTAL COLUMN ----------------
         with col_total:
-            st.markdown("##### 🎯 Game Total (O/U)")
+            is_t_sweet = (min_edge <= abs_t_edge <= max_edge)
+            is_t_trap = (abs_t_edge > max_edge)
+            t_badge = " ✅ **SWEET SPOT**" if is_t_sweet else (" ⚠️ **Outlier Gap**" if is_t_trap else "")
+            st.markdown(f"##### 🎯 Game Total (O/U){t_badge}")
             st.write(f"**Vegas Line:** `{pred.vegas_total:.1f}`")
             st.write(f"**Model Projection:** `{pred.pred_total:.1f}` (80% CI: `{pred.pred_total_q10:.1f}` to `{pred.pred_total_q90:.1f}`)")
 
-            t_edge_color = "green" if abs(total_edge) >= min_edge else "gray"
-            st.markdown(f"**Edge:** :{t_edge_color}[`{total_edge:+.1f} pts`] → **{pred.ou_pick}** ({pred.confidence_total})")
+            t_edge_color = "green" if is_t_sweet else ("orange" if is_t_trap else "gray")
+            st.markdown(f"**Edge:** :{t_edge_color}[`{total_edge:+.1f} pts`] → **{pred.ou_pick} {pred.vegas_total:.1f}** ({pred.confidence_total})")
             st.caption(f"Win Prob: `{total_prob:.1%}` | EV: `{total_ev:+.1%}` | Rec Stake: `${total_stake:.2f}`")
 
             # One-click Track Total Bet button
             total_btn_key = f"track_total_{home}_{away}_{card_index}"
-            if st.button(f"➕ Track {pred.ou_pick} {pred.vegas_total:.1f}", key=total_btn_key, use_container_width=True):
-                bet_side = f"{total_pick} {pred.vegas_total:.1f}"
-                bet_data = {
-                    "date": game.get("date", datetime.now().strftime("%Y-%m-%d")),
-                    "player": f"{away} @ {home}",
-                    "market": "TOTAL",
-                    "bet_type": "total",
-                    "side": bet_side,
-                    "line": float(pred.vegas_total),
-                    "odds": -110,
-                    "odds_decimal": STANDARD_DECIMAL_ODDS,
-                    "predicted_mean": float(pred.pred_total),
-                    "predicted_std": float(STD_TOTAL),
-                    "ev": float(total_ev),
-                    "win_prob": float(total_prob),
-                    "stake": float(total_stake),
-                    "opponent": f"{away} vs {home}",
-                    "tag": "game_model",
-                    "model_version": "game_xgb_v1",
-                    "result": "Pending",
-                }
-                try:
-                    if hasattr(tracker, 'add_bet'):
-                        tracker.add_bet(bet_data)
-                    elif hasattr(tracker, 'log_bet'):
-                        tracker.log_bet(bet_data)
-                    else:
-                        tracker.save_bet(bet_data)
-                    st.success(f"Tracked Total Bet: {bet_side} (${total_stake:.0f})")
-                except Exception as e:
-                    st.error(f"Failed to track bet: {e}")
+            bet_side_total = f"{total_pick} {pred.vegas_total:.1f}"
+            total_bet_data = {
+                "date": game.get("date", datetime.now().strftime("%Y-%m-%d")),
+                "player": f"{away} @ {home}",
+                "market": "TOTAL",
+                "bet_type": "total",
+                "side": bet_side_total,
+                "line": float(pred.vegas_total),
+                "opening_line": float(pred.vegas_total),
+                "closing_line": float(pred.vegas_total),
+                "odds": -110,
+                "odds_decimal": STANDARD_DECIMAL_ODDS,
+                "predicted_mean": float(pred.pred_total),
+                "predicted_std": float(STD_TOTAL),
+                "ev": float(total_ev),
+                "win_prob": float(total_prob),
+                "stake": float(total_stake),
+                "opponent": f"{away} vs {home}",
+                "tag": "game_model",
+                "model_version": "game_xgb_v1",
+                "result": "Pending",
+                "tracked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            existing_total = tracker.is_duplicate_bet(total_bet_data) if hasattr(tracker, "is_duplicate_bet") else None
+            if existing_total:
+                st.button(f"✓ Tracked: {bet_side_total}", key=total_btn_key, disabled=True, use_container_width=True)
+            else:
+                if st.button(f"➕ Track {pred.ou_pick} {pred.vegas_total:.1f}", key=total_btn_key, use_container_width=True):
+                    try:
+                        if hasattr(tracker, 'save_bet'):
+                            tracker.save_bet(total_bet_data)
+                        elif hasattr(tracker, 'add_bet'):
+                            tracker.add_bet(total_bet_data)
+                        else:
+                            tracker.log_bet(total_bet_data)
+                        st.toast(f"✅ Tracked Total Bet: {bet_side_total} (${total_stake:.0f})")
+                        time.sleep(0.3)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to track bet: {e}")
 
 
 def render_games_tab(tracker: Any, bankroll_current: float = 1000.0):
     """Main entry point for the 🏀 Games tab."""
     st.markdown("### 🏀 NBA Game Predictions & Line Value")
-    st.caption("Game-level XGBoost Quantile Regression models trained on 17 seasons of historical data (2008–2025).")
+    st.caption(
+        "Game-level XGBoost Quantile Regression models trained on 17 seasons (2008–2025). "
+        "Out-of-sample backtest (2,640 games): **1.0–2.0 pt Spread Sweet Spot hits 53.4% overall** and **59.3% (+13.3% ROI) on Road ATS picks**, "
+        "while edges >3.0 pts regress (45.3%) due to unpriced star injuries."
+    )
 
     # Top Control Bar
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns([1.5, 1.2, 1.2, 1.2])
+    # Default date to latest harvested odds file with valid lines if available, else today
+    default_date = datetime.now().date()
+    existing_files = sorted(HARVEST_DIR.glob("odds_*.json"))
+    if existing_files:
+        for f in reversed(existing_files):
+            try:
+                data = safe_json_load(f, default={})
+                g_list = data if isinstance(data, list) else data.get("games", [])
+                if any(g.get("spread_home") is not None and g.get("total") is not None for g in g_list):
+                    latest_dt_str = f.stem.replace("odds_", "")
+                    default_date = datetime.strptime(latest_dt_str, "%Y-%m-%d").date()
+                    break
+            except Exception:
+                pass
+
+    ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([1.2, 1.2, 1.5, 1.1, 1.1])
 
     with ctrl1:
-        selected_date = st.date_input("Slate Date", value=datetime.now().date())
+        selected_date = st.date_input("Slate Date", value=default_date, key="game_slate_date")
         date_str = selected_date.strftime("%Y-%m-%d")
 
     with ctrl2:
@@ -277,59 +478,124 @@ def render_games_tab(tracker: Any, bankroll_current: float = 1000.0):
             "Kelly Sizing",
             [0.10, 0.25, 0.50, 1.0],
             index=1,
-            format_func=lambda x: f"{x}x {'(Quarter Kelly)' if x == 0.25 else ''}",
+            format_func=lambda x: f"{x}x {'(1/4 Kelly)' if x == 0.25 else ''}",
         )
 
     with ctrl3:
-        min_edge = st.slider("Min Edge (pts)", min_value=0.5, max_value=5.0, value=1.5, step=0.5)
+        edge_band = st.slider(
+            "Edge Sweet Spot (pts)",
+            min_value=0.5,
+            max_value=8.0,
+            value=(1.0, 3.0),
+            step=0.5,
+            help="2,640-game backtest shows 1.0–3.0 pt edges win 53.4%–59.7%, whereas >3.0 pt disagreements usually reflect unpriced star injuries (45.3% ATS).",
+        )
+        min_edge, max_edge = float(edge_band[0]), float(edge_band[1])
 
     with ctrl4:
+        road_ats_only = st.checkbox(
+            "🎯 Road ATS Sniper Only",
+            value=False,
+            help="Filter Best Picks strictly to Away ATS picks in the 1.0–2.5 pt sweet spot (197W-135L, 59.3% Win Rate, +13.3% ROI in 2024-25 backtest).",
+        )
+
+    with ctrl5:
         refresh_btn = st.button("🔄 Refresh Live Lines", use_container_width=True)
 
     if refresh_btn:
-        with st.spinner("Harvesting live odds from The Odds API & ESPN..."):
-            harvest_daily_odds(date_str)
-            st.success("Odds refreshed!")
+        with st.spinner(f"Harvesting live DraftKings game lines for {date_str}..."):
+            load_harvested_games(date_str, force_refresh=True)
+            st.toast(f"Harvested live odds for {date_str}!")
             st.rerun()
 
-    # Load slate games
-    games = load_harvested_games(date_str)
+    # Load slate games (automatically triggers on-demand harvest if lines missing)
+    games = load_harvested_games(date_str, force_refresh=False)
 
     # Filter games that have valid spread and total
     valid_games = [g for g in games if g.get("spread_home") is not None and g.get("total") is not None]
 
-    st.markdown(f"#### 📅 Today's Matchups ({len(valid_games)} games with posted lines)")
-
     if not valid_games:
-        st.info(f"No posted game lines found for {date_str}. Use the button above to refresh, or try the Custom Matchup Predictor below.")
+        st.info(f"No game lines found for **{date_str}**. Click **🔄 Refresh Live Lines** above or select an active slate date.")
     else:
-        for idx, g in enumerate(valid_games):
-            home = g.get("home_team", "")
-            away = g.get("away_team", "")
-            spread = float(g.get("spread_home", 0.0))
-            total = float(g.get("total", 220.0))
-            ml_home = g.get("ml_home")
-            ml_away = g.get("ml_away")
+        evaluated_games, best_game_picks = score_slate_games(
+            valid_games=valid_games,
+            bankroll=bankroll_current,
+            kelly_fraction=kelly_frac,
+            min_edge=min_edge,
+            max_edge=max_edge,
+            road_ats_priority=road_ats_only,
+        )
 
-            pred = predict_game(
-                home=home,
-                away=away,
-                vegas_spread=spread,
-                vegas_total=total,
-                moneyline_home=ml_home,
-                moneyline_away=ml_away,
+        spread_picks_n = sum(1 for p in best_game_picks if p["market"] == "SPREAD")
+        total_picks_n = sum(1 for p in best_game_picks if p["market"] == "TOTAL")
+        total_exp = sum(float(p.get("stake", 0.0)) for p in best_game_picks)
+
+        # Top Metrics & 1-Click Batch Track Bar
+        gm1, gm2, gm3, gm4 = st.columns(4)
+        gm1.metric("Matchups Posted", f"{len(evaluated_games)}", f"Slate: {date_str}")
+        gm2.metric("Sweet-Spot Spreads", f"{spread_picks_n}", f"{min_edge:.1f}–{max_edge:.1f} pt edge")
+        gm3.metric("Sweet-Spot Totals", f"{total_picks_n}", f"{min_edge:.1f}–{max_edge:.1f} pt edge")
+        gm4.metric("Recommended Exposure", f"${total_exp:,.0f}", f"Bankroll: ${bankroll_current:,.0f}")
+
+        if best_game_picks:
+            with st.container(border=True):
+                b_col1, b_col2 = st.columns([3, 1.3])
+                with b_col1:
+                    st.markdown(f"#### 🔥 Best Game Edges Worth Betting ({len(best_game_picks)} Qualifying Picks)")
+                    picks_summary = " • ".join(
+                        [f"**{p['side']}** (`{p['player']}`, Edge `+{p['edge_pts']:.1f} pts`)" for p in best_game_picks[:6]]
+                    )
+                    st.markdown(picks_summary)
+                with b_col2:
+                    existing_bets = tracker.get_bets() if hasattr(tracker, "get_bets") else []
+                    untracked_game_picks = [
+                        bp for bp in best_game_picks
+                        if not (hasattr(tracker, "is_duplicate_bet") and tracker.is_duplicate_bet(bp, existing_bets))
+                    ]
+
+                    if not untracked_game_picks:
+                        st.button(f"✓ All {len(best_game_picks)} Picks Tracked", disabled=True, use_container_width=True, key="all_games_already_tracked")
+                    else:
+                        btn_txt = (
+                            f"🚀 Track {len(untracked_game_picks)} Best Game Picks"
+                            if len(untracked_game_picks) < len(best_game_picks)
+                            else f"🚀 Track All {len(best_game_picks)} Best Game Picks"
+                        )
+                        if st.button(
+                            btn_txt,
+                            type="primary",
+                            use_container_width=True,
+                            key="track_batch_best_game_picks",
+                        ):
+                            logged_n = 0
+                            for bp in untracked_game_picks:
+                                if hasattr(tracker, "save_bet"):
+                                    ok = tracker.save_bet(bp)
+                                elif hasattr(tracker, "add_bet"):
+                                    ok = tracker.add_bet(bp)
+                                else:
+                                    ok = tracker.log_bet(bp)
+                                if ok or ok is None:
+                                    logged_n += 1
+                            if len(untracked_game_picks) < len(best_game_picks):
+                                st.success(f"✅ Tracked {logged_n} new Best Game Picks ({len(best_game_picks) - logged_n} were already tracked)!")
+                            else:
+                                st.success(f"✅ Tracked {logged_n} Best Game Picks into Bet Tracker!")
+                            time.sleep(0.4)
+                            st.rerun()
+
+        st.markdown(f"#### 📅 Today's Matchups ({len(evaluated_games)} games with posted lines)")
+        for idx, item in enumerate(evaluated_games):
+            render_game_card(
+                game=item["game"],
+                pred=item["pred"],
+                tracker=tracker,
+                bankroll=bankroll_current,
+                kelly_fraction=kelly_frac,
+                min_edge=min_edge,
+                card_index=idx,
+                max_edge=max_edge,
             )
-
-            if pred:
-                render_game_card(
-                    game=g,
-                    pred=pred,
-                    tracker=tracker,
-                    bankroll=bankroll_current,
-                    kelly_fraction=kelly_frac,
-                    min_edge=min_edge,
-                    card_index=idx,
-                )
 
     # =========================================================================
     # SECTION 2: CUSTOM / HYPOTHETICAL MATCHUP PREDICTOR
@@ -344,7 +610,7 @@ def render_games_tab(tracker: Any, bankroll_current: float = 1000.0):
         with c2:
             custom_away = st.selectbox("Away Team", team_options, index=team_options.index("LAL"))
         with c3:
-            custom_spread = st.number_input("Vegas Spread (Home)", value=-4.5, step=0.5, format="%.1f")
+            custom_spread = st.number_input("Vegas Spread (Home, e.g. -4.5 = Home Fav)", value=-4.5, step=0.5, format="%.1f")
         with c4:
             custom_total = st.number_input("Vegas Game Total", value=224.5, step=0.5, format="%.1f")
 
@@ -352,13 +618,15 @@ def render_games_tab(tracker: Any, bankroll_current: float = 1000.0):
             custom_pred = predict_game(
                 home=custom_home,
                 away=custom_away,
-                vegas_spread=custom_spread,
+                vegas_spread=-float(custom_spread),
                 vegas_total=custom_total,
             )
             if custom_pred:
                 dummy_game = {
                     "home_team": custom_home,
                     "away_team": custom_away,
+                    "spread_home": float(custom_spread),
+                    "total": float(custom_total),
                     "date": datetime.now().strftime("%Y-%m-%d"),
                     "bookmaker": "Custom",
                 }
@@ -370,49 +638,151 @@ def render_games_tab(tracker: Any, bankroll_current: float = 1000.0):
                     kelly_fraction=kelly_frac,
                     min_edge=min_edge,
                     card_index=999,
+                    max_edge=max_edge,
                 )
 
     # =========================================================================
     # SECTION 3: SETTLED GAMES & MODEL TRACK RECORD
     # =========================================================================
     with st.expander("📊 Settled Closing Lines & Harvest Performance", expanded=True):
-        col_hdr, col_act = st.columns([3, 1])
+        col_hdr, col_act = st.columns([3, 1.2])
         with col_hdr:
-            st.markdown("##### Historical Settled Games")
-            st.caption("Harvested closing lines automatically matched against official final scores.")
+            st.markdown("##### Historical Settled Games & Model Evaluation")
+            st.caption("Closing odds from DraftKings automatically graded against official NBA final scores.")
         with col_act:
             if st.button("🔄 Check & Settle Finished Games", use_container_width=True):
-                with st.spinner("Settling games from yesterday and today..."):
-                    today = datetime.now().strftime("%Y-%m-%d")
-                    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-                    settle_games_for_date(yesterday)
-                    settle_games_for_date(today)
-                    st.success("Games settled!")
+                with st.spinner("Settling games from recent slates..."):
+                    settled_any = 0
+                    for d_offset in range(4, -1, -1):
+                        chk_date = (datetime.now() - timedelta(days=d_offset)).strftime("%Y-%m-%d")
+                        try:
+                            res = settle_games_for_date(chk_date)
+                            settled_any += len(res)
+                        except Exception as _set_err:
+                            logger.debug(f"Settlement check for {chk_date}: {_set_err}")
+                    st.success(f"Settled {settled_any} newly finished games!")
                     st.rerun()
 
         if SETTLED_CSV.exists():
             try:
                 df_settled = pd.read_csv(SETTLED_CSV)
                 if not df_settled.empty:
-                    # Metrics row
-                    ats_acc = df_settled["model_ats_correct"].mean() if "model_ats_correct" in df_settled else 0.0
-                    ou_acc = df_settled["model_ou_correct"].mean() if "model_ou_correct" in df_settled else 0.0
-                    total_settled = len(df_settled)
+                    # Auto-backfill model predictions if any rows are missing them (e.g. settled on TrueNAS server)
+                    needs_backfill = (
+                        "model_ats_correct" not in df_settled.columns
+                        or df_settled["model_ats_correct"].isna().any()
+                        or "model_ats_pick" not in df_settled.columns
+                        or df_settled["model_ats_pick"].isna().any()
+                    )
+                    if needs_backfill:
+                        try:
+                            from game_prediction import predict_game
+                            for col in ["model_ats_pick", "model_ou_pick"]:
+                                if col in df_settled.columns:
+                                    df_settled[col] = df_settled[col].astype("object")
+                                else:
+                                    df_settled[col] = pd.Series(dtype="object")
+                            needs_save = False
+                            for idx, r in df_settled.iterrows():
+                                if (
+                                    pd.isna(r.get("model_ats_pick"))
+                                    and pd.notna(r.get("closing_spread"))
+                                    and pd.notna(r.get("closing_total"))
+                                ):
+                                    pred = predict_game(
+                                        home=r["home_team"],
+                                        away=r["away_team"],
+                                        vegas_spread=-float(r["closing_spread"]),
+                                        vegas_total=float(r["closing_total"]),
+                                    )
+                                    if pred:
+                                        df_settled.at[idx, "pred_margin"] = pred.pred_margin
+                                        df_settled.at[idx, "pred_total"] = pred.pred_total
+                                        df_settled.at[idx, "spread_edge"] = pred.spread_edge
+                                        df_settled.at[idx, "total_edge"] = pred.total_edge
+                                        df_settled.at[idx, "model_ats_pick"] = pred.ats_pick
+                                        df_settled.at[idx, "model_ou_pick"] = pred.ou_pick
+                                        df_settled.at[idx, "model_ats_correct"] = int(
+                                            (pred.ats_pick.startswith("HOME") and r["ats_winner"] == "HOME")
+                                            or (pred.ats_pick.startswith("AWAY") and r["ats_winner"] == "AWAY")
+                                        )
+                                        df_settled.at[idx, "model_ou_correct"] = int(
+                                            (pred.ou_pick == "OVER" and r["ou_winner"] == "OVER")
+                                            or (pred.ou_pick == "UNDER" and r["ou_winner"] == "UNDER")
+                                        )
+                                        needs_save = True
+                            if needs_save:
+                                df_settled.to_csv(SETTLED_CSV, index=False)
+                        except Exception as _bf_err:
+                            logger.debug(f"Auto-backfill model predictions error: {_bf_err}")
+
+                    # Calculate verified stats
+                    valid_ats = df_settled[df_settled["model_ats_correct"].notna()]
+                    valid_ou = df_settled[df_settled["model_ou_correct"].notna()]
+
+                    ats_w = int(valid_ats["model_ats_correct"].sum()) if not valid_ats.empty else 0
+                    ats_n = len(valid_ats)
+                    ats_l = ats_n - ats_w
+                    ats_pct = ats_w / ats_n if ats_n > 0 else 0.0
+
+                    ou_w = int(valid_ou["model_ou_correct"].sum()) if not valid_ou.empty else 0
+                    ou_n = len(valid_ou)
+                    ou_l = ou_n - ou_w
+                    ou_pct = ou_w / ou_n if ou_n > 0 else 0.0
+
+                    comb_w = ats_w + ou_w
+                    comb_n = ats_n + ou_n
+                    comb_pct = comb_w / comb_n if comb_n > 0 else 0.0
 
                     m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Settled Games", f"{total_settled}")
-                    m2.metric("Spread (ATS) Win Rate", f"{ats_acc:.1%}" if pd.notna(ats_acc) else "N/A")
-                    m3.metric("Total (O/U) Win Rate", f"{ou_acc:.1%}" if pd.notna(ou_acc) else "N/A")
-                    m4.metric("Dataset File", "settled_games.csv")
+                    m1.metric("Settled Games", f"{len(df_settled)}")
+                    m2.metric("Spread (ATS) Record", f"{ats_w}W - {ats_l}L ({ats_pct:.1%})")
+                    m3.metric("Total (O/U) Record", f"{ou_w}W - {ou_l}L ({ou_pct:.1%})")
+                    m4.metric("Overall Accuracy", f"{comb_pct:.1%} ({comb_w}/{comb_n})")
 
-                    # Display dataframe
-                    display_cols = [
-                        "date", "matchup", "actual_margin", "actual_total",
-                        "closing_spread", "closing_total", "ats_winner", "ou_winner",
-                        "model_ats_pick", "model_ou_pick", "model_ats_correct", "model_ou_correct"
+                    # Formatted Display Table
+                    df_disp = df_settled.copy().sort_values("date", ascending=False)
+                    df_disp["Final Score"] = df_disp.apply(
+                        lambda r: f"{int(r['away_score'])} @ {int(r['home_score'])}"
+                        if pd.notna(r.get("home_score")) and pd.notna(r.get("away_score"))
+                        else "N/A",
+                        axis=1,
+                    )
+                    df_disp["Closing Spread"] = df_disp.apply(
+                        lambda r: f"{r['home_team']} {float(r['closing_spread']):+.1f}"
+                        if pd.notna(r.get("closing_spread"))
+                        else "N/A",
+                        axis=1,
+                    )
+                    df_disp["ATS Result"] = df_disp.apply(
+                        lambda r: "✅ WIN" if r.get("model_ats_correct") == 1 else ("❌ LOSS" if r.get("model_ats_correct") == 0 else "—"),
+                        axis=1,
+                    )
+                    df_disp["Closing Total"] = df_disp.apply(
+                        lambda r: f"O/U {float(r['closing_total']):.1f} (Act: {int(r['actual_total'])})"
+                        if pd.notna(r.get("closing_total")) and pd.notna(r.get("actual_total"))
+                        else "N/A",
+                        axis=1,
+                    )
+                    df_disp["O/U Result"] = df_disp.apply(
+                        lambda r: "✅ WIN" if r.get("model_ou_correct") == 1 else ("❌ LOSS" if r.get("model_ou_correct") == 0 else "—"),
+                        axis=1,
+                    )
+
+                    disp_cols = [
+                        "date", "matchup", "Final Score", "Closing Spread", "ats_winner",
+                        "model_ats_pick", "ATS Result", "Closing Total", "ou_winner", "model_ou_pick", "O/U Result"
                     ]
-                    available_cols = [c for c in display_cols if c in df_settled.columns]
-                    st.dataframe(df_settled[available_cols].sort_values("date", ascending=False), height=250)
+                    col_rename = {
+                        "date": "Date",
+                        "matchup": "Matchup",
+                        "ats_winner": "ATS Winner",
+                        "model_ats_pick": "Model Pick",
+                        "ou_winner": "O/U Winner",
+                        "model_ou_pick": "Model O/U",
+                    }
+                    avail = [c for c in disp_cols if c in df_disp.columns]
+                    st.dataframe(df_disp[avail].rename(columns=col_rename), use_container_width=True, height=280)
                 else:
                     st.info("No settled games in dataset yet.")
             except Exception as e:

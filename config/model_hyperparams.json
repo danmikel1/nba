@@ -1,19 +1,226 @@
 {
   "PTS": {
-    "learning_rate": 0.05,
+    "learning_rate": 0.099,
     "max_depth": 3,
-    "min_child_weight": 8,
-    "subsample": 0.8,
-    "colsample_bytree": 0.9,
-    "reg_alpha": 1.0,
-    "reg_lambda": 1.0,
-    "gamma": 0.2
+    "min_child_weight": 12,
+    "subsample": 0.65,
+    "colsample_bytree": 0.7,
+    "reg_alpha": 0.378,
+    "reg_lambda": 0.5068,
+    "gamma": 0.45
   },
   "_PTS_meta": {
-    "best_mae": 4.6687,
-    "baseline_mae": 4.6693,
-    "improvement_pct": 0.01,
+    "best_pinball": 1.1891,
+    "baseline_pinball": 1.2031,
+    "pinball_improvement_pct": 1.16,
+    "best_mae": 4.6994,
+    "baseline_mae": 4.7267,
+    "improvement_pct": 0.58,
     "samples": 46179,
-    "tuned_at": "2026-10-22 21:07:32"
+    "trials_run": 20,
+    "trials_completed": 15,
+    "trials_pruned": 5,
+    "elapsed_sec": 63.26,
+    "param_importances": {
+      "learning_rate": 0.4005,
+      "colsample_bytree": 0.1772,
+      "reg_alpha": 0.15,
+      "subsample": 0.1411,
+      "max_depth": 0.0593
+    },
+    "optimizer": "Optuna TPESampler + MedianPruner (CUDA)",
+    "tuned_at": "2026-10-30 23:12:56"
+  },
+  "REB": {
+    "learning_rate": 0.1166,
+    "max_depth": 3,
+    "min_child_weight": 8,
+    "subsample": 0.75,
+    "colsample_bytree": 0.7,
+    "reg_alpha": 0.1656,
+    "reg_lambda": 3.1796,
+    "gamma": 0.35
+  },
+  "_REB_meta": {
+    "best_pinball": 0.4916,
+    "baseline_pinball": 0.4973,
+    "pinball_improvement_pct": 1.14,
+    "best_mae": 1.9468,
+    "baseline_mae": 1.9584,
+    "improvement_pct": 0.59,
+    "samples": 46179,
+    "trials_run": 20,
+    "trials_completed": 16,
+    "trials_pruned": 4,
+    "elapsed_sec": 69.0,
+    "param_importances": {
+      "learning_rate": 0.435,
+      "reg_lambda": 0.2081,
+      "gamma": 0.1647,
+      "reg_alpha": 0.1137,
+      "max_depth": 0.0392
+    },
+    "optimizer": "Optuna TPESampler + MedianPruner (CUDA)",
+    "tuned_at": "2026-10-30 23:14:08"
+  },
+  "AST": {
+    "learning_rate": 0.1107,
+    "max_depth": 4,
+    "min_child_weight": 6,
+    "subsample": 0.7,
+    "colsample_bytree": 0.65,
+    "reg_alpha": 0.4659,
+    "reg_lambda": 0.5968,
+    "gamma": 0.25
+  },
+  "_AST_meta": {
+    "best_pinball": 0.344,
+    "baseline_pinball": 0.3498,
+    "pinball_improvement_pct": 1.65,
+    "best_mae": 1.3667,
+    "baseline_mae": 1.3792,
+    "improvement_pct": 0.91,
+    "samples": 46179,
+    "trials_run": 20,
+    "trials_completed": 16,
+    "trials_pruned": 4,
+    "elapsed_sec": 61.17,
+    "param_importances": {
+      "gamma": 0.2806,
+      "colsample_bytree": 0.2287,
+      "learning_rate": 0.1575,
+      "reg_lambda": 0.1015,
+      "max_depth": 0.093
+    },
+    "optimizer": "Optuna TPESampler + MedianPruner (CUDA)",
+    "tuned_at": "2026-10-30 23:15:13"
+  },
+  "PRA": {
+    "learning_rate": 0.1107,
+    "max_depth": 4,
+    "min_child_weight": 6,
+    "subsample": 0.7,
+    "colsample_bytree": 0.65,
+    "reg_alpha": 0.4659,
+    "reg_lambda": 0.5968,
+    "gamma": 0.25
+  },
+  "_PRA_meta": {
+    "best_pinball": 1.5615,
+    "baseline_pinball": 1.5856,
+    "pinball_improvement_pct": 1.52,
+    "best_mae": 6.1604,
+    "baseline_mae": 6.2106,
+    "improvement_pct": 0.81,
+    "samples": 46179,
+    "trials_run": 20,
+    "trials_completed": 16,
+    "trials_pruned": 4,
+    "elapsed_sec": 64.68,
+    "param_importances": {
+      "reg_alpha": 0.5103,
+      "reg_lambda": 0.1481,
+      "learning_rate": 0.1016,
+      "max_depth": 0.0875,
+      "colsample_bytree": 0.0511
+    },
+    "optimizer": "Optuna TPESampler + MedianPruner (CUDA)",
+    "tuned_at": "2026-10-30 23:16:21"
+  },
+  "PR": {
+    "learning_rate": 0.1166,
+    "max_depth": 3,
+    "min_child_weight": 8,
+    "subsample": 0.75,
+    "colsample_bytree": 0.7,
+    "reg_alpha": 0.1656,
+    "reg_lambda": 3.1796,
+    "gamma": 0.35
+  },
+  "_PR_meta": {
+    "best_pinball": 1.4344,
+    "baseline_pinball": 1.4534,
+    "pinball_improvement_pct": 1.31,
+    "best_mae": 5.6614,
+    "baseline_mae": 5.6996,
+    "improvement_pct": 0.67,
+    "samples": 46179,
+    "trials_run": 20,
+    "trials_completed": 16,
+    "trials_pruned": 4,
+    "elapsed_sec": 63.33,
+    "param_importances": {
+      "learning_rate": 0.435,
+      "reg_lambda": 0.2081,
+      "gamma": 0.1647,
+      "reg_alpha": 0.1137,
+      "max_depth": 0.0392
+    },
+    "optimizer": "Optuna TPESampler + MedianPruner (CUDA)",
+    "tuned_at": "2026-10-30 23:17:27"
+  },
+  "PA": {
+    "learning_rate": 0.0989,
+    "max_depth": 4,
+    "min_child_weight": 9,
+    "subsample": 0.65,
+    "colsample_bytree": 0.65,
+    "reg_alpha": 1.7333,
+    "reg_lambda": 0.6323,
+    "gamma": 0.25
+  },
+  "_PA_meta": {
+    "best_pinball": 1.3095,
+    "baseline_pinball": 1.3303,
+    "pinball_improvement_pct": 1.56,
+    "best_mae": 5.169,
+    "baseline_mae": 5.2098,
+    "improvement_pct": 0.78,
+    "samples": 46179,
+    "trials_run": 20,
+    "trials_completed": 16,
+    "trials_pruned": 4,
+    "elapsed_sec": 63.02,
+    "param_importances": {
+      "reg_lambda": 0.5701,
+      "colsample_bytree": 0.1384,
+      "gamma": 0.0896,
+      "learning_rate": 0.0848,
+      "max_depth": 0.0521
+    },
+    "optimizer": "Optuna TPESampler + MedianPruner (CUDA)",
+    "tuned_at": "2026-10-30 23:18:34"
+  },
+  "RA": {
+    "learning_rate": 0.1166,
+    "max_depth": 3,
+    "min_child_weight": 8,
+    "subsample": 0.75,
+    "colsample_bytree": 0.7,
+    "reg_alpha": 0.1656,
+    "reg_lambda": 3.1796,
+    "gamma": 0.35
+  },
+  "_RA_meta": {
+    "best_pinball": 0.6763,
+    "baseline_pinball": 0.6837,
+    "pinball_improvement_pct": 1.09,
+    "best_mae": 2.6716,
+    "baseline_mae": 2.6845,
+    "improvement_pct": 0.48,
+    "samples": 46179,
+    "trials_run": 20,
+    "trials_completed": 16,
+    "trials_pruned": 4,
+    "elapsed_sec": 64.36,
+    "param_importances": {
+      "colsample_bytree": 0.2809,
+      "learning_rate": 0.2425,
+      "min_child_weight": 0.1875,
+      "gamma": 0.0951,
+      "max_depth": 0.0864
+    },
+    "optimizer": "Optuna TPESampler + MedianPruner (CUDA)",
+    "tuned_at": "2026-10-30 23:19:41"
   }
 }

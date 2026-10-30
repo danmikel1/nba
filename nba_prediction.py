@@ -1,5 +1,4 @@
 import streamlit as st
-from groq import Groq
 import pandas as pd
 import numpy as np
 from nba_api.stats.endpoints import playergamelog, leaguedashteamstats, commonplayerinfo, leaguedashplayerstats, leaguegamelog
@@ -240,145 +239,7 @@ def _haversine_miles(coord1: tuple, coord2: tuple) -> float:
 def get_all_nba_players():
     return players.get_players()
 
-@st.cache_resource
-def get_groq_client():
-    """Initialize Groq client securely."""
-    if "GROQ_API_KEY" in st.secrets:
-        return Groq(api_key=st.secrets["GROQ_API_KEY"])
-    return None
-    
-def get_ai_second_opinion(prop_analysis, backtest_json, history_context=None):
-    """
-    V21.4: RAW FEATURE AI (No Hard-Coded Heuristics)
-    
-    Philosophy: Feed the LLM the same features the ML model uses.
-    Let the LLM interpret them, not Python hard-coded rules.
-    
-    The ML model learned relationships from data.
-    The LLM provides human-readable interpretation of the same features.
-    """
-    
-    # ==========================================================================
-    # 1. EXTRACT FEATURES (Same as ML Model Input)
-    # ==========================================================================
-    player = prop_analysis.get('player', 'Unknown')
-    position = prop_analysis.get('position', '')
-    opponent = prop_analysis.get('opponent', backtest_json.get('opponent', ''))
-    market = prop_analysis.get('market', 'PTS')
-    
-    # --- Model Outputs ---
-    line = float(prop_analysis.get('line', backtest_json.get('line', 0.0)) or 0.0)
-    proj = float(prop_analysis.get('projected', prop_analysis.get('projected_value', 0.0)) or 0.0)
-    prob = float(prop_analysis.get('prob', 0.0) or 0.0)
-    ev = float(prop_analysis.get('ev', 0.0) or 0.0)
-    signal = prop_analysis.get('predicted_side', prop_analysis.get('signal', 'OVER'))
-    spread = float(prop_analysis.get('spread', backtest_json.get('spread', 0.0)) or 0.0)
-    
-    # --- Raw Features (No Interpretation Yet) ---
-    ema = float(prop_analysis.get('feat_ema', 0) or 0)
-    season_avg = float(prop_analysis.get('feat_season_avg', 0) or 0)
-    l10_avg = float(prop_analysis.get('feat_l10_avg', 0) or 0)
-    trend_5g = float(prop_analysis.get('feat_trend_5g', 0) or 0)
-    std = float(prop_analysis.get('feat_std', 0) or 0)
-    cv = float(prop_analysis.get('feat_cv', 0) or 0)
-    avg_minutes = float(prop_analysis.get('feat_avg_minutes', 0) or 0)
-    min_volatility = float(prop_analysis.get('feat_min_volatility', 0) or 0)
-    days_rest = int(prop_analysis.get('feat_days_rest', 1) or 1)
-    is_b2b = bool(prop_analysis.get('feat_is_b2b', False))
-    is_home = bool(prop_analysis.get('feat_is_home', True))
-    depth_rank = int(prop_analysis.get('feat_depth_rank', 4) or 4)
-    hit_rate_l10 = float(prop_analysis.get('feat_hit_rate_l10', 0) or 0)
-    hit_rate_l20 = float(prop_analysis.get('feat_hit_rate_l20', 0) or 0)
-    team_out_ppg = float(prop_analysis.get('feat_team_out_ppg', 0) or 0)
-    opp_drtg = float(prop_analysis.get('feat_opponent_drtg_season', 110) or 110)
-    opp_rank_vs_pos = int(prop_analysis.get('feat_opp_rank_vs_pos', 15) or 15)
-    home_avg = float(prop_analysis.get('feat_home_avg', ema) or ema)
-    away_avg = float(prop_analysis.get('feat_away_avg', ema) or ema)
-    games_played = int(prop_analysis.get('feat_games_played', 0) or 0)
-    
-    # --- Derived (Math, Not Heuristics) ---
-    edge = (proj - line) if signal == 'OVER' else (line - proj)
-    depth_labels = {1: 'Starter', 2: 'Rotation', 3: 'Bench', 4: 'Unknown'}
-    depth_str = depth_labels.get(depth_rank, 'Unknown')
-    location = "HOME" if is_home else "AWAY"
-    location_avg = home_avg if is_home else away_avg
 
-# ==========================================================================
-    # 2. BUILD RAW FEATURE PROMPT
-    # ==========================================================================
-    # Compute signal coherence for trend analysis
-    trend_aligns = (trend_5g > 0 and signal == 'OVER') or (trend_5g < 0 and signal == 'UNDER') or abs(trend_5g) < 0.3
-    trend_status = "aligned" if trend_aligns else "contradictory"
-
-    # --- NEW: MATH SAFETY CHECK ---
-    # We calculate the severity here so the LLM doesn't have to guess
-    trend_flag = ""
-    if not trend_aligns and abs(trend_5g) > 1.5:
-        trend_flag = f" [⚠️ CRITICAL: Exceeds ±1.5 Threshold!]"
-    
-    prompt = f"""
-You validate ML sports betting predictions. Your default answer is TAKE.
-
-┌───────────────────────────────────────────────────────────────────────────────┐
-│ BET: {player} ({position}) {market} {signal} {line} vs {opponent}             │
-│ Model Projection: {proj:.1f} | Win Prob: {prob*100:.0f}% | EV: {ev*100:+.1f}% │
-└───────────────────────────────────────────────────────────────────────────────┘
-
-FEATURES:
-• Recent: Season={season_avg:.1f}, L10={l10_avg:.1f}, EMA={ema:.1f}
-• Trend: {trend_5g:+.2f}/game ({trend_status} with {signal}){trend_flag}
-• Volatility: StdDev={std:.1f}, CV={cv*100:.0f}%, MinutesVol={min_volatility:.1f}
-• Sample: {games_played} games, Hit Rate L10={hit_rate_l10*100:.0f}%
-• Context: {location}, Days Rest={days_rest}, B2B={"Yes" if is_b2b else "No"}
-• Matchup: OppDRTG={opp_drtg:.1f}, Rank vs Pos=#{opp_rank_vs_pos}/30
-• Injuries: Team missing {team_out_ppg:.1f}ppg, Opp missing {prop_analysis.get('feat_opp_out_ppg', 0):.1f}ppg
-
-════════════════════════════════════════════════════════════════════════════════
-RULES (FADE requires ALL of these to be true for the specific criterion)
-════════════════════════════════════════════════════════════════════════════════
-FADE ONLY if one of these EXACT conditions is met:
-1. games_played < 15
-2. CV > 35%
-3. Trend magnitude > 1.5/game AND trend direction opposes the signal
-4. MinutesVol > 8 AND signal is OVER
-
-If NONE of these conditions are met, output TAKE. Do not invent other reasons.
-
-OUTPUT (exactly this format, nothing else):
-VERDICT: [TAKE/FADE]
-REASON: [One sentence citing the specific feature values that support your verdict]
-CONFIDENCE: [1-10]
-"""
-    
-    try:
-        from llm_engine import query_llm
-        system_msg = (
-            "You validate ML betting predictions against 4 specific numeric thresholds. "
-            "If none are triggered, output TAKE. Do not add subjective commentary or invent concerns not in the rules."
-        )
-        res = query_llm(prompt=prompt, system_prompt=system_msg, temperature=0.2)
-        if res.get("success"):
-            return res.get("response", "").strip()
-
-        # Fallback to direct Groq client
-        client = get_groq_client()
-        if client:
-            completion = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_msg},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_tokens=120
-            )
-            return completion.choices[0].message.content.strip()
-
-        return res.get("response", "No LLM response available.")
-    except Exception as e:
-        return f"AI Generation Error: {str(e)}"
-    
-    
 class ResultQuality(Enum):
     """
     Result quality categories for ML training.
@@ -560,6 +421,8 @@ class FeatureVector:
     feat_foul_rate: float = -1.0
     # Coefficient of variation for target stat (std / ema)
     feat_cv: float = -1.0
+    feat_lstm_momentum: float = 0.0
+    feat_lstm_fatigue_gate: float = 0.5
     
     # === DATA QUALITY (audit only, not used in ML) ===
     data_quality: DataQuality = field(default_factory=DataQuality)
@@ -2776,6 +2639,21 @@ class ModelEngine:
             'feat_form_gap': float(getattr(features, 'feat_form_gap', 0.0)),
             'feat_market_rare': float(getattr(features, 'market_rare', 0.0)),
         }
+        lstm_mom = float(getattr(features, 'feat_lstm_momentum', 0.0) or 0.0)
+        lstm_fg = float(getattr(features, 'feat_lstm_fatigue_gate', 0.5) if getattr(features, 'feat_lstm_fatigue_gate', None) is not None else 0.5)
+        if lstm_mom == 0.0 and abs(lstm_fg - 0.5) < 1e-6 and (
+            'feat_lstm_momentum' in expected_features or 'feat_lstm_fatigue_gate' in expected_features
+        ):
+            try:
+                if not hasattr(self, '_lstm_scout') or self._lstm_scout is None:
+                    from lstm_feature_scout import LSTMFeatureScoutEngine
+                    self._lstm_scout = LSTMFeatureScoutEngine()
+                mkt = getattr(features, 'market', None) or 'PTS'
+                lstm_mom, lstm_fg = self._lstm_scout.predict_live_features(features, mkt)
+            except Exception:
+                pass
+        feature_map['feat_lstm_momentum'] = lstm_mom
+        feature_map['feat_lstm_fatigue_gate'] = lstm_fg
         
         # Extract values in the exact order expected by the model
         values = []
@@ -3146,133 +3024,7 @@ class ModelEngine:
 # LAYER 4: SIMULATION ENGINE (Feature-Aware)
 # =============================================================================
 
-class SimulationEngine:
-    """
-    V20 EMPIRICAL: Pure CDF-based probability calculation.
-    
-    DESIGN PRINCIPLES (per refactor directive):
-    - Pure CDF calculation: P(Over) = 1 - ((line - ) / )
-    - NO mixture models (belief-based)
-    - NO variance adjustments based on spread/rest (heuristics)
-    - NO probability caps (let ML calibration handle this)
-    - Uncertainty comes from variance model, not hardcoded adjustments
-    
-    REMOVED:
-    - _generate_smart_mixture_samples (belief-based)
-    - _generate_low_count_samples (heuristic caps and adjustments)
-    - _calculate_dynamic_mixture_probs (belief-based)
-    - _apply_feature_adjustments_to_mean (heuristic)
-    - All probability caps (MAX_PROBABILITY_CAP, MIN_PROBABILITY_FLOOR)
-    - All variance multipliers based on spread/CV
-    """
-    
-    def __init__(self, config: Config = CONFIG):
-        self.config = config
-    
-    def compute_cdf_probability(
-        self,
-        mean: float,
-        std: float,
-        line: float,
-        market: str = None,
-        features: 'FeatureVector' = None
-    ) -> SimulationResult:
-        """
-        V20 EMPIRICAL: Pure CDF probability calculation.
-        
-        Formula: P(Over) = 1 - ((line - ) / )
-        
-        NO ADJUSTMENTS. The ML model's mean and std predictions are used as-is.
-        If the model is uncertain, that's reflected in a larger std.
-        """
-        # Handle edge cases
-        if std <= 0:
-            std = 1.0  # V20: Minimal fallback - do not fabricate variance
-        
-        # V20: NO variance adjustments - use model's predicted std directly
-        adjusted_std = std
-        
-        # === CORE CDF CALCULATION ===
-        z_score = (line - mean) / adjusted_std
-        p_under = stats.norm.cdf(z_score)
-        p_over = 1.0 - p_under
-        
-        # V20: NO probability caps - let calibration handle extreme cases
-        # The model should learn when to output extreme probabilities
-        
-        # Calculate confidence intervals analytically
-        ci_10 = mean - 1.28 * adjusted_std  # 10th percentile
-        ci_90 = mean + 1.28 * adjusted_std  # 90th percentile
-        
-        # Minimal placeholder for compatibility
-        sims = np.array([mean])
-        
-        return SimulationResult(
-            over_prob=float(max(0.001, min(0.999, p_over))),  # Technical bounds only
-            under_prob=float(max(0.001, min(0.999, p_under))),
-            median=mean,
-            ci_10=max(0, ci_10),
-            ci_90=ci_90,
-            simulations=sims
-        )
-    
-    def run_simulation(
-        self, 
-        mean: float, 
-        std: float, 
-        line: float, 
-        market: str,
-        features: 'FeatureVector' = None,
-        simulations: int = 1000,
-        use_mixture: bool = False  # V20: mixture disabled by default
-    ) -> SimulationResult: 
-        """
-        V20 EMPIRICAL: Simple normal-distribution Monte Carlo.
-        
-        For most use cases, prefer compute_cdf_probability() which is deterministic.
-        This method is kept for generating sample distributions for histograms.
-        
-        NO mixture models, NO heuristic adjustments.
-        """
-        # Handle edge cases
-        if std <= 0:
-            std = 1.0  # V20: Minimal fallback
-        
-        # V20: Pure normal distribution - no mixture, no adjustments
-        sims = np.random.normal(mean, std, simulations)
-        
-        # Ensure non-negative (physical constraint, not heuristic)
-        sims = np.maximum(sims, 0)
-        
-        over_rate = float((sims > line).mean())
-        under_rate = float((sims <= line).mean())
-        
-        return SimulationResult(
-            over_prob=max(0.001, min(0.999, over_rate)),  # Technical bounds
-            under_prob=max(0.001, min(0.999, under_rate)),
-            median=float(np.median(sims)),
-            ci_10=float(np.percentile(sims, 10)),
-            ci_90=float(np.percentile(sims, 90)),
-            simulations=sims
-        )
-    
-    def run_cdf_simulation(
-        self, 
-        predicted_mean: float, 
-        predicted_std: float, 
-        line: float, 
-        market: str
-    ) -> SimulationResult:
-        """
-        V20: Alias for compute_cdf_probability for backwards compatibility.
-        """
-        return self.compute_cdf_probability(
-            mean=predicted_mean,
-            std=predicted_std,
-            line=line,
-            market=market
-        )
-
+from simulation_engine import SimulationEngine
 
 # =============================================================================
 # LAYER 5: DECISION POLICY
@@ -5546,18 +5298,23 @@ class PredictionOrchestrator:
                 player_position=player_position
             )
             
-            # Step 6: Generate projection
-            projection = self.model_engine. generate_projection(features)
+            # Step 6: Generate projection & ML quantile details
+            projection = self.model_engine.generate_projection(features)
+            ml_details = self.model_engine.get_ml_prediction_details(features)
             
-            # Step 7: V21.6 CDF fallback (only used if ML prob unavailable)
-            # Use model's predicted_std when available, fall back to empirical std
+            # Step 7: 🎲 10k Monte Carlo Simulation (Blowout Tail-Risk, Foul Trouble & True Prob)
             sim_std = projection.adjustments.get('predicted_std', features.std) or features.std
-            simulation = self.simulation_engine.compute_cdf_probability(
+            q05_val = ml_details.get('q05') if isinstance(ml_details, dict) else None
+            q95_val = ml_details.get('q95') if isinstance(ml_details, dict) else None
+            simulation = self.simulation_engine.run_monte_carlo_10k(
                 mean=projection.final_projection,
                 std=sim_std,
                 line=line,
                 market=market,
-                features=features
+                features=features,
+                q05=q05_val,
+                q95=q95_val,
+                n_simulations=10_000,
             )
             
             # Step 8: Make decision
@@ -5569,9 +5326,6 @@ class PredictionOrchestrator:
                 odds=odds,
                 bankroll=bankroll
             )
-            
-            # Step 9: Get ML calibration details (V18)
-            ml_details = self.model_engine.get_ml_prediction_details(features)
             
             return AnalysisResult(
                 success=True,
@@ -5676,23 +5430,68 @@ class Tracker:
         # Default sentinel for floats
         return -1.0
 
-    def add_bet(self, bet_data: Dict):
+    @staticmethod
+    def get_dedup_key(bet_data: Dict) -> Tuple[str, str, str, str]:
+        """Canonical signature for identifying identical bets with robust player name normalization."""
+        b_date = str(bet_data.get("date") or "").strip()
+        raw_p = str(bet_data.get("player") or bet_data.get("player_name") or bet_data.get("matchup") or "")
+        import unicodedata
+        s = unicodedata.normalize("NFKD", raw_p).encode("ASCII", "ignore").decode("utf-8").strip().lower()
+        for ch in ("'", "’", "`", "."):
+            s = s.replace(ch, "")
+        s = s.replace("-", " ")
+        for suffix in (" jr", " sr", " iii", " ii", " iv"):
+            if s.endswith(suffix):
+                s = s[:-len(suffix)].strip()
+        b_player = " ".join(s.split())
+        b_mkt = str(bet_data.get("market") or bet_data.get("bet_type") or "").strip().upper()
+        b_side = str(bet_data.get("side") or "").strip().upper()
+        return (b_date, b_player, b_mkt, b_side)
+
+    def is_duplicate_bet(self, bet_data: Dict, existing_bets: List[Dict] = None) -> Optional[Dict]:
+        """
+        Returns the existing matching bet if an identical pending bet already exists, else None.
+        Matches by date, player/matchup, market, and pick side.
+        """
+        if existing_bets is None:
+            existing_bets = self.get_bets()
+
+        target_key = self.get_dedup_key(bet_data)
+        if not target_key[0] or not target_key[1]:
+            return None
+
+        for eb in existing_bets:
+            if eb.get("result", "Pending") == "Pending" and self.get_dedup_key(eb) == target_key:
+                return eb
+        return None
+
+    def add_bet(self, bet_data: Dict, allow_duplicate: bool = False) -> bool:
         """Alias for save_bet / log_bet to support both player props and game-level tracking."""
-        self.save_bet(bet_data)
+        return self.save_bet(bet_data, allow_duplicate=allow_duplicate)
 
-    def log_bet(self, bet_data: Dict):
+    def log_bet(self, bet_data: Dict, allow_duplicate: bool = False) -> bool:
         """Alias for save_bet to prevent 'AttributeError'."""
-        self.save_bet(bet_data)
+        return self.save_bet(bet_data, allow_duplicate=allow_duplicate)
 
-    def save_bet(self, bet_data: Dict):
+    def save_bet(self, bet_data: Dict, allow_duplicate: bool = False) -> bool:
         import time
         from datetime import datetime
         
         bets = self.get_bets()
+
+        # Duplicate Prevention Check
+        if not allow_duplicate:
+            existing = self.is_duplicate_bet(bet_data, bets)
+            if existing is not None:
+                return False
         
         # 1. Generate ID if missing
         if 'id' not in bet_data:
             bet_data['id'] = int(time.time() * 1000)
+            
+        # 1b. Timestamp the exact moment the bet was tracked
+        if 'tracked_at' not in bet_data or not bet_data['tracked_at']:
+            bet_data['tracked_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
         # 2. Generate DATE if missing (Format: YYYY-MM-DD)
         if 'date' not in bet_data or not bet_data['date']:
@@ -5706,7 +5505,7 @@ class Tracker:
         if 'model_version' not in bet_data:
             bet_data['model_version'] = CURRENT_VERSION
             
-        # 4. Ensure all canonical ML feature columns exist on saved bets to prevent schema drift.
+        # 5. Ensure all canonical ML feature columns exist on saved bets to prevent schema drift.
         # This stores explicit sentinel values for any missing V20.3 features so older records
         # remain compatible with downstream diagnostics and export code.
         for col in TRAINING_FEATURE_COLUMNS:
@@ -5715,6 +5514,7 @@ class Tracker:
 
         bets.append(bet_data)
         self._save(bets)
+        return True
 
     def get_bets(self) -> list: 
         """Loads bets and auto-fixes any legacy data safely."""
@@ -5724,12 +5524,14 @@ class Tracker:
                 if not isinstance(data, list):
                     data = []
                 
-                # Auto-Heal Logic
+                # Auto-Heal & Deduplication Logic
                 if data:
                     modified = False
                     import time
                     from datetime import datetime
                     
+                    deduped_data = []
+                    seen_pending = set()
                     for i, bet in enumerate(data):
                         # Fix ID
                         if 'id' not in bet:
@@ -5744,8 +5546,28 @@ class Tracker:
                             bet['result'] = 'Pending'
                             modified = True
                             
+                        # Fix Missing tracked_at from ID epoch ms
+                        if 'tracked_at' not in bet or not bet['tracked_at']:
+                            b_id = bet.get('id')
+                            if isinstance(b_id, (int, float)) and b_id > 1_600_000_000_000:
+                                bet['tracked_at'] = datetime.fromtimestamp(b_id / 1000.0).strftime("%Y-%m-%d %H:%M:%S")
+                                modified = True
+                            
+                        # Deduplicate identical Pending bets
+                        if bet.get('result', 'Pending') == 'Pending':
+                            d_key = self.get_dedup_key(bet)
+                            if d_key in seen_pending:
+                                modified = True
+                                continue  # Drop duplicate pending bet
+                            seen_pending.add(d_key)
+
+                        deduped_data.append(bet)
+                            
                     if modified:
+                        data = deduped_data
                         self._save(data)
+                    else:
+                        data = deduped_data
                         
                 self._load_failed = False
                 return data
@@ -5836,12 +5658,130 @@ class Tracker:
 
         espn_scoreboards_by_date = {}
         espn_boxscores_by_date = {}
+        espn_to_std = {
+            "GS": "GSW",
+            "SA": "SAS",
+            "NO": "NOP",
+            "NY": "NYK",
+            "UTAH": "UTA",
+            "WSH": "WAS",
+        }
+
+        def _norm_abbr(abbr: str) -> str:
+            u = (abbr or "").strip().upper()
+            return espn_to_std.get(u, u)
+
+        def _get_bet_teams(b: dict):
+            p = str(b.get('player', '')).upper().strip()
+            opp = str(b.get('opponent', '')).upper().strip()
+            side = str(b.get('side', '')).upper().strip()
+
+            if "@" in opp:
+                parts = [x.strip() for x in opp.split("@")]
+                if len(parts) == 2 and parts[0] and parts[1]:
+                    return _norm_abbr(parts[0]), _norm_abbr(parts[1])
+
+            if " VS " in opp:
+                parts = [x.strip() for x in opp.split(" VS ")]
+                if len(parts) == 2 and parts[0] and parts[1]:
+                    return _norm_abbr(parts[0]), _norm_abbr(parts[1])
+
+            if "@" in p:
+                parts = [x.strip() for x in p.split("@")]
+                if len(parts) == 2 and parts[0] and parts[1]:
+                    return _norm_abbr(parts[0]), _norm_abbr(parts[1])
+
+            if " VS " in p or " VS. " in p:
+                p_clean = p.replace(" VS. ", " VS ")
+                parts = [x.strip() for x in p_clean.split(" VS ")]
+                if len(parts) == 2 and parts[0] and parts[1]:
+                    return _norm_abbr(parts[0]), _norm_abbr(parts[1])
+
+            side_tok = _norm_abbr(side.split()[0]) if side else ""
+            opp_tok = _norm_abbr(opp)
+            if side_tok and opp_tok and side_tok != opp_tok and side_tok not in ("OVER", "UNDER"):
+                return side_tok, opp_tok
+
+            return None, None
+
+        def _event_matches_teams(comp: dict, t1: str, t2: str) -> bool:
+            if not t1 or not t2:
+                return False
+            competitors = comp.get("competitors", [])
+            if len(competitors) < 2:
+                return False
+            c_tokens = []
+            for c in competitors:
+                team = c.get("team", {})
+                tokens = {
+                    _norm_abbr(team.get("abbreviation", "")),
+                    team.get("name", "").upper(),
+                    team.get("displayName", "").upper(),
+                    team.get("shortDisplayName", "").upper(),
+                    team.get("location", "").upper(),
+                }
+                c_tokens.append(tokens)
+
+            def _matches(token_set, t):
+                t_u = t.upper()
+                return any(t_u == tok or t_u in tok or tok in t_u for tok in token_set if tok)
+
+            opt1 = _matches(c_tokens[0], t1) and _matches(c_tokens[1], t2)
+            opt2 = _matches(c_tokens[0], t2) and _matches(c_tokens[1], t1)
+            return opt1 or opt2
+
+        def _is_event_final(comp: dict) -> bool:
+            status = comp.get("status", {}).get("type", {})
+            state = str(status.get("state", "")).lower()
+            completed = status.get("completed", False) is True
+            desc = str(status.get("description", "")).upper()
+            return (state == "post" and completed) or ("FINAL" in desc and state == "post")
+
+        def _candidate_dates(dt_str: str) -> list:
+            out = [dt_str]
+            try:
+                dt_obj = datetime.strptime(dt_str, "%Y-%m-%d")
+                prev_dt = (dt_obj - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+                if prev_dt not in out:
+                    out.append(prev_dt)
+            except Exception:
+                pass
+            return out
+
+        def _canonical_name(raw_name: str) -> str:
+            """Robust normalization stripping apostrophes, accents, hyphens, periods, and suffixes."""
+            if not raw_name:
+                return ""
+            import unicodedata
+            s = unicodedata.normalize("NFKD", str(raw_name)).encode("ASCII", "ignore").decode("utf-8")
+            s = s.strip().lower()
+            for ch in ("'", "’", "`", "."):
+                s = s.replace(ch, "")
+            s = s.replace("-", " ")
+            for suffix in (" jr", " sr", " iii", " ii", " iv"):
+                if s.endswith(suffix):
+                    s = s[:-len(suffix)].strip()
+            return " ".join(s.split())
 
         settled_count = 0
         wins = 0
         losses = 0
         pushes = 0
         details = []
+
+        # Optional: load settled harvested odds to populate true closing lines & CLV
+        settled_props_df = None
+        settled_games_df = None
+        try:
+            from pathlib import Path
+            p_pqt = Path("data/harvested_odds/settled_player_props.parquet")
+            if p_pqt.exists():
+                settled_props_df = pd.read_parquet(p_pqt)
+            g_csv = Path("data/harvested_odds/settled_games.csv")
+            if g_csv.exists():
+                settled_games_df = pd.read_csv(g_csv)
+        except Exception:
+            pass
 
         for bet in pending_bets:
             b_id = bet.get('id')
@@ -5856,37 +5796,51 @@ class Tracker:
             is_game = market in ['SPREAD', 'TOTAL', 'spread', 'total'] or bet_type in ['spread', 'total']
 
             if is_game:
-                if bet_date not in espn_scoreboards_by_date:
-                    try:
-                        resp = requests.get(
-                            "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
-                            params={"dates": bet_date.replace("-", "")},
-                            timeout=10
-                        )
-                        espn_scoreboards_by_date[bet_date] = resp.json().get("events", []) if resp.status_code == 200 else []
-                    except Exception:
-                        espn_scoreboards_by_date[bet_date] = []
-
-                events = espn_scoreboards_by_date[bet_date]
                 matched_event = None
+                t1, t2 = _get_bet_teams(bet)
                 p_text = (str(bet.get('player', '')) + " " + str(bet.get('opponent', ''))).upper()
+                game_found_live_or_pre = False
 
-                for ev in events:
-                    comp = ev.get("competitions", [{}])[0]
-                    competitors = comp.get("competitors", [])
-                    abbrevs = [c.get("team", {}).get("abbreviation", "").upper() for c in competitors]
-                    names = [c.get("team", {}).get("name", "").upper() for c in competitors]
-                    if any(a in p_text for a in abbrevs if a) or any(n in p_text for n in names if n):
-                        status = comp.get("status", {}).get("type", {})
-                        if status.get("state") == "post" or "FINAL" in status.get("description", "").upper():
-                            matched_event = comp
+                for q_date in _candidate_dates(bet_date):
+                    if q_date not in espn_scoreboards_by_date:
+                        try:
+                            resp = requests.get(
+                                "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+                                params={"dates": q_date.replace("-", "")},
+                                timeout=10
+                            )
+                            espn_scoreboards_by_date[q_date] = resp.json().get("events", []) if resp.status_code == 200 else []
+                        except Exception:
+                            espn_scoreboards_by_date[q_date] = []
+
+                    for ev in espn_scoreboards_by_date[q_date]:
+                        comp = ev.get("competitions", [{}])[0]
+                        if t1 and t2:
+                            is_match = _event_matches_teams(comp, t1, t2)
+                        else:
+                            competitors = comp.get("competitors", [])
+                            abbrevs = [_norm_abbr(c.get("team", {}).get("abbreviation", "")) for c in competitors]
+                            is_match = len(abbrevs) >= 2 and all(a in p_text for a in abbrevs if a)
+
+                        if is_match:
+                            if _is_event_final(comp):
+                                matched_event = comp
+                            else:
+                                # Found the game for this bet, but it is currently LIVE or UPCOMING!
+                                # Strict stop: never settle an in-progress game or fall back to previous dates!
+                                game_found_live_or_pre = True
                             break
 
-                if not matched_event:
+                    if matched_event or game_found_live_or_pre:
+                        break
+
+                if game_found_live_or_pre or not matched_event:
                     continue
 
                 home_c = next((c for c in matched_event.get("competitors", []) if c.get("homeAway") == "home"), {})
                 away_c = next((c for c in matched_event.get("competitors", []) if c.get("homeAway") == "away"), {})
+                h_abbr = _norm_abbr(home_c.get("team", {}).get("abbreviation", ""))
+                a_abbr = _norm_abbr(away_c.get("team", {}).get("abbreviation", ""))
 
                 try:
                     h_score = float(home_c.get("score", 0))
@@ -5904,7 +5858,23 @@ class Tracker:
                     else:
                         res = "Push"
 
-                    self.update_result(b_id, res, closing_line=line, actual_value=actual_total)
+                    # Resolve true closing line if present in harvested database
+                    cl_total = float(bet.get('closing_line') or line)
+                    if settled_games_df is not None and not settled_games_df.empty:
+                        try:
+                            g_m = settled_games_df[
+                                (settled_games_df['date'] == bet_date) &
+                                (settled_games_df['matchup'].astype(str).str.contains(h_abbr, case=False, regex=False) |
+                                 settled_games_df['home_team'].astype(str).str.contains(h_abbr, case=False, regex=False))
+                            ]
+                            if not g_m.empty and 'closing_total' in g_m.columns:
+                                cl_cand = g_m['closing_total'].dropna()
+                                if not cl_cand.empty:
+                                    cl_total = float(cl_cand.iloc[0])
+                        except Exception:
+                            pass
+
+                    self.update_result(b_id, res, closing_line=cl_total, actual_value=actual_total)
                     settled_count += 1
                     if res == "Win": wins += 1
                     elif res == "Loss": losses += 1
@@ -5912,8 +5882,9 @@ class Tracker:
                     details.append({"id": b_id, "type": "game_total", "result": res, "actual": actual_total, "line": line})
 
                 elif market == 'SPREAD' or bet_type == 'spread':
-                    h_abbr = home_c.get("team", {}).get("abbreviation", "").upper()
-                    picked_home = h_abbr in side or "HOME" in side
+                    h_abbr = _norm_abbr(home_c.get("team", {}).get("abbreviation", ""))
+                    side_team_tok = side.split()[0] if side else ""
+                    picked_home = (side_team_tok == h_abbr) or (h_abbr in side and side_team_tok not in ("AWAY",)) or ("HOME" in side)
                     margin = (h_score - a_score) if picked_home else (a_score - h_score)
                     ats_margin = margin + line
                     if ats_margin > 0.05:
@@ -5923,7 +5894,24 @@ class Tracker:
                     else:
                         res = "Push"
 
-                    self.update_result(b_id, res, closing_line=line, actual_value=margin)
+                    # Resolve true closing line if present in harvested database
+                    cl_spread = float(bet.get('closing_line') or line)
+                    if settled_games_df is not None and not settled_games_df.empty:
+                        try:
+                            g_m = settled_games_df[
+                                (settled_games_df['date'] == bet_date) &
+                                (settled_games_df['matchup'].astype(str).str.contains(h_abbr, case=False, regex=False) |
+                                 settled_games_df['home_team'].astype(str).str.contains(h_abbr, case=False, regex=False))
+                            ]
+                            if not g_m.empty and 'closing_spread' in g_m.columns:
+                                cl_cand = g_m['closing_spread'].dropna()
+                                if not cl_cand.empty:
+                                    base_spread = float(cl_cand.iloc[0])
+                                    cl_spread = base_spread if picked_home else -base_spread
+                        except Exception:
+                            pass
+
+                    self.update_result(b_id, res, closing_line=cl_spread, actual_value=margin)
                     settled_count += 1
                     if res == "Win": wins += 1
                     elif res == "Loss": losses += 1
@@ -5931,25 +5919,62 @@ class Tracker:
                     details.append({"id": b_id, "type": "game_spread", "result": res, "actual": margin, "line": line})
 
             else:
-                if bet_date not in espn_boxscores_by_date:
-                    try:
-                        from scripts.harvest_player_props import fetch_espn_player_boxscores
-                        espn_boxscores_by_date[bet_date] = fetch_espn_player_boxscores(bet_date)
-                    except Exception:
-                        espn_boxscores_by_date[bet_date] = {}
-
-                boxscores = espn_boxscores_by_date[bet_date]
-                if not boxscores:
+                matched_stats = None
+                raw_player = str(bet.get('player', '')).strip()
+                p_norm = _canonical_name(raw_player)
+                if not p_norm:
                     continue
 
-                player_name = str(bet.get('player', '')).strip().lower()
-                matched_stats = None
-                for b_name, b_stats in boxscores.items():
-                    if b_name in player_name or player_name in b_name:
-                        matched_stats = b_stats
+                t1, t2 = _get_bet_teams(bet)
+                game_in_progress = False
+
+                for q_date in _candidate_dates(bet_date):
+                    if q_date not in espn_scoreboards_by_date:
+                        try:
+                            resp = requests.get(
+                                "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
+                                params={"dates": q_date.replace("-", "")},
+                                timeout=10
+                            )
+                            espn_scoreboards_by_date[q_date] = resp.json().get("events", []) if resp.status_code == 200 else []
+                        except Exception:
+                            espn_scoreboards_by_date[q_date] = []
+
+                    # If this player's game is active on q_date and not finished, halt settlement!
+                    if t1 and t2:
+                        for ev in espn_scoreboards_by_date[q_date]:
+                            comp = ev.get("competitions", [{}])[0]
+                            if _event_matches_teams(comp, t1, t2):
+                                if not _is_event_final(comp):
+                                    game_in_progress = True
+                                break
+                    if game_in_progress:
                         break
 
-                if not matched_stats:
+                    if q_date not in espn_boxscores_by_date:
+                        try:
+                            from scripts.harvest_player_props import fetch_espn_player_boxscores
+                            espn_boxscores_by_date[q_date] = fetch_espn_player_boxscores(q_date)
+                        except Exception:
+                            espn_boxscores_by_date[q_date] = {}
+
+                    boxscores = espn_boxscores_by_date[q_date]
+                    if not boxscores:
+                        continue
+
+                    # Direct canonical match
+                    if p_norm in boxscores:
+                        matched_stats = boxscores[p_norm]
+                    else:
+                        for b_name, b_stats in boxscores.items():
+                            b_norm = _canonical_name(b_name)
+                            if b_norm == p_norm or b_norm in p_norm or p_norm in b_norm:
+                                matched_stats = b_stats
+                                break
+                    if matched_stats:
+                        break
+
+                if game_in_progress or not matched_stats:
                     continue
 
                 actual_stat = matched_stats.get(market)
@@ -5964,7 +5989,26 @@ class Tracker:
                 else:
                     res = "Push"
 
-                self.update_result(b_id, res, closing_line=line, actual_value=actual_stat)
+                # Resolve true closing line if present in harvested database
+                cl_prop = float(bet.get('closing_line') or line)
+                if settled_props_df is not None and not settled_props_df.empty:
+                    try:
+                        p_m = settled_props_df[
+                            (settled_props_df['date'] == bet_date) &
+                            (settled_props_df['market'] == market)
+                        ]
+                        if not p_m.empty:
+                            p_m_matched = p_m[
+                                p_m['player'].apply(_canonical_name).apply(lambda x: x == p_norm or x in p_norm or p_norm in x)
+                            ]
+                            if not p_m_matched.empty and 'closing_line' in p_m_matched.columns:
+                                cl_cand = p_m_matched['closing_line'].dropna()
+                                if not cl_cand.empty:
+                                    cl_prop = float(cl_cand.iloc[0])
+                    except Exception:
+                        pass
+
+                self.update_result(b_id, res, closing_line=cl_prop, actual_value=actual_stat)
                 settled_count += 1
                 if res == "Win": wins += 1
                 elif res == "Loss": losses += 1
@@ -7265,126 +7309,42 @@ def render_ml_decoder(result: AnalysisResult):
     e3.metric("Games", f"{features.games_played}")
     e4.metric("Game Total", f"{features.game_total:.1f}")
 
-
-def render_recommendation_card(result: AnalysisResult, bankroll: float):
-    """
-    Render clean, mobile-friendly recommendation card.
-
-    V19: Removed grades - uses EV-based coloring.
-    """
-    decision = result.decision
-    projection = result.projection
-    features = result.features
-    simulation = result.simulation
-    
-    # V20 EMPIRICAL: Color based on EV sign only
-    ev = decision.expected_value
-    if ev > 0:
-        ev_color = 'green'
-    else:
-        ev_color = 'red'
-    
-    # --- 1. HEADER ---
-    
-    # V20 EMPIRICAL: Display ML recommendation directly
-    st.markdown(f"### {decision.recommended_side} {result.line}  :{ev_color}[EV: {ev:+.1%}]")
-    
-    # --- 2. KEY METRICS ---
-    
-    if projection.ml_prob is not None:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Win Prob", f"{decision.probability:.0%}")
-        c2.metric("EV", f"{decision.expected_value:+.1%}")
-        c3.metric("Stake", f"{decision.kelly_stake:.0f}", f"{decision.kelly_fraction:.1%}")
-        
-        # V20 EMPIRICAL: Display raw probability - no categorical labels
-        c4.metric("ML P(Over)", f"{projection.ml_prob:.0%}")
-        
-    else:
-        # Fallback if no ML model loaded
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Win Prob", f"{decision.probability:.0%}")
-        c2.metric("EV", f"{decision.expected_value:+.1%}")
-        c3.metric("Stake", f"{decision.kelly_stake:.0f}", f"{decision.kelly_fraction:.1%}")
-    
-    # --- 3. V19 SIGNAL DECODER (STREAMLINED) ---
-    
-    with st.expander(" ML Signal Decoder", expanded=False):
-        # V20.2 EMPIRICAL: Display raw observables only - NO categorical labels
-        # The ML model interprets these values; humans should not add labels
-        
-        st.caption(" **Raw Observables (Model Inputs)**")
-        r1, r2, r3 = st.columns(3)
-        
-        with r1:
-            st.metric("Spread", f"{features.spread:+.1f}")
-            
-        with r2:
-            st.metric("Days Rest", f"{features.days_rest}")
-            
-        with r3:
-            cv = (features.std / features.ema * 100) if features.ema > 0 else 0
-            st.metric("CV %", f"{cv:.0f}%")
-
-        st.divider()
-
-        # V20: Raw numeric values only - no categorical interpretation
-        st.caption(" **Feature Values**")
-        d1, d2, d3 = st.columns(3)
-        
-        with d1:
-            st.metric("Avg Minutes", f"{features.avg_minutes:.1f}")
-            
-        with d2:
-            st.metric("Opp DRTG", f"{features.opponent_drtg_season:.1f}")
-            
-        with d3:
-            st.metric("Game Total", f"{features.game_total:.0f}")
-        
-        # V20.2 NEW: Pace and trend features
-        st.divider()
-        st.caption(" **V20.2 Features**")
-        p1, p2, p3 = st.columns(3)
-        
-        with p1:
-            st.metric("Opp Pace", f"{features.opponent_pace:.1f}")
-            
-        with p2:
-            st.metric("Team Pace", f"{features.team_pace:.1f}")
-            
-        with p3:
-            trend_color = "" if features.trend_5g > 0 else "" if features.trend_5g < 0 else ""
-            st.metric("Trend 5G", f"{trend_color} {features.trend_5g:+.2f}")
-        
-        h1, h2 = st.columns(2)
-        with h1:
-            st.metric("Home Avg", f"{features.home_avg:.1f}")
-        with h2:
-            st.metric("Away Avg", f"{features.away_avg:.1f}")
-
-    # --- 4. FOOTER ---
-    
-    render_data_quality_card(result)
-
-
 def render_distribution_chart(result: AnalysisResult):
     """
-    V20 EMPIRICAL: Render probability distribution chart.
-    
-    Uses ML model's predicted mean and std directly - NO heuristic adjustments.
-    The chart is for visualization only; actual probabilities come from CDF.
+    🎲 10k MONTE CARLO: Render empirical 10,000-trial probability distribution chart
+    with Blowout Tail-Risk, Foul Trouble, and True Prob metrics.
     """
     simulation = result.simulation
     projection = result.projection
     features = result.features
 
-    # V20: Use ML model's predictions directly - NO heuristic adjustments
     mean = projection.final_projection
-    std = features.std if features.std > 0 else 1.0  # Use actual std, fallback only if zero
-    
-    # Generate 10,000 samples for smooth histogram
-    viz_samples = np.random.normal(mean, std, 10000)
-    viz_samples = np.maximum(viz_samples, 0)  # Non-negative (physical constraint)
+    std = features.std if features.std > 0 else 1.0
+
+    # Ensure we have full 10,000 Monte Carlo samples (run if legacy/analytical placeholder)
+    if getattr(simulation, "simulations", None) is None or len(simulation.simulations) < 100:
+        ml_d = result.ml_details if isinstance(getattr(result, "ml_details", None), dict) else {}
+        simulation = SimulationEngine().run_monte_carlo_10k(
+            mean=mean,
+            std=std,
+            line=result.line,
+            market=result.market,
+            features=features,
+            q05=ml_d.get("q05"),
+            q95=ml_d.get("q95"),
+            n_simulations=10_000,
+        )
+
+    viz_samples = np.asarray(simulation.simulations, dtype=float)
+
+    # 4-Column 10k Monte Carlo Tail-Risk Summary Bar
+    mc_c1, mc_c2, mc_c3, mc_c4 = st.columns(4)
+    pick_side = getattr(result.decision, "recommended_side", "OVER")
+    mc_win_prob = simulation.over_prob if str(pick_side).upper() != "UNDER" else simulation.under_prob
+    mc_c1.metric("🎲 10k MC True Prob", f"{mc_win_prob:.1%}", f"{len(viz_samples):,} trials")
+    mc_c2.metric("📉 Blowout Bench Risk", f"{getattr(simulation, 'blowout_risk_pct', 0.0):.1f}%", "4th-Qtr Sit Prob")
+    mc_c3.metric("🛡️ 10% Tail Floor (CVaR)", f"{getattr(simulation, 'tail_cvar_10', simulation.ci_10):.1f}", f"80% CI: [{simulation.ci_10:.1f}, {simulation.ci_90:.1f}]")
+    mc_c4.metric("⚡ Compute Latency", f"{getattr(simulation, 'compute_time_ms', 0.0):.1f} ms", f"OT Boost: {getattr(simulation, 'overtime_boost_pct', 0.0):.1f}%")
 
     fig, ax = plt.subplots(figsize=(10, 2.5))
     n, bins, patches = ax.hist(viz_samples, bins=50, color='skyblue', alpha=0.7, density=True)
@@ -7397,1679 +7357,17 @@ def render_distribution_chart(result: AnalysisResult):
             patch.set_facecolor('#dc3545')
             patch.set_alpha(0.6)
     
-    ax.axvline(result. line, color='white', linestyle='--', linewidth=2, label=f"Line ({result.line})")
+    ax.axvline(result.line, color='white', linestyle='--', linewidth=2, label=f"Line ({result.line})")
     ax.axvline(projection.final_projection, color='yellow', linestyle='-', linewidth=2, label=f"Proj ({projection.final_projection:.1f})")
-    ax.axvspan(simulation.ci_10, simulation.ci_90, alpha=0.2, color='white', label='90% CI')
+    ax.axvspan(simulation.ci_10, simulation.ci_90, alpha=0.2, color='white', label='80% MC Interval (P10-P90)')
     ax.legend(loc='upper right', fontsize=8)
     ax.set_yticks([])
     ax.set_xlabel(result.market)
-    ax.set_title('Probability Distribution (CDF-based)', fontsize=10, pad=10)
+    ax.set_title('10,000-Trial Monte Carlo Distribution (Split-Normal + Blowout/Foul Regimes)', fontsize=10, pad=10)
     plt.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
 
-
-def render_backtest_tab(orchestrator):
-    """Render compact backtesting tab with Form Optimization & Bug Fixes."""
-    st.markdown("###  Model Backtest")
-    
-    #  START FORM
-    with st.form(key='backtest_form'):
-        col1, col2, col3 = st.columns([2, 1, 1])
-        with col1:
-            # Use the cached player loader we added earlier
-            all_players = get_all_nba_players() 
-            player_names = sorted([p['full_name'] for p in all_players if p.get('is_active', True)])
-            bt_player = st.selectbox("Player", player_names, index=None, placeholder="Search...", key="bt_player")
-        with col2:
-            bt_market = st.selectbox("Market", ["PTS", "REB", "AST", "PRA", "RA"], key="bt_market")
-        with col3:
-            bt_days = st.number_input("Games", 10, 50, 30, key="bt_days")
-        
-        with st.expander(" Advanced", expanded=False):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                bt_lookback = st.slider("Lookback", 5, 20, 15, key="bt_lookback")
-            with c2:
-                bt_offset = st.number_input("Line Offset", -10.0, 10.0, 0.0, 0.5, key="bt_offset")
-            with c3:
-                bt_spread = st.number_input("Spread", -20.0, 20.0, 0.0, 0.5, key="bt_spread")
-        
-        submitted = st.form_submit_button(" Run Backtest", type="primary")
-
-    #  LOGIC EXECUTION
-    if submitted:
-        if not bt_player:
-            st.error("Please select a player to backtest.")
-        else:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            def update_progress(pct):
-                progress_bar.progress(pct)
-                status_text.text(f"Processing... {pct:.0%}")
-            
-            with st.spinner(f"Running backtest for {bt_player}..."):
-                summary = orchestrator.run_backtest(
-                    player_name=bt_player,
-                    market=bt_market,
-                    lookback=bt_lookback,
-                    test_days=bt_days,
-                    line_offset=bt_offset,
-                    fixed_spread=bt_spread,
-                    progress_callback=update_progress
-                )
-            
-            progress_bar.empty()
-            status_text.empty()
-            
-            if summary is None:
-                st.error("Backtest failed - insufficient data.")
-            else:
-                # Save to session state so it survives refreshes
-                st.session_state['last_backtest_summary'] = summary
-
-    #  RESULTS DISPLAY (Persists via session state)
-    if 'last_backtest_summary' in st.session_state:
-        summary = st.session_state['last_backtest_summary']
-        
-        # Safety Check: Ensure the dataframe isn't empty before accessing it
-        if summary.results_df is None or summary.results_df.empty:
-            st.warning("No results to display.")
-            return
-
-        #  FIX 1: Get player name safely from the DATAFRAME, not the widget
-        try:
-            safe_player_name = summary.results_df['player'].iloc[0]
-        except:
-            safe_player_name = "Backtest_Result"
-            
-        st.success(f" {summary.total_predictions} predictions analyzed for {safe_player_name}")
-        
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Win Rate", f"{summary.win_rate:.0%}")
-        c2.metric("ROI", f"{summary.roi:+.1%}")
-        c3.metric("Brier", f"{summary.brier_score:.3f}")
-        c4.metric("Record", f"{summary.wins}-{summary.losses}")
-        
-        with st.expander(" Detailed Results", expanded=True):
-            if summary.calibration_by_bucket:
-                st.markdown("**Calibration:**")
-                cal_data = []
-                for bucket, data in summary.calibration_by_bucket.items():
-                    cal_data.append({
-                        'Bucket': bucket,
-                        'Pred': f"{data['predicted']:.0%}",
-                        'Actual': f"{data['actual']:.0%}",
-                        'N': data['count'],
-                    })
-                #  FIX 2: Replace use_container_width with width="stretch"
-                st.dataframe(pd.DataFrame(cal_data), hide_index=True, width="stretch")
-            
-            if summary.grade_performance:
-                st.markdown("**By Grade:**")
-                grade_data = []
-                for grade, data in summary.grade_performance.items():
-                    grade_data.append({
-                        'Grade': grade,
-                        'N': data['count'],
-                        'Win%': f"{data['win_rate']:.0%}",
-                        'ROI': f"{data['roi']:+.1%}"
-                    })
-                #  FIX 2: Replace use_container_width with width="stretch"
-                st.dataframe(pd.DataFrame(grade_data), hide_index=True, width="stretch")
-            
-            #  FIX 2: Replace use_container_width with width="stretch"
-            st.dataframe(summary.results_df, hide_index=True, width="stretch")
-            
-            csv = summary.results_df.to_csv(index=False)
-            #  FIX 1: Use the safe_player_name variable we created above
-            st.download_button(
-                " Download CSV", 
-                csv, 
-                f"backtest_{safe_player_name.replace(' ', '_')}.csv", 
-                "text/csv"
-            )
-
-def load_watchlist():
-    if WATCHLIST_FILE.exists():
-        try:
-            with open(WATCHLIST_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            return []
-    return []
-
-def save_watchlist(data):
-    try:
-        with open(WATCHLIST_FILE, 'w') as f:
-            json.dump(data, f, indent=4)
-    except Exception as e:
-        st.error(f"Failed to save watchlist: {e}")
-
-@st.cache_data(ttl=600, show_spinner=False)
-def get_cached_watchlist_stats(player_id: int, market: str, line: float, _loader) -> dict:
-    try:
-        time.sleep(0.6)
-        df = _loader.fetch_game_logs(player_id)
-        if df.empty or market not in df.columns: 
-            return None
-        
-        recent = df.tail(15)
-        ema = recent[market].ewm(span=len(recent), adjust=False).mean().iloc[-1]
-        l5_hit_rate = (df.tail(5)[market] > line).mean()
-        
-        return {"ema": ema, "l5_hit_rate": l5_hit_rate, "valid": True}
-    except:
-        return None
-
-def render_watchlist_tab(orchestrator):
-    """
-    Optimized Watchlist: 
-    1. Uses st.form to batch inputs (No more refreshing while typing).
-    2. Uses cached helper to calculate stats (No more freezing).
-    """
-    st.markdown("###  Watchlist")
-    
-    # --- LOAD DATA ---
-    if 'watchlist' not in st.session_state:
-        st.session_state.watchlist = load_watchlist()
-
-    # --- SECTION 1: ADD PLAYER (OPTIMIZED) ---
-    with st.container(border=True):
-        st.caption("Add to Watchlist")
-        
-        #  THE FIX: Wrapping inputs in a form stops the "Triple Reload"
-        with st.form(key="add_watchlist_form", clear_on_submit=True):
-            c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
-            
-            with c1:
-                all_players = get_all_nba_players()
-                active_players = [p['full_name'] for p in all_players if p.get('is_active', True)]
-                # Note: We load the list once. Streamlit handles the search UI efficiently.
-                target_player = st.selectbox("Player", active_players, index=None, placeholder="Search Name...")
-            
-            with c2:
-                target_market = st.selectbox("Stat", ["PTS", "REB", "AST", "PRA", "RA"])
-                
-            with c3:
-                target_line = st.number_input("Line", 0.5, 100.0, 15.5, 0.5)
-
-            with c4:
-                st.write(" ")  # Spacer for alignment (non-empty for accessibility)
-                # The form only submits when this is clicked
-                submit_add = st.form_submit_button("Add ", use_container_width="stretch")
-
-        # Logic runs ONLY on submit
-        if submit_add:
-            if target_player:
-                # Check for duplicates
-                if not any(x['player'] == target_player and x['market'] == target_market for x in st.session_state.watchlist):
-                    import uuid
-                    st.session_state.watchlist.append({
-                        'id': str(uuid.uuid4())[:8],
-                        'player': target_player, 
-                        'market': target_market, 
-                        'line': target_line,
-                        'added_date': datetime.now().strftime("%Y-%m-%d")
-                    })
-                    save_watchlist(st.session_state.watchlist)
-                    st.rerun()
-            else:
-                st.warning(" Please select a player.")
-
-    # --- SECTION 2: VIEW LIST ---
-    if not st.session_state.watchlist:
-        st.info("Watchlist empty.")
-    else:
-        st.write("---")
-        h1, h2, h3, h4 = st.columns([2, 1, 2, 0.5])
-        h1.caption("Player")
-        h2.caption("Target Line")
-        h3.caption("Trends (Cached )")
-        
-        # Create a copy to iterate safely
-        current_list = st.session_state.watchlist.copy()
-        
-        for i, item in enumerate(current_list):
-            item_id = item.get('id', str(i))
-            
-            with st.container(border=True):
-                c1, c2, c3, c4 = st.columns([2, 1, 2, 0.5])
-                
-                with c1:
-                    st.subheader(item['player'])
-                    st.caption(f"**{item['market']}**")
-                
-                with c2:
-                    # Note: Changing this DOES trigger a reload, which is good! 
-                    # We want to see the new offset immediately.
-                    # Because stats are cached, the reload will be instant.
-                    new_line = st.number_input(
-                        "Line", 
-                        value=float(item.get('line', 10.5)), 
-                        step=0.5, 
-                        key=f"wl_line_{item_id}",
-                        label_visibility="collapsed"
-                    )
-                    
-                    # Save if changed
-                    if new_line != item.get('line'):
-                        st.session_state.watchlist[i]['line'] = new_line
-                        save_watchlist(st.session_state.watchlist)
-
-                with c3:
-                    #  CACHED LOOKUP (Fast)
-                    p_obj = next((p for p in all_players if p['full_name'] == item['player']), None)
-                    
-                    if p_obj:
-                        stats = get_cached_watchlist_stats(
-                            player_id=p_obj['id'], 
-                            market=item['market'], 
-                            line=new_line,
-                            _loader=orchestrator.data_loader # Pass loader for data access
-                        )
-                        
-                        if stats and stats['valid']:
-                            # Visuals
-                            ema = stats['ema']
-                            offset = ema - new_line
-                            off_color = "green" if offset > 0 else "red"
-                            off_sym = "" if offset > 0 else ""
-                            
-                            l5 = stats['l5_hit_rate']
-                            if l5 >= 0.8: icon, color = "", "green"
-                            elif l5 >= 0.6: icon, color = "", "green"
-                            elif l5 >= 0.4: icon, color = "", "orange"
-                            else: icon, color = "", "red"
-
-                            st.markdown(f"**EMA:** {ema:.1f} :{off_color}[{offset:+.1f}{off_sym}]")
-                            st.markdown(f"**L5:** :{color}[{l5:.0%}] {icon}")
-                        else:
-                            st.caption("Need more data")
-                    else:
-                        st.caption("Player ID not found")
-
-                with c4:
-                    # Accessibility: provide a hidden label instead of empty string
-                    if st.button("Remove watchlist item", key=f"del_{item_id}"):
-                        st.session_state.watchlist.pop(i)
-                        save_watchlist(st.session_state.watchlist)
-                        st.rerun()
-
-def render_parlay_tab(parlay_tracker: ParlayTracker, bankroll: float, bankroll_enabled: bool = True):
-    """Render compact parlay tab."""
-    st.markdown("###  Parlay Builder")
-    
-    if not bankroll_enabled:
-        st.info(" **Data Collection Mode**  Parlay stakes disabled. Toggle Bankroll Mode in sidebar to enable.")
-    
-    builder = st.session_state.get('parlay_builder', [])
-    
-    if builder:
-        combined_odds, combined_prob = 1.0, 1.0
-        for leg in builder: 
-            combined_odds *= leg['odds']
-            combined_prob *= leg['prob']
-        
-        for i, leg in enumerate(builder):
-            with st.container(border=True):
-                c1, c2 = st.columns([5, 1])
-                c1.markdown(f"**{leg['player']}** {leg['side']} {leg['line']} @ {leg['odds']:.2f}")
-                if c2.button("", key=f"remove_leg_{i}"):
-                    st.session_state.parlay_builder.pop(i)
-                    st.rerun()
-        
-        # Multivariate Correlated SGP Monte Carlo simulation
-        from simulation_engine import SimulationEngine
-        sim_engine = SimulationEngine()
-        sim_res = sim_engine.simulate_correlated_parlay(builder)
-        joint_prob = sim_res.get("joint_prob", combined_prob)
-        ind_prob = sim_res.get("independent_prob", combined_prob)
-        corr_edge = sim_res.get("correlation_edge_pct", 0.0)
-        fair_odds = sim_res.get("fair_decimal_odds", 1.0 / max(joint_prob, 1e-4))
-        parlay_ev = (joint_prob * combined_odds - 1.0) * 100
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Book Odds", f"{combined_odds:.2f}")
-        c2.metric("SGP Joint Prob", f"{joint_prob:.1%}", help="Cholesky Multivariate Monte Carlo Joint Win Probability")
-        c3.metric("Fair Odds", f"{fair_odds:.2f}")
-        c4.metric("Parlay EV", f"{parlay_ev:+.1f}%", delta=f"{corr_edge:+.1f}% corr")
-
-        if len(builder) >= 2:
-            if corr_edge > 2.0:
-                st.success(f"🔥 **Positive Synergy!** Correlated legs boost true win prob by **{corr_edge:+.1f}%** over bookmaker assumption.")
-            elif corr_edge < -2.0:
-                st.warning(f"⚠️ **Cannibalization Drag!** Correlated legs reduce joint prob by **{corr_edge:.1f}%** below naive multiplication.")
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            if bankroll_enabled and bankroll > 0:
-                parlay_stake = st.number_input("Stake", 10.0, float(bankroll), 50.0, 10.0, key="parlay_stake")
-            else:
-                parlay_stake = 0.0
-                st.caption(" Stake tracking disabled")
-        with c2:
-            parlay_name = st.text_input("Name", placeholder="Optional...", key="parlay_name")
-        
-        c1, c2 = st.columns(2)
-        if c1.button(" Create", type="primary", use_container_width="stretch"):
-            parlay_tracker.create_parlay(legs=builder.copy(), stake=parlay_stake, name=parlay_name)
-            st.session_state.parlay_builder = []
-            st.toast("Parlay created!")
-            st.rerun()
-        if c2.button(" Clear", use_container_width="stretch"):
-            st.session_state.parlay_builder = []
-            st.rerun()
-    else:
-        st.info("Add legs from Analyze tab.")
-    
-    # History
-    with st.expander(" History", expanded=False):
-        stats = parlay_tracker.get_stats()
-        if stats['total_parlays'] > 0:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Win%", f"{stats['win_rate']:.0%}")
-            c2.metric("P/L", f"{stats['total_profit']:+,.0f}")
-            c3.metric("Legs", f"{stats['total_legs_hit']}/{stats['total_legs']}")
-        
-        parlays = parlay_tracker.get_parlays()
-        for parlay in sorted(parlays, key=lambda x: x['id'], reverse=True):
-            result = parlay['result']
-            icon = "" if result == 'Win' else "" if result == 'Loss' else ""
-            
-            with st.container(border=True):
-                col1, col2, col3 = st.columns([3, 1, 0.5])
-                with col1:
-                    parlay_name = parlay.get('name') or f"#{parlay['id']}"
-                    st.markdown(f"{icon} **{parlay_name}** ({parlay['num_legs']})")
-                    st.caption(f"{parlay['stake']:.0f} @ {parlay['combined_odds']:.2f}")
-                with col2:
-                    if result == 'Win': 
-                        st.markdown(f"**+{parlay['actual_payout'] - parlay['stake']:,.0f}**")
-                    elif result == 'Loss':
-                        st.markdown(f"**-{parlay['stake']:,.0f}**")
-                    else:
-                        st.markdown(f"*{parlay['potential_profit']:,.0f}*")
-                with col3:
-                    # Accessibility: give button a descriptive (hidden) label
-                    if st.button("Delete parlay", key=f"del_parlay_{parlay['id']}"):
-                        parlay_tracker.delete_parlay(parlay['id'])
-                        st.rerun()
-                
-                with st.expander(f"Legs ({parlay['legs_hit']}/{parlay['legs_decided']})"):
-                    for i, leg in enumerate(parlay['legs']):
-                        leg_result = leg.get('result', 'Pending')
-                        leg_icon = "" if leg_result == 'Win' else "" if leg_result == 'Loss' else "" if leg_result == 'Push' else ""
-                        
-                        c1, c2 = st.columns([4, 1])
-                        c1.markdown(f"{leg_icon} {leg['player']} {leg['side']} {leg['line']}")
-                        new_result = c2.selectbox(
-                            "Result", ["Pending", "Win", "Loss", "Push"],
-                            index=["Pending", "Win", "Loss", "Push"].index(leg_result),
-                            key=f"leg_{parlay['id']}_{i}",
-                            label_visibility="collapsed"
-                        )
-                        if new_result != leg_result:
-                            parlay_tracker.update_leg_result(parlay['id'], i, new_result)
-                            st.rerun()
-        
-        if st.button(" Clear All", key="clear_parlays"):
-            parlay_tracker.clear_history()
-            st.rerun()
-
-
-def render_ml_data_tab(tracker: Tracker):
-    """Render enhanced ML data tab with better preview."""
-    st.markdown("###  ML Training Data")
-    
-    from persistence_utils import load_ml_training_data
-    parquet_path = DATA_DIR / "ml_training_data.parquet"
-    csv_path = DATA_DIR / "ml_training_data.csv"
-    has_data = parquet_path.exists() or csv_path.exists()
-    
-    # =========================================================================
-    # SECTION 1: THEORETICAL PERFORMANCE (The Math - from Parquet/CSV)
-    # =========================================================================
-    with st.expander(" Theoretical Performance (The Math)", expanded=False):
-        st.caption("Based on simulation data from ml_training_data.parquet / .csv")
-        
-        if has_data:
-            try:
-                csv_df = load_ml_training_data(DATA_DIR)
-                skipped_warning = False
-                
-                # Quick check for corruption
-                try:
-                    with open(csv_path, 'r', encoding='utf-8') as f:
-                        raw_line_count = sum(1 for _ in f)
-                    if raw_line_count > len(csv_df) + 10:
-                        skipped_warning = True
-                        st.warning(f" CSV has {raw_line_count - len(csv_df) - 1} corrupted rows. Click 'Repair CSV' below.")
-                except:
-                    pass
-                
-                if 'hit' in csv_df.columns:
-                    total_sim_bets = len(csv_df)
-                    sim_wins = int(csv_df['hit'].sum())
-                    sim_losses = total_sim_bets - sim_wins
-                    sim_win_rate = sim_wins / total_sim_bets if total_sim_bets > 0 else 0
-                    
-                    # --- Theoretical Win Rate (Raw) ---
-                    # Standard -110 odds = 1.91 decimal
-                    sim_units_won = sim_wins * 0.91
-                    sim_units_lost = sim_losses * 1.0
-                    sim_net_units = sim_units_won - sim_units_lost
-                    sim_roi = (sim_net_units / total_sim_bets * 100) if total_sim_bets > 0 else 0
-                    
-                    # --- Quality Units: Offset Rule (V16) ---
-                    # Rule 1 (Offset) alone gives +2.8% ROI - this is the key filter
-                    if 'projected_value' in csv_df.columns:
-                        # For OVER: projection > line. For UNDER: projection < line
-                        def check_offset(row):
-                            if row['predicted_side'] == 'OVER':
-                                return row['projected_value'] > row['line']
-                            else:
-                                return row['projected_value'] < row['line']
-                        csv_df['passes_offset'] = csv_df.apply(check_offset, axis=1)
-                        quality_df = csv_df[csv_df['passes_offset']]
-                    else:
-                        quality_df = csv_df[csv_df['predicted_prob'] > 0.55] if 'predicted_prob' in csv_df.columns else pd.DataFrame()
-                    
-                    if len(quality_df) > 0:
-                        quality_total = len(quality_df)
-                        quality_wins = int(quality_df['hit'].sum())
-                        quality_losses = quality_total - quality_wins
-                        quality_win_rate = quality_wins / quality_total if quality_total > 0 else 0
-                        quality_units_won = quality_wins * 0.91
-                        quality_units_lost = quality_losses * 1.0
-                        quality_net_units = quality_units_won - quality_units_lost
-                        quality_roi = (quality_net_units / quality_total * 100) if quality_total > 0 else 0
-                    else:
-                        quality_total = 0
-                        quality_win_rate = 0
-                        quality_net_units = 0
-                        quality_roi = 0
-                    
-                    # Display: Theoretical (Raw) vs Quality (Filtered)
-                    st.markdown("** Theoretical Win Rate (All Sim Bets)**")
-                    th_c1, th_c2, th_c3, th_c4 = st.columns(4)
-                    th_c1.metric("Total Samples", f"{total_sim_bets:,}")
-                    th_c2.metric("Win Rate", f"{sim_win_rate:.1%}")
-                    if sim_net_units >= 0:
-                        th_c3.metric("Net Units", f"+{sim_net_units:.1f}u")
-                    else:
-                        th_c3.metric("Net Units", f"{sim_net_units:.1f}u")
-                    th_c4.metric("ROI", f"{sim_roi:+.1f}%")
-                    
-                    st.markdown("---")
-                    st.markdown("** Quality Units (Offset Rule - V16)**")
-                    st.caption("Offset Rule: Only bet when projection agrees with side (53.8% win rate, +2.8% ROI)")
-                    q_c1, q_c2, q_c3, q_c4 = st.columns(4)
-                    q_c1.metric("Filtered Bets", f"{quality_total:,}")
-                    q_c2.metric("Win Rate", f"{quality_win_rate:.1%}")
-                    if quality_net_units >= 0:
-                        q_c3.metric("Quality Units", f"+{quality_net_units:.1f}u", delta="Offset rule applied")
-                    else:
-                        q_c3.metric("Quality Units", f"{quality_net_units:.1f}u", delta="Offset rule applied", delta_color="inverse")
-                    q_c4.metric("ROI", f"{quality_roi:+.1f}%")
-                else:
-                    st.info("CSV missing 'hit' column. Cannot calculate theoretical performance.")
-                
-                # Repair button
-                if skipped_warning:
-                    if st.button(" Repair CSV", type="primary"):
-                        clean_df = pd.read_csv(csv_path, on_bad_lines='skip')
-                        backup_path = DATA_DIR / "ml_training_data_backup.csv"
-                        import shutil
-                        shutil.copy(csv_path, backup_path)
-                        clean_df.to_csv(csv_path, index=False)
-                        st.success(f" Repaired! Kept {len(clean_df):,} valid rows. Backup saved to {backup_path.name}")
-                        st.rerun()
-                    
-            except Exception as e:
-                st.warning(f"Could not read CSV file: {e}")
-        else:
-            st.info(" No training data file found. Generate data using backtest or track bets to create one.")
-    
-    # =========================================================================
-    # SECTION 2: REAL PERFORMANCE (The Human - from tracker.history ONLY)
-    # =========================================================================
-    with st.expander(" Real Performance (Your Actual Bets)", expanded=True):
-        st.caption("Based on YOUR tracked bets in bet_tracker.json - this is what actually happened")
-        
-        tracker_bets = tracker.get_bets()
-        # Only consider bets where a positive stake was placed for "Real Performance"
-        decided_bets = [b for b in tracker_bets if b.get('result') in ['Win', 'Loss'] and float(b.get('stake', 0) or 0) > 0]
-
-        if len(decided_bets) > 0:
-            real_wins = len([b for b in decided_bets if b.get('result') == 'Win'])
-            real_losses = len([b for b in decided_bets if b.get('result') == 'Loss'])
-            real_total = real_wins + real_losses
-            real_win_rate = real_wins / real_total if real_total > 0 else 0
-            
-            # Calculate real units (using actual odds from tracked bets)
-            real_units_profit = 0
-            for bet in decided_bets:
-                # Get decimal odds - check both 'odds_decimal' (new) and 'odds' (legacy)
-                odds = bet.get('odds_decimal', bet.get('odds', 1.91))
-                # Handle edge case where odds might be in American format (negative or >= 100)
-                if odds < 0 or odds >= 100:
-                    odds = american_to_decimal(odds)
-                if bet.get('result') == 'Win':
-                    real_units_profit += (odds - 1)  # Win pays (odds - 1) units
-                else:
-                    real_units_profit -= 1  # Loss costs 1 unit
-            
-            real_roi = (real_units_profit / real_total * 100) if real_total > 0 else 0
-            
-            # Display real performance metrics
-            r_c1, r_c2, r_c3, r_c4 = st.columns(4)
-            r_c1.metric("Your Bets", f"{real_total:,}")
-            r_c2.metric("Win Rate", f"{real_win_rate:.1%}")
-            if real_units_profit >= 0:
-                r_c3.metric("Net Units", f"+{real_units_profit:.1f}u", delta="Real $$$")
-            else:
-                r_c3.metric("Net Units", f"{real_units_profit:.1f}u", delta="Real $$$", delta_color="inverse")
-            r_c4.metric("ROI", f"{real_roi:+.1f}%")
-            
-            # Show pending count
-            pending_bets = [b for b in tracker_bets if b.get('result', 'Pending') == 'Pending']
-            if len(pending_bets) > 0:
-                st.caption(f" {len(pending_bets)} pending bets awaiting results")
-            
-            # Real performance chart (cumulative units over time)
-            st.markdown("** Cumulative Units Over Time**")
-            
-            # Sort by date and calculate cumulative units
-            chart_data = []
-            cumulative = 0
-            sorted_bets = sorted(decided_bets, key=lambda x: x.get('date', ''))
-            
-            for bet in sorted_bets:
-                # Get decimal odds - check both 'odds_decimal' (new) and 'odds' (legacy)
-                odds = bet.get('odds_decimal', bet.get('odds', 1.91))
-                # Handle American format if needed
-                if odds < 0 or odds >= 100:
-                    odds = american_to_decimal(odds)
-                if bet.get('result') == 'Win':
-                    cumulative += (odds - 1)
-                else:
-                    cumulative -= 1
-                chart_data.append({
-                    'date': bet.get('date', 'Unknown'),
-                    'units': cumulative,
-                    'player': bet.get('player_name', bet.get('player', 'Unknown')),
-                    'result': bet.get('result')
-                })
-            
-            if chart_data:
-                chart_df = pd.DataFrame(chart_data)
-                # Color based on positive/negative
-                line_color = "#00ff00" if cumulative >= 0 else "#ff4444"
-                st.line_chart(chart_df.set_index('date')['units'], color=line_color)
-        else:
-            st.info(" No decided bets yet. Track bets and update their results to see your real performance.")
-    
-    # =========================================================================
-    # SECTION 2.5: RETRAIN RECOMMENDATION
-    # =========================================================================
-    with st.expander(" Retrain Recommendation", expanded=True):
-        retrain_rec = tracker.get_retrain_recommendation()
-        
-        r1, r2, r3 = st.columns(3)
-        r1.metric("Sample Size", f"{retrain_rec['sample_size']} bets")
-        r2.metric("Win Rate", f"{retrain_rec['win_rate']*100:.1f}%")
-        
-        if retrain_rec['days_since_retrain'] is not None:
-            r3.metric("Days Since Retrain", retrain_rec['days_since_retrain'])
-        else:
-            r3.metric("Days Since Retrain", "N/A")
-        
-        if retrain_rec['should_retrain']:
-            st.warning(f"⚠️ **RETRAIN RECOMMENDED:** {retrain_rec['reason']}")
-            if st.button(" Mark Retrain Complete"):
-                tracker.mark_retrain_complete()
-                st.success("Retrain marked complete!")
-                st.rerun()
-        else:
-            st.success(f"✅ **Model OK:** {retrain_rec['reason']}")
-    
-    st.markdown("---")
-    
-    feature_stats = tracker.get_feature_stats()
-    training_df = tracker.export_training_data()
-    
-    # Top-level stats
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Samples", feature_stats['total_with_features'])
-    c2.metric("Ready (W/L)", feature_stats['decided_with_features'])
-    c3.metric("Pending", feature_stats['pending_with_features'])
-    
-    if len(training_df) > 0:
-        win_rate = training_df['target'].mean() if 'target' in training_df.columns else 0
-        c4.metric("Win Rate", f"{win_rate:.0%}")
-        
-        # Data quality summary
-        with st.expander(" Data Quality Summary", expanded=False):
-            sq1, sq2, sq3 = st.columns(3)
-            
-            # Feature columns count
-            feat_cols = [c for c in training_df.columns if c.startswith('feat_')]
-            sq1.metric("Feature Columns", len(feat_cols))
-            
-            # Schema health diagnostics (compare live df to canonical ML_EXPORT_SCHEMA)
-            canonical_schema = ML_EXPORT_SCHEMA
-            present_schema_cols = [c for c in canonical_schema if c in training_df.columns]
-            missing_features = list(set(canonical_schema) - set(training_df.columns))
-            schema_completeness = (len(present_schema_cols) / len(canonical_schema)) * 100 if canonical_schema else 0
-
-            # Show schema completeness as a top-level metric
-            sq2.metric("Schema Completeness", f"{schema_completeness:.0f}% ({len(present_schema_cols)}/{len(canonical_schema)})")
-
-            # Date range
-            if 'timestamp' in training_df.columns:
-                try:
-                    dates = pd.to_datetime(training_df['timestamp'])
-                    sq3.metric("Date Range", f"{dates.min().strftime('%m/%d')} - {dates.max().strftime('%m/%d')}")
-                except:
-                    sq3.metric("Date Range", "N/A")
-            else:
-                sq3.metric("Date Range", "N/A")
-
-            # If there are missing canonical columns, surface a clear warning & explanation
-            if missing_features:
-                # Prefer listing only canonical feature names to avoid overwhelming the user
-                missing_list = ', '.join(sorted(missing_features))
-                st.warning(f"Missing {len(missing_features)} canonical columns: {missing_list}")
-                st.caption("These features are present in the CSV generator but missing from historical tracked bets.")
-
-            # Avg margin if available
-            if 'margin' in training_df.columns:
-                avg_margin = training_df['margin'].mean()
-                # If schema is incomplete, display avg margin but add a small note
-                if missing_features:
-                    sq3.metric("Avg Margin", f"{avg_margin:+.1f}", delta="(Schema incomplete)")
-                else:
-                    sq3.metric("Avg Margin", f"{avg_margin:+.1f}")
-            else:
-                sq3.metric("Avg Margin", "N/A")
-            
-            # Result quality breakdown
-            if 'result_quality' in training_df.columns:
-                st.markdown("**Result Quality Breakdown:**")
-                quality_counts = training_df['result_quality'].value_counts()
-                
-                # Losses
-                loss_cols = st.columns(4)
-                loss_cols[0].write(f" Bad Beat: {quality_counts.get('bad_beat', 0)}")
-                loss_cols[1].write(f" Close Loss: {quality_counts.get('close_loss', 0)}")
-                loss_cols[2].write(f" Clear Loss: {quality_counts.get('clear_loss', 0)}")
-                loss_cols[3].write(f" Bad Read: {quality_counts.get('bad_read', 0)}")
-                
-                # Wins
-                win_cols = st.columns(4)
-                win_cols[0].write(f" Sweat Win: {quality_counts.get('sweat_win', 0)}")
-                win_cols[1].write(f" Close Win: {quality_counts.get('close_win', 0)}")
-                win_cols[2].write(f" Solid Win: {quality_counts.get('solid_win', 0)}")
-                win_cols[3].write(f" Blowout Win: {quality_counts.get('blowout_win', 0)}")
-        
-        # Tabbed data views
-        view_tab1, view_tab2, view_tab3 = st.tabs([" Summary", " Features", " Raw Data"])
-        
-        with view_tab1:
-            # Key columns for quick overview
-            summary_cols = ['player', 'market', 'line', 'side', 'result', 'margin', 'result_quality', 'feat_prob', 'feat_ev']
-            display_cols = [c for c in summary_cols if c in training_df.columns]
-            if display_cols:
-                st.dataframe(safe_clean_for_arrow(training_df[display_cols].tail(20)), hide_index=True, width="stretch")
-            else:
-                st.info("No summary columns available")
-        
-        with view_tab2:
-            # All feature columns
-            canonical_feat_cols = [c for c in ML_EXPORT_SCHEMA if c.startswith('feat_')]
-            present_feat_cols = [c for c in training_df.columns if c.startswith('feat_')]
-            missing_feat_cols = [c for c in canonical_feat_cols if c not in present_feat_cols]
-
-            # Prepare a display copy so we don't mutate the original DataFrame
-            display_df = training_df.copy()
-            if missing_feat_cols:
-                # Fill missing canonical columns with sentinel values for visibility (display-only)
-                for col in missing_feat_cols:
-                    try:
-                        display_df[col] = tracker._ml_column_sentinel(col)
-                    except Exception:
-                        # Fallback to NaN if sentinel helper unavailable
-                        display_df[col] = ''
-
-            # Build ordered columns: identifiers first, then canonical features
-            id_cols = ['player', 'market', 'result']
-            show_cols = [c for c in id_cols if c in display_df.columns] + [c for c in canonical_feat_cols if c in display_df.columns]
-
-            st.caption(f"Showing {len(present_feat_cols)} of {len(canonical_feat_cols)} canonical feature columns")
-
-            if missing_feat_cols:
-                st.warning(f"Missing {len(missing_feat_cols)} feature(s): {', '.join(sorted(missing_feat_cols))}")
-                st.caption("These features are present in the CSV generator but missing from historical tracked bets. Shown above with sentinel values for clarity.")
-
-            if show_cols:
-                st.dataframe(safe_clean_for_arrow(display_df[show_cols].tail(20)), hide_index=True, width="stretch")
-            else:
-                st.info("No feature columns found")
-        
-        with view_tab3:
-            # Full raw data with column count
-            st.caption(f"All {len(training_df.columns)} columns  {len(training_df)} rows")
-            st.dataframe(safe_clean_for_arrow(training_df.tail(30)), hide_index=True, width="stretch")
-        
-        # Download buttons
-        st.markdown("---")
-        dc1, dc2, dc3 = st.columns(3)
-        csv_data = training_df.to_csv(index=False)
-        dc1.download_button(" Download CSV", csv_data, "ml_training_data.csv", "text/csv", use_container_width="stretch")
-        json_data = training_df.to_json(orient='records', indent=2)
-        dc2.download_button(" Download JSON", json_data, "ml_training_data.json", "application/json", use_container_width="stretch")
-        
-        # Show column list
-        with dc3:
-            if st.button(" Show Columns", use_container_width="stretch"):
-                st.session_state['show_ml_cols'] = not st.session_state.get('show_ml_cols', False)
-        
-        if st.session_state.get('show_ml_cols', False):
-            with st.expander("Available Columns", expanded=True):
-                cols_by_type = {
-                    'Identifiers': [c for c in training_df.columns if c in ['id', 'player', 'market', 'opponent', 'timestamp']],
-                    'Bet Info': [c for c in training_df.columns if c in ['line', 'odds', 'side', 'stake', 'result', 'closing_line', 'actual_value', 'margin', 'result_quality']],
-                    'Targets': [c for c in training_df.columns if c.startswith('target')],
-                    'Features': [c for c in training_df.columns if c.startswith('feat_')]
-                }
-                for cat, cols in cols_by_type.items():
-                    if cols:
-                        st.markdown(f"**{cat}:** `{'`, `'.join(cols)}`")
-        
-        st.caption(f" Need 100-200+ samples for XGBoost. Currently: {feature_stats['decided_with_features']}")
-    else: 
-        c4.metric("Win Rate", "N/A")
-        st.info("Track bets to collect training data. Log bets with the  Track button after analysis.")
-
-
-def validate_training_data(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Comprehensive data quality validation for ML training data.
-    Returns a dict with validation results and issues found.
-    """
-    issues = []
-    warnings = []
-    stats = {}
-    
-    # 1. Basic stats
-    stats['total_rows'] = len(df)
-    stats['unique_players'] = df['player'].nunique() if 'player' in df.columns else 0
-    stats['unique_markets'] = df['market'].nunique() if 'market' in df.columns else 0
-    stats['date_range'] = f"{df['date'].min()} to {df['date'].max()}" if 'date' in df.columns else "N/A"
-    
-    # 2. Check for missing required columns
-    required_cols = ['hit', 'actual_value', 'line', 'predicted_side', 'player', 'market', 'date']
-    missing_required = [c for c in required_cols if c not in df.columns]
-    if missing_required:
-        issues.append(f"Missing required columns: {missing_required}")
-    
-    # 3. Check feature columns exist
-    feature_cols = [c for c in df.columns if c.startswith('feat_')]
-    stats['feature_count'] = len(feature_cols)
-    if len(feature_cols) < 30:
-        warnings.append(f"Only {len(feature_cols)} features found (expected 36+)")
-    
-    # 4. Check for missing values in features
-    if feature_cols:
-        null_counts = df[feature_cols].isnull().sum()
-        cols_with_nulls = null_counts[null_counts > 0]
-        if len(cols_with_nulls) > 0:
-            null_pct = (cols_with_nulls / len(df) * 100).to_dict()
-            warnings.append(f"Features with nulls: {null_pct}")
-        stats['null_feature_cols'] = len(cols_with_nulls)
-    
-    # 5. Validate hit label accuracy (critical!)
-    if all(c in df.columns for c in ['hit', 'actual_value', 'line', 'predicted_side']):
-        df_check = df.copy()
-        df_check['computed_hit'] = df_check.apply(
-            lambda r: 1 if (
-                (r['predicted_side'] == 'OVER' and r['actual_value'] > r['line']) or
-                (r['predicted_side'] == 'UNDER' and r['actual_value'] <= r['line'])
-            ) else 0, axis=1
-        )
-        mismatches = (df_check['hit'] != df_check['computed_hit']).sum()
-        stats['label_mismatches'] = mismatches
-        if mismatches > 0:
-            issues.append(f" {mismatches} rows ({mismatches/len(df)*100:.1f}%) have incorrect 'hit' labels!")
-    
-    # 6. Check for reasonable feature ranges (V20.3 STRICT - exact feature names with 27 features)
-    range_checks = {
-        'feat_avg_minutes': (10, 42),           # Player average minutes
-        'feat_opponent_drtg_season': (100, 125), # Team defensive rating (V20 exact name)
-        'feat_line': (0, 100),                  # Prop bet line
-        'feat_ema': (0, 100),                   # Player averages
-        'feat_std': (0, 30),                    # Standard deviation
-        'feat_is_home': (0, 1),                 # Binary
-        'feat_spread': (-25, 25),               # Point spread
-        'feat_game_total': (190, 270),          # Game total
-        'feat_games_played': (1, 300),          # Games in sample (V20.2: expanded to 300)
-        'feat_days_rest': (0, 14),              # Days since last game
-        'feat_is_b2b': (0, 1),                  # Binary
-        'feat_market_scoring': (0, 1),          # Binary
-        'feat_market_counting': (0, 1),         # Binary
-        'feat_market_combo': (0, 1),            # Binary
-
-        # V20.2: Pace and trend features
-        'feat_opponent_pace': (90, 115),        # Possessions per game
-        'feat_team_pace': (90, 115),            # Possessions per game
-        'feat_trend_5g': (-5, 5),               # Linear slope (can be negative)
-        'feat_home_avg': (0, 100),              # Home game average
-        'feat_away_avg': (0, 100),              # Away game average
-        # V20.3 NEW: True-Shot features
-        'feat_ts_pct': (-1, 1),                 # TS% fraction (-1 = unknown)
-        'feat_ts_pct_delta': (-1, 1),           # Delta between rolling and season TS%
-        # V20.3 NEW: Absence-aware features (-1 sentinel = unknown)
-        'feat_team_out_ppg': (-1, 100),         # PPG of teammates out (-1 = unknown)
-        'feat_team_out_count': (-1, 15),        # Count of teammates out (-1 = unknown)
-        'feat_opp_out_ppg': (-1, 100),          # PPG of opponents out (-1 = unknown)
-        'feat_opp_out_count': (-1, 15),         # Count of opponents out (-1 = unknown)
-        # V20.3 NEW: Behavior & Risk ranges (allow -1 sentinel for unknown)
-        'feat_min_volatility': (-1, 20),         # Rolling std of minutes
-        'feat_foul_rate': (-1, 6),               # Rolling mean of PF per game
-        'feat_cv': (-1, 5),                      # Coef. of var (std/ema)
-    }
-    
-    out_of_range = []
-    for col, (min_val, max_val) in range_checks.items():
-        if col in df.columns:
-            below = (df[col] < min_val).sum()
-            above = (df[col] > max_val).sum()
-            if below > 0 or above > 0:
-                out_of_range.append(f"{col}: {below} below {min_val}, {above} above {max_val}")
-    
-    if out_of_range:
-        warnings.append(f"Values outside expected ranges: {out_of_range[:5]}")  # Show first 5
-    
-    # 7. Check class balance
-    if 'hit' in df.columns:
-        hit_rate = df['hit'].mean()
-        stats['overall_hit_rate'] = hit_rate
-        if hit_rate < 0.35 or hit_rate > 0.65:
-            warnings.append(f"Class imbalance: {hit_rate:.1%} hit rate (expected 40-60%)")
-    
-    # 8. Check for duplicate rows
-    if all(c in df.columns for c in ['date', 'player', 'market', 'line']):
-        dupes = df.duplicated(subset=['date', 'player', 'market', 'line']).sum()
-        stats['duplicates'] = dupes
-        if dupes > 0:
-            warnings.append(f"{dupes} duplicate rows found")
-    
-    # 9. Market distribution
-    if 'market' in df.columns:
-        market_dist = df['market'].value_counts().to_dict()
-        stats['market_distribution'] = market_dist
-        min_market = min(market_dist.values())
-        if min_market < 100:
-            warnings.append(f"Some markets have few samples: {min_market}")
-    
-    # 10. Temporal distribution (check for data freshness)
-    if 'date' in df.columns:
-        df['date_parsed'] = pd.to_datetime(df['date'], errors='coerce')
-        recent = (df['date_parsed'] >= pd.Timestamp.now() - pd.Timedelta(days=30)).sum()
-        stats['recent_30d_samples'] = recent
-        if recent < 50:
-            warnings.append(f"Only {recent} samples from last 30 days")
-    
-    return {
-        'valid': len(issues) == 0,
-        'issues': issues,
-        'warnings': warnings,
-        'stats': stats
-    }
-
-
-def render_train_model_tab():
-    from xgboost import XGBRegressor
-    from sklearn.isotonic import IsotonicRegression
-    """
-    V21.5 QUANTILE REGRESSION: Training UI.
-    
-    Trains 3 XGBRegressor models for quantiles 0.05, 0.50, 0.95.
-    - Removes Gaussian assumption (handles skewed player distributions)
-    - Wider 90% intervals fix overconfidence (old 80% only hit 78%)
-    - P(Over) calculated via interpolation, not CDF
-    """
-    st.markdown("### Train V21.5 Quantile Model")
-    st.info("""
-    **V21.5 CALIBRATED QUANTILE REGRESSION**: Wider 90% intervals fix overconfidence.
-    
-    **Calibration Fix:**
-    -  Old q10/q90 (80% target) → only 78% actual coverage = overconfident
-    -  **New q05/q95 (90% target) → properly calibrated probabilities**
-    -  No more betting big on "90% certainty" that only hits 78%
-    
-    **Benefits:**
-    -  Per-market models: PTS, REB, AST each get specialized quantile predictions
-    -  No Gaussian assumption - handles skewed player distributions
-    -  Backward compatible with old models (auto-detected)
-    """)
-    
-    # Check if data exists (Parquet or CSV)
-    from persistence_utils import load_ml_training_data
-    parquet_path = DATA_DIR / "ml_training_data.parquet"
-    csv_path = DATA_DIR / "ml_training_data.csv"
-    
-    if not parquet_path.exists() and not csv_path.exists():
-        st.error(" Training data not found.")
-        st.warning("**Action Required:** Go to 'Generate Dataset' tab and create a new dataset.")
-        return
-
-    # =========================================================================
-    # V20.3 STRICT SCHEMA - These canonical columns MUST exist exactly as named
-    # NO FALLBACKS. NO DEFAULTS. NO LEGACY MIGRATION.
-    # =========================================================================
-    V20_REQUIRED_FEATURES = TRAINING_FEATURE_COLUMNS.copy()  # Use canonical list (V20 features)
-    
-    V20_REQUIRED_TARGET = 'actual_value'  # Regression target (postgame stat)
-    
-    V20_REQUIRED_METADATA = ['player', 'market', 'line', 'date']
-
-    # Data Validation Section
-    st.markdown("####  V20.3 Schema Validation")
-    st.caption(f"Required features: {len(V20_REQUIRED_FEATURES)} (V20.3 empirical)")
-    
-    if st.button(" Validate Dataset", type="secondary"):
-        with st.spinner("Validating against V20.3 schema..."):
-            df = load_ml_training_data(DATA_DIR)
-            
-            # === STRICT VALIDATION ===
-            errors = []
-            
-            # 1. Check required features (NO inference, NO remapping)
-            missing_features = [f for f in V20_REQUIRED_FEATURES if f not in df.columns]
-            if missing_features:
-                errors.append(f" Missing V20.3 features ({len(missing_features)}): {', '.join(missing_features)}")
-            
-            # 2. Check regression target exists (NO fallback to classification)
-            if V20_REQUIRED_TARGET not in df.columns:
-                errors.append(f" Missing regression target: '{V20_REQUIRED_TARGET}'")
-            
-            # 3. Check metadata columns
-            missing_meta = [m for m in V20_REQUIRED_METADATA if m not in df.columns]
-            if missing_meta:
-                errors.append(f" Missing metadata: {', '.join(missing_meta)}")
-            
-            # 4. Detect legacy/heuristic columns (should NOT exist in V20 data)
-            legacy_columns = [
-                'feat_usage_mult', 'feat_rest_factor', 'feat_matchup_mult',
-                'feat_blowout_prob', 'feat_fatigue_mult', 'feat_position_mult',
-                'feat_opp_drtg_l5', 'feat_hit_rate_l5', 'feat_hit_rate_l10'
-            ]
-            found_legacy = [c for c in legacy_columns if c in df.columns]
-            if found_legacy:
-                errors.append(f" Legacy columns detected (invalid for V20): {', '.join(found_legacy)}")
-            
-            # === DISPLAY RESULTS ===
-            if errors:
-                st.error(" **Dataset is INVALID for V20.2 training**")
-                for err in errors:
-                    st.write(f"   {err}")
-                st.warning("**Action Required:** Regenerate dataset using V20.2 pipeline.")
-                st.caption("Go to 'Generate Dataset' tab  Run generation  Return here to train.")
-            else:
-                st.success(" **Dataset passes V20.3 schema validation**")
-                st.write(f"   Rows: {len(df):,}")
-                st.write(f"   Features: {len(V20_REQUIRED_FEATURES)} (all present)")
-                st.write(f"   Target: {V20_REQUIRED_TARGET}")
-                st.write(f"   Players: {df['player'].nunique()}")
-                st.write(f"   Markets: {df['market'].nunique()}")
-    
-    st.markdown("---")
-    
-    # =========================================================================
-    # V21.1 PER-MARKET TRAINING OPTIONS
-    # =========================================================================
-    st.markdown("####  Training Mode")
-    
-    training_mode = st.radio(
-        "Select training mode:",
-        options=["per_market", "universal"],
-        format_func=lambda x: " Per-Market Models (Recommended)" if x == "per_market" else " Universal Model (All markets)",
-        horizontal=True,
-        help="Per-market trains separate models for PTS, REB, AST, etc. Universal trains one model for all markets."
-    )
-    
-    # Market selection for per-market mode
-    all_markets = ['PTS', 'REB', 'AST', 'PRA', 'PR', 'PA', 'RA', '3PM', 'STL', 'BLK']
-    selected_markets = all_markets  # Default: all
-    
-    if training_mode == "per_market":
-        st.markdown("##### Select markets to train:")
-        col1, col2 = st.columns(2)
-        with col1:
-            select_all = st.checkbox("Select All Markets", value=True)
-        with col2:
-            min_samples = st.number_input("Min samples per market", min_value=50, value=100, step=50,
-                                          help="Markets with fewer samples will use universal fallback")
-        
-        if not select_all:
-            selected_markets = st.multiselect(
-                "Choose markets:",
-                options=all_markets,
-                default=['PTS', 'REB', 'AST', 'PRA'],
-                help="Hold Ctrl/Cmd to select multiple"
-            )
-    
-    st.markdown("---")
-    
-    if st.button(" Start Training", type="primary"):
-        status = st.status("Training in progress...", expanded=True)
-        try:
-            # 1. Load Data (High-performance Parquet preferred)
-            status.write("Loading dataset (preferring Parquet)...")
-            df = load_ml_training_data(DATA_DIR)
-            
-            # =========================================================
-            # V21.1 QUANTILE: Train q10, q50, q90 models
-            # NO LEGACY COMPATIBILITY - strict schema enforcement
-            # =========================================================
-            
-            # Check required features - ALL MUST EXIST
-            missing_features = [f for f in V20_REQUIRED_FEATURES if f not in df.columns]
-            if missing_features:
-                status.update(label=" Schema Validation Failed", state="error")
-                st.error(f"**FATAL:** Missing V20.3 features ({len(missing_features)}):")
-                for f in missing_features:
-                    st.write(f"   `{f}`")
-                st.warning("Dataset is incompatible with V20.3. Regenerate using 'Generate Dataset' tab.")
-                st.info("V20.3 requires 27 features. Your dataset may have an older schema.")
-                return
-            
-            # Check regression target (NO fallback to classification)
-            if V20_REQUIRED_TARGET not in df.columns:
-                status.update(label=" Schema Validation Failed", state="error")
-                st.error(f"**FATAL:** Missing regression target '{V20_REQUIRED_TARGET}'")
-                st.warning("V21 requires actual stat values for regression. Regenerate dataset.")
-                return
-            
-            status.write(f" Schema validation passed ({len(V20_REQUIRED_FEATURES)} features)")
-            
-            # XGBoost base params
-            # V21.6 REGULARISATION: Explicit complexity penalties + early stopping
-            # min_child_weight=5: prevents tiny leaves memorising rare players
-            # reg_alpha/lambda: L1+L2 penalty on leaf weights
-            # gamma: requires minimum loss reduction to split (structural regulariser)
-            # n_estimators is an upper bound — early stopping will halt before this
-            from hardware_utils import get_xgboost_hardware_params
-            # Load tuned GPU hyperparameters if available
-            market_gpu_params = {}
-            hp_path = Path("config/model_hyperparams.json")
-            if hp_path.exists():
-                try:
-                    with open(hp_path, "r", encoding="utf-8") as f:
-                        hp_cfg = json.load(f)
-                    if model_name in hp_cfg and isinstance(hp_cfg[model_name], dict):
-                        market_gpu_params = hp_cfg[model_name]
-                        st.caption(f"⚡ Loaded GPU-tuned hyperparameters for {model_name}")
-                except Exception:
-                    pass
-
-            base_params = get_xgboost_hardware_params({
-                'n_estimators': 500,
-                'learning_rate': 0.05,
-                'max_depth': 4,
-                'min_child_weight': 5,
-                'subsample': 0.8,
-                'colsample_bytree': 0.8,
-                'reg_alpha': 1.0,
-                'reg_lambda': 1.0,
-                'gamma': 0.1,
-                'random_state': 42,
-                'verbosity': 0,
-                **market_gpu_params,
-            })
-            
-            # V21.5 CALIBRATION FIX: Wider quantiles (90% interval)
-            # Old: [0.10, 0.50, 0.90] gave 78% coverage (underconfident)
-            # New: [0.05, 0.50, 0.95] targets 90% coverage (properly calibrated)
-            quantiles = [0.05, 0.50, 0.95]
-            quantile_names = ['q05', 'q50', 'q95']
-            
-            def _interpolate_prob(line, q_low, q50, q_high):
-                """V22: Split-normal CDF (matches ModelEngine fix)."""
-                z_val = 1.645  # wide quantiles (q05/q95)
-                if q_low >= q_high or q_high - q_low < 0.1:
-                    return 0.50
-                sigma_lower = max((q50 - q_low) / z_val, 0.1)
-                sigma_upper = max((q_high - q50) / z_val, 0.1)
-                if line <= q50:
-                    z = (line - q50) / sigma_lower
-                else:
-                    z = (line - q50) / sigma_upper
-                p_over = 1.0 - stats.norm.cdf(z)
-                return float(max(0.02, min(0.98, p_over)))
-
-            def train_quantile_models(X_train, y_train, X_test, y_test, model_name: str, lines_train=None, lines_test=None):
-                """Train q05/q50/q95 models + optional isotonic calibrator.
-
-                V21.6 UPGRADES:
-                - Early stopping: halts training when val RMSE stops improving (25 rounds)
-                - evals_result: captures train vs val RMSE per boosting round for learning curves
-                - Calibrator fitted on chronological val slice from training set (no test leakage)
-                """
-                from sklearn.model_selection import TimeSeriesSplit
-
-                quantile_models = {}
-                all_evals = {}  # {q_name: evals_result dict}
-                best_iters = {}  # record early-stop iteration per quantile
-
-                for q, name in zip(quantiles, quantile_names):
-                    evals_result = {}
-                    use_early_stop = (name == 'q50')
-                    params = {
-                        **base_params,
-                        'objective': 'reg:quantileerror',
-                        'quantile_alpha': q,
-                        'eval_metric': 'mae',
-                    }
-                    if use_early_stop:
-                        params['early_stopping_rounds'] = 25
-
-                    model = XGBRegressor(**params)
-                    model.fit(
-                        X_train, y_train,
-                        eval_set=[(X_train, y_train), (X_test, y_test)],
-                        verbose=False,
-                    )
-                    # Capture evals via booster
-                    try:
-                        evals_result = model.evals_result()
-                    except Exception:
-                        evals_result = {}
-                    quantile_models[name] = model
-                    all_evals[name] = evals_result
-                    best_iter = getattr(model, 'best_iteration', base_params['n_estimators'])
-                    best_iters[name] = best_iter
-                    logger.info(f"  {model_name}/{name}: {'early stop @' if use_early_stop else 'ran'} iter {best_iter}")
-
-                # Mark as wide quantile model for backward compat detection
-                quantile_models['_wide_quantile'] = True
-                # return full history so caller can plot/inspect
-                # Store learning curves for UI rendering
-                quantile_models['_evals_result'] = all_evals
-
-                # Evaluate on held-out TEST set
-                pred_05 = quantile_models['q05'].predict(X_test)
-                pred_50 = quantile_models['q50'].predict(X_test)
-                pred_95 = quantile_models['q95'].predict(X_test)
-
-                mae = mean_absolute_error(y_test, pred_50)
-                r2 = r2_score(y_test, pred_50)
-                in_interval = ((y_test >= pred_05) & (y_test <= pred_95)).mean()
-                coverage = in_interval * 100
-                avg_width = (pred_95 - pred_05).mean()
-
-                # === TIME-SERIES CROSS-VALIDATION (5 folds) ===
-                # Runs on median quantile (q50) only for speed.
-                # Fold MAEs tell us if the model generalises across seasons
-                # or just memorises the most recent one.
-                cv_mae_folds = []
-                try:
-                    tscv = TimeSeriesSplit(n_splits=5)
-                    X_cv = pd.concat([X_train, X_test])
-                    y_cv = pd.concat([y_train, y_test])
-                    for fold_train_idx, fold_val_idx in tscv.split(X_cv):
-                        fold_model = XGBRegressor(
-                            **base_params,
-                            objective='reg:quantileerror',
-                            quantile_alpha=0.50,
-                            eval_metric='mae',
-                            early_stopping_rounds=25,
-                        )
-                        Xf_tr, Xf_val = X_cv.iloc[fold_train_idx], X_cv.iloc[fold_val_idx]
-                        yf_tr, yf_val = y_cv.iloc[fold_train_idx], y_cv.iloc[fold_val_idx]
-                        fold_model.fit(
-                            Xf_tr, yf_tr,
-                            eval_set=[(Xf_val, yf_val)],
-                            verbose=False,
-                        )
-                        fold_pred = fold_model.predict(Xf_val)
-                        cv_mae_folds.append(mean_absolute_error(yf_val, fold_pred))
-                except Exception as e:
-                    logger.warning(f"CV failed for {model_name}: {e}")
-
-                cv_mae_mean = float(np.mean(cv_mae_folds)) if cv_mae_folds else None
-                cv_mae_std  = float(np.std(cv_mae_folds))  if cv_mae_folds else None
-
-                # === CALIBRATION (Isotonic Regression) ===
-                calibrator = None
-                cal_delta = 0.0
-
-                raw_probs_test = None
-                actual_over_test = None
-                if lines_test is not None and len(lines_test) == len(y_test):
-                    lines_arr_test = np.asarray(lines_test, dtype=float)
-                    raw_probs_test = np.array([
-                        _interpolate_prob(l, q05, q50, q95)
-                        for l, q05, q50, q95 in zip(lines_arr_test, pred_05, pred_50, pred_95)
-                    ])
-                    actual_over_test = (np.asarray(y_test, dtype=float) > lines_arr_test).astype(float)
-
-                if lines_train is not None and len(lines_train) == len(y_train):
-                    val_size = max(1, int(len(y_train) * 0.25))
-                    val_start = len(y_train) - val_size
-
-                    X_val = X_train.iloc[val_start:]
-                    y_val = y_train.iloc[val_start:]
-                    lines_val = np.asarray(lines_train[val_start:], dtype=float)
-
-                    pred_05_val = quantile_models['q05'].predict(X_val)
-                    pred_50_val = quantile_models['q50'].predict(X_val)
-                    pred_95_val = quantile_models['q95'].predict(X_val)
-
-                    raw_probs_val = np.array([
-                        _interpolate_prob(l, q05, q50, q95)
-                        for l, q05, q50, q95 in zip(lines_val, pred_05_val, pred_50_val, pred_95_val)
-                    ])
-                    actual_over_val = (np.asarray(y_val, dtype=float) > lines_val).astype(float)
-
-                    try:
-                        from model_engine import SigmoidCalibrator
-                        cal = SigmoidCalibrator(clip_min=0.01, clip_max=0.99)
-                        cal.fit(raw_probs_val, actual_over_val)
-                        calibrator = cal
-
-                        if raw_probs_test is not None and actual_over_test is not None:
-                            cal_probs = cal.predict(raw_probs_test)
-                            cal_delta = abs(cal_probs.mean() - actual_over_test.mean()) - abs(raw_probs_test.mean() - actual_over_test.mean())
-                    except Exception as e:
-                        logger.warning(f"Calibration fitting failed for {model_name}: {e}")
-
-                return quantile_models, calibrator, {
-                    'name': model_name,
-                    'samples': len(y_train) + len(y_test),
-                    'mae': mae,
-                    'r2': r2,
-                    'coverage': coverage,
-                    'avg_width': avg_width,
-                    'calibrated': calibrator is not None,
-                    'cal_delta': round(cal_delta, 4),
-                    'cv_mae_mean': round(cv_mae_mean, 4) if cv_mae_mean is not None else None,
-                    'cv_mae_std':  round(cv_mae_std,  4) if cv_mae_std  is not None else None,
-                    'evals_result': all_evals,
-                }, best_iters
-            
-            all_metrics = []
-            
-            if training_mode == "per_market":
-                # =========================================================
-                # PER-MARKET TRAINING
-                # =========================================================
-                status.write(f" Training per-market models for {len(selected_markets)} markets...")
-                
-                # Check market column exists
-                if 'market' not in df.columns:
-                    status.update(label=" Schema Validation Failed", state="error")
-                    st.error("**FATAL:** 'market' column not found in dataset")
-                    return
-                
-                trained_markets = []
-                skipped_markets = []
-                
-                for market in selected_markets:
-                    market_df = df[df['market'] == market]
-                    
-                    if len(market_df) < min_samples:
-                        status.write(f"   {market}: Skipping (only {len(market_df)} samples, need {min_samples})")
-                        skipped_markets.append((market, len(market_df)))
-                        continue
-                    
-                    status.write(f"   {market}: Training on {len(market_df)} samples...")
-                    
-                    # Prepare data
-                    X = market_df[V20_REQUIRED_FEATURES].apply(pd.to_numeric, errors='coerce')
-                    y = pd.to_numeric(market_df[V20_REQUIRED_TARGET], errors='coerce')
-                    
-                    # Skip if too many NaN
-                    if X.isna().sum().sum() > len(X) * 0.1:
-                        status.write(f"   {market}: Skipping (too many NaN values)")
-                        skipped_markets.append((market, 'NaN'))
-                        continue
-                    
-                    # Fill remaining NaN with median for training stability
-                    X = X.fillna(X.median())
-                    
-                    # Drop rows where target is NaN
-                    valid_mask = ~y.isna()
-                    X = X[valid_mask]
-                    y = y[valid_mask]
-                    
-                    if len(y) < min_samples:
-                        skipped_markets.append((market, len(y)))
-                        continue
-                    
-                    # Get lines for calibration (from feat_line feature or metadata 'line' column)
-                    if 'feat_line' in market_df.columns:
-                        market_lines = pd.to_numeric(market_df['feat_line'], errors='coerce').fillna(0)
-                    elif 'line' in market_df.columns:
-                        market_lines = pd.to_numeric(market_df['line'], errors='coerce').fillna(0)
-                    else:
-                        market_lines = pd.Series(0, index=market_df.index)
-                    market_lines = market_lines[valid_mask]
-                    
-                    # Time-aware split: sort chronologically and perform a non-shuffled holdout
-                    # This prevents future->past leakage and gives an out-of-time estimate.
-                    if 'date' in market_df.columns:
-                        ordered_idx = market_df.loc[valid_mask].sort_values('date').index
-                        X = X.loc[ordered_idx]
-                        y = y.loc[ordered_idx]
-                        market_lines = market_lines.loc[ordered_idx]
-
-                    X_train, X_test, y_train, y_test, lines_train, lines_test = train_test_split(
-                        X, y, market_lines, test_size=0.2, shuffle=False
-                    )
-                    # temporal cross-validation on training set
-                    tscv = TimeSeriesSplit(n_splits=5)
-                    fold_scores = []
-                    for tr_idx, val_idx in tscv.split(X_train):
-                        m_cv = XGBRegressor(**base_params)
-                        m_cv.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
-                        pred_cv = m_cv.predict(X_train.iloc[val_idx])
-                        prob_cv = (pred_cv >= lines_train.iloc[val_idx]).astype(float)
-                        actual_cv = (y_train.iloc[val_idx] > lines_train.iloc[val_idx]).astype(float)
-                        fold_scores.append(accuracy_score(actual_cv, prob_cv))
-                    status.write(f"    CV win rates: {fold_scores}, std={np.std(fold_scores):.3f}")
-                    
-                    # Train quantile models + calibrator (pass both train/test lines for validation split)
-                    ret = train_quantile_models(
-                        X_train, y_train, X_test, y_test, market, lines_train=lines_train.values, lines_test=lines_test.values
-                    )
-                    # function now returns (models, calibrator, metrics, best_iters)
-                    quantile_models, calibrator, metrics, best_iters = ret
-                    # extract evals history from metrics dict
-                    evals_hist = metrics.get('evals_result', {})
-                    all_metrics.append(metrics)
-                    # learning curves and early stop info
-                    status.write(f"    {market}: best iters {best_iters}")
-                    # plot q50 curve if available
-                    if 'q50' in evals_hist:
-                        curve = pd.DataFrame({
-                            'train_rmse': evals_hist['q50']['validation_0']['rmse'],
-                            'val_rmse': evals_hist['q50']['validation_1']['rmse']
-                        })
-                        status.line_chart(curve)
-                    
-                    # Save per-market model
-                    model_path = DATA_DIR / f"nba_quantile_{market}.pkl"
-                    joblib.dump(quantile_models, model_path)
-                    
-                    # Save calibrator
-                    if calibrator is not None:
-                        group = ML_MARKET_GROUPS.get(market, 'universal')
-                        cal_path = DATA_DIR / f"nba_calibrator_{group}.pkl"
-                        joblib.dump(calibrator, cal_path)
-                        status.write(f"    {market}: MAE={metrics['mae']:.2f}, Coverage={metrics['coverage']:.1f}%, Calibrator saved ({group})")
-                    else:
-                        status.write(f"    {market}: MAE={metrics['mae']:.2f}, Coverage={metrics['coverage']:.1f}%, No calibrator")
-                    trained_markets.append(market)
-                
-                # Also train universal fallback for skipped markets
-                if skipped_markets:
-                    status.write(" Training universal fallback for markets with insufficient data...")
-                    
-                    X_all = df[V20_REQUIRED_FEATURES].apply(pd.to_numeric, errors='coerce').fillna(df[V20_REQUIRED_FEATURES].median())
-                    y_all = pd.to_numeric(df[V20_REQUIRED_TARGET], errors='coerce')
-                    valid_mask = ~y_all.isna()
-                    X_all = X_all[valid_mask]
-                    y_all = y_all[valid_mask]
-                    
-                    # Get lines for calibration
-                    if 'feat_line' in df.columns:
-                        all_lines = pd.to_numeric(df['feat_line'], errors='coerce').fillna(0)[valid_mask]
-                    elif 'line' in df.columns:
-                        all_lines = pd.to_numeric(df['line'], errors='coerce').fillna(0)[valid_mask]
-                    else:
-                        all_lines = pd.Series(0, index=X_all.index)
-                    
-                    # Chronological holdout for universal fallback
-                    if 'date' in df.columns:
-                        ordered_idx = df[valid_mask].sort_values('date').index
-                        X_all = X_all.loc[ordered_idx]
-                        y_all = y_all.loc[ordered_idx]
-                        all_lines = all_lines.loc[ordered_idx]
-
-                    X_train, X_test, y_train, y_test, lines_train, lines_test = train_test_split(
-                        X_all, y_all, all_lines, test_size=0.2, shuffle=False
-                    )
-                    # CV on universal training set
-                    tscv = TimeSeriesSplit(n_splits=5)
-                    fold_scores = []
-                    for tr_idx, val_idx in tscv.split(X_train):
-                        m_cv = XGBRegressor(**base_params)
-                        m_cv.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
-                        pred_cv = m_cv.predict(X_train.iloc[val_idx])
-                        prob_cv = (pred_cv >= lines_train.iloc[val_idx]).astype(float)
-                        actual_cv = (y_train.iloc[val_idx] > lines_train.iloc[val_idx]).astype(float)
-                        fold_scores.append(accuracy_score(actual_cv, prob_cv))
-                    status.write(f"    Universal CV win rates: {fold_scores}, std={np.std(fold_scores):.3f}")
-                    ret = train_quantile_models(
-                        X_train, y_train, X_test, y_test, "universal", lines_train=lines_train.values, lines_test=lines_test.values
-                    )
-                    quantile_models, calibrator, metrics, best_iters_uni = ret
-                    evals_hist_uni = metrics.get('evals_result', {})
-                    all_metrics.append(metrics)
-                    status.write(f"    Universal: best iters {best_iters_uni}")
-                    if 'q50' in evals_hist_uni:
-                        curve_u = pd.DataFrame({
-                            'train_rmse': evals_hist_uni['q50']['validation_0']['rmse'],
-                            'val_rmse': evals_hist_uni['q50']['validation_1']['rmse']
-                        })
-                        status.line_chart(curve_u)
-                    
-                    universal_path = DATA_DIR / "nba_quantile_universal.pkl"
-                    joblib.dump(quantile_models, universal_path)
-                    if calibrator is not None:
-                        joblib.dump(calibrator, DATA_DIR / "nba_calibrator_universal.pkl")
-                    status.write(f"    Universal: MAE={metrics['mae']:.2f}, Coverage={metrics['coverage']:.1f}%")
-                
-                status.write(f" Trained {len(trained_markets)} per-market models")
-                if skipped_markets:
-                    status.write(f"   Skipped {len(skipped_markets)} markets (using universal fallback)")
-                
-            else:
-                # =========================================================
-                # UNIVERSAL TRAINING (all markets combined)
-                # =========================================================
-                status.write(" Training universal model on all markets...")
-                
-                X = df[V20_REQUIRED_FEATURES].apply(pd.to_numeric, errors='coerce')
-                y = pd.to_numeric(df[V20_REQUIRED_TARGET], errors='coerce')
-                
-                # Check for NaN
-                nan_counts = X.isna().sum()
-                if nan_counts.sum() > 0:
-                    bad_cols = nan_counts[nan_counts > 0].to_dict()
-                    status.write(f"   Warning: NaN values in {len(bad_cols)} features, filling with median")
-                    X = X.fillna(X.median())
-                
-                valid_mask = ~y.isna()
-                X = X[valid_mask]
-                y = y[valid_mask]
-                
-                status.write(f"   Processing {len(y)} samples with {len(V20_REQUIRED_FEATURES)} features...")
-                
-                # Get lines for calibration
-                if 'feat_line' in df.columns:
-                    uni_lines = pd.to_numeric(df['feat_line'], errors='coerce').fillna(0)[valid_mask]
-                elif 'line' in df.columns:
-                    uni_lines = pd.to_numeric(df['line'], errors='coerce').fillna(0)[valid_mask]
-                else:
-                    uni_lines = pd.Series(0, index=X.index)
-                
-                # Time-aware train/test split: sort by date then hold out the latest 20%
-                if 'date' in df.columns:
-                    ordered_idx = df[valid_mask].sort_values('date').index
-                    X = X.loc[ordered_idx]
-                    y = y.loc[ordered_idx]
-                    uni_lines = uni_lines.loc[ordered_idx]
-
-                X_train, X_test, y_train, y_test, lines_train, lines_test = train_test_split(
-                    X, y, uni_lines, test_size=0.2, shuffle=False
-                )
-                # CV on universal training set
-                tscv = TimeSeriesSplit(n_splits=5)
-                fold_scores = []
-                for tr_idx, val_idx in tscv.split(X_train):
-                    m_cv = XGBRegressor(**base_params)
-                    m_cv.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
-                    pred_cv = m_cv.predict(X_train.iloc[val_idx])
-                    prob_cv = (pred_cv >= lines_train.iloc[val_idx]).astype(float)
-                    actual_cv = (y_train.iloc[val_idx] > lines_train.iloc[val_idx]).astype(float)
-                    fold_scores.append(accuracy_score(actual_cv, prob_cv))
-                status.write(f"    Universal CV win rates: {fold_scores}, std={np.std(fold_scores):.3f}")
-                
-                # Train quantile models + calibrator (use validation split taken from training set)
-                ret = train_quantile_models(
-                    X_train, y_train, X_test, y_test, "universal", lines_train=lines_train.values, lines_test=lines_test.values
-                )
-                quantile_models, calibrator, metrics, best_iters_uni = ret
-                evals_hist_uni = metrics.get('evals_result', {})
-                all_metrics.append(metrics)
-                status.write(f"    Universal: best iters {best_iters_uni}")
-                if 'q50' in evals_hist_uni:
-                    curve_u = pd.DataFrame({
-                        'train_rmse': evals_hist_uni['q50']['validation_0']['rmse'],
-                        'val_rmse': evals_hist_uni['q50']['validation_1']['rmse']
-                    })
-                    status.line_chart(curve_u)
-                
-                # Save universal model
-                universal_path = DATA_DIR / "nba_quantile_universal.pkl"
-                joblib.dump(quantile_models, universal_path)
-                if calibrator is not None:
-                    joblib.dump(calibrator, DATA_DIR / "nba_calibrator_universal.pkl")
-                    status.write("   Calibration curve saved")
-            
-            # Save feature list
-            joblib.dump(V20_REQUIRED_FEATURES, DATA_DIR / "nba_features_v21.pkl")
-            
-            status.update(label=" Training Complete!", state="complete")
-            
-            st.success(f" V21.1 Quantile Regression Models Trained!")
-            
-            # Display metrics in table
-            st.markdown("#### Model Performance Summary")
-            
-            # ── Strip non-tabular fields before building the display df ──
-            display_rows = []
-            for m in all_metrics:
-                display_rows.append({k: v for k, v in m.items()
-                                     if k not in ('evals_result',)})
-            metrics_df = pd.DataFrame(display_rows)
-            metrics_df = metrics_df.rename(columns={
-                'name': 'Model',
-                'samples': 'Samples',
-                'mae': 'MAE',
-                'r2': 'R²',
-                'coverage': 'Coverage %',
-                'avg_width': 'Avg Width',
-                'calibrated': 'Calibrated',
-                'cal_delta': 'Cal Δ',
-                'cv_mae_mean': 'CV MAE',
-                'cv_mae_std': 'CV Std',
-            })
-
-            # Format numeric columns
-            for col in ['MAE', 'R²', 'Avg Width', 'Cal Δ', 'CV MAE', 'CV Std']:
-                if col in metrics_df.columns:
-                    metrics_df[col] = metrics_df[col].apply(
-                        lambda x: f"{x:.3f}" if x is not None else "—")
-            if 'Coverage %' in metrics_df.columns:
-                metrics_df['Coverage %'] = metrics_df['Coverage %'].apply(
-                    lambda x: f"{x:.1f}%" if x is not None else "—")
-
-            st.dataframe(metrics_df, use_container_width=True, hide_index=True)
-
-            # ── CV Std flag ──
-            if 'CV Std' in metrics_df.columns:
-                try:
-                    max_std = max(
-                        float(v) for v in metrics_df['CV Std'] if v not in (None, "—")
-                    )
-                    if max_std > 1.5:
-                        st.warning(f"⚠️ High CV Std ({max_std:.3f}) — model generalisation varies across seasons. "
-                                   "Consider adding more historical data or tightening regularisation.")
-                    else:
-                        st.success(f"✅ CV Std stable ({max_std:.3f}) — model generalises consistently across folds.")
-                except Exception:
-                    pass
-
-            # ── Learning Curves (q50 only, train vs val RMSE) ──
-            st.markdown("#### 📈 Learning Curves — Train vs Validation RMSE (q50)")
-            st.caption("Gap between lines = overfitting. Early stopping iteration marked where val RMSE bottomed out.")
-
-            curve_data_found = False
-            for m in all_metrics:
-                er = m.get('evals_result', {})
-                q50_er = er.get('q50', {})
-                # evals_result keys are 'validation_0' (train) and 'validation_1' (test)
-                train_rmse = q50_er.get('validation_0', {}).get('rmse')
-                val_rmse   = q50_er.get('validation_1', {}).get('rmse')
-                if train_rmse and val_rmse:
-                    curve_data_found = True
-                    n = min(len(train_rmse), len(val_rmse))
-                    curve_df = pd.DataFrame({
-                        'Iteration': list(range(1, n + 1)),
-                        'Train RMSE': train_rmse[:n],
-                        'Val RMSE':   val_rmse[:n],
-                    })
-                    best_iter = int(np.argmin(val_rmse[:n])) + 1
-                    with st.expander(f"{m['name']} — stopped @ iter {best_iter}/{base_params['n_estimators']}", expanded=False):
-                        st.line_chart(curve_df.set_index('Iteration')[['Train RMSE', 'Val RMSE']])
-                        col_a, col_b, col_c = st.columns(3)
-                        col_a.metric("Best Val RMSE", f"{min(val_rmse[:n]):.3f}", f"@ iter {best_iter}")
-                        col_b.metric("Final Train RMSE", f"{train_rmse[best_iter-1]:.3f}")
-                        gap = train_rmse[best_iter-1] - min(val_rmse[:n])
-                        col_c.metric("Train-Val Gap", f"{gap:+.3f}",
-                                     delta_color="inverse" if gap < -0.1 else "normal")
-
-            if not curve_data_found:
-                st.info("Learning curve data not available for this run.")
-            
-            # Overall interpretation
-            avg_coverage = np.mean([m['coverage'] for m in all_metrics])
-            cal_count = sum(1 for m in all_metrics if m.get('calibrated', False))
-            if avg_coverage < 75:
-                st.warning(" Low average coverage: Models may be overconfident.")
-            elif avg_coverage > 85:
-                st.info(" High average coverage: Models are conservative.")
-            else:
-                st.success(f" Good calibration: Average coverage {avg_coverage:.1f}% is near target 90%.")
-            
-            if cal_count > 0:
-                st.success(f" {cal_count} isotonic calibration curves trained and saved.")
-            else:
-                st.warning(" No calibration curves were fitted (missing line data in training set).")
-                st.caption("Ensure the training CSV has a 'line' or 'feat_line' column.")
-            
-            if training_mode == "per_market":
-                st.info(f"""
-                **Per-Market Models Saved:**
-                - {len([m for m in all_metrics if m['name'] != 'universal'])} market-specific models
-                - Fallback universal model for other markets
-                
-                **Model lookup priority:** PTS → scoring group → universal
-                """)
-            
-            st.balloons()
-            
-        except Exception as e:
-            status.update(label=" Training Failed", state="error")
-            st.error(f"Error: {str(e)}")
-            import traceback
-            st.code(traceback.format_exc())
 
 def render_analytics_tab(tracker: 'Tracker'):
     """
@@ -9544,7 +7842,18 @@ def main():
     if 'parlay_builder' not in st. session_state: 
         st.session_state.parlay_builder = []
     
-    # Initialize components
+    # Initialize components (auto-pull from TrueNAS on launch + every 15 minutes)
+    if (
+        'truenas_sync_status' not in st.session_state
+        or (time.time() - st.session_state.get('truenas_last_sync_ts', 0)) > 900
+    ):
+        try:
+            from server_sync import sync_from_home_server
+            st.session_state.truenas_sync_status = sync_from_home_server()
+            st.session_state.truenas_last_sync_ts = time.time()
+        except Exception as _sync_err:
+            st.session_state.truenas_sync_status = {"ok": False, "message": str(_sync_err)}
+            st.session_state.truenas_last_sync_ts = time.time()
     orchestrator = PredictionOrchestrator()
     tracker = Tracker()
     parlay_tracker = ParlayTracker()
@@ -9570,6 +7879,23 @@ def main():
                 st.info("Cache cleared! Reloading...")
             time.sleep(1)
             st.rerun()
+
+        # Sync harvested odds from TrueNAS Home Server via Git
+        if st.button("🔄 Sync TrueNAS Odds", use_container_width="stretch", help="Pull latest game odds & player props pushed by TrueNAS from GitHub"):
+            try:
+                from server_sync import sync_from_home_server
+                sync_res = sync_from_home_server()
+                st.session_state.truenas_sync_status = sync_res
+                st.cache_data.clear()
+                st.toast(f"✅ {sync_res.get('message', 'Synced!')}")
+            except Exception as _e:
+                st.toast(f"⚠️ Sync failed: {_e}")
+            time.sleep(0.6)
+            st.rerun()
+
+        if st.session_state.get("truenas_sync_status", {}).get("ok"):
+            _sr = st.session_state["truenas_sync_status"]
+            st.caption(f"📡 Harvester: {_sr.get('total_files', 0)} files ({_sr.get('timestamp', '')})")
         
         # Bankroll Mode Toggle
         bankroll_enabled = st.toggle(" Bankroll Mode", value=True, help="Turn off when just gathering data for ML")
@@ -9601,28 +7927,24 @@ def main():
         if st.session_state.parlay_builder:
             st.markdown(f" Parlay: {len(st.session_state.parlay_builder)} legs")
         
-        # Hardware & AI Engine Status
+        # Compute Hardware Status
         try:
             from hardware_utils import check_cuda_availability
-            from llm_engine import get_active_llm_provider
             has_cuda, gpu_name = check_cuda_availability()
-            active_llm = get_active_llm_provider()
             st.markdown("---")
-            st.markdown("##### ⚡ Hardware & AI")
+            st.markdown("##### ⚡ Compute Hardware")
             if has_cuda:
-                st.caption(f"🚀 **GPU:** {gpu_name}")
+                st.caption(f"🚀 **GPU Acceleration:** {gpu_name}")
             else:
                 st.caption("🖥️ **Compute:** CPU Mode")
-            st.caption(f"🧠 **AI:** {active_llm['name']}")
         except Exception:
             pass
 
         st.caption(f"{CURRENT_VERSION}")
     
-    # Main tabs - simplified names for mobile
-
-    tab_games, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-        "🏀 Games", "Analyze", "Backtest", "Watchlist", "H2H", "Splits", "Bets", "Parlays", "ML", "Analytics"
+    # Main tabs — streamlined 4-tab layout
+    tab_games, tab1, tab6, tab9 = st.tabs([
+        "🏀 Games", "👤 Player Props", "📋 Bets", "📈 Analytics"
     ])
 
     # Tab 0: Game Predictions & Lines
@@ -9636,6 +7958,21 @@ def main():
 
     # Tab 1: Analyzer
     with tab1:
+        try:
+            from props_ui import render_best_prop_edges_scanner
+            with st.expander("🔥 Best Player Prop Edges (Worth Betting — Live Bookmakers)", expanded=True):
+                render_best_prop_edges_scanner(
+                    model_engine=orchestrator.model_engine,
+                    tracker=tracker,
+                    bankroll_current=float(bankroll if bankroll > 0 else 500.0),
+                )
+        except Exception as _prop_scanner_err:
+            st.error(f"Error loading Best Prop Edges Scanner: {_prop_scanner_err}")
+            logger.exception("Error in best prop edges scanner")
+
+        st.markdown("---")
+        st.markdown("### 🔍 Custom Single-Player Prop Analyzer")
+
         # Mobile-friendly stacked layout with expander for advanced options
         all_players = get_all_nba_players()
         player_names = sorted([p['full_name'] for p in all_players if p.get('is_active', True)])
@@ -9852,256 +8189,6 @@ def main():
 
             st.divider()
     
-            with st.container(border=True):
-                c_ai_1, c_ai_2 = st.columns([3, 1])
-                with c_ai_1:
-                    st.subheader("AI Analyst")
-                    st.caption("Get a second opinion. compares the math (EV) vs. the tape (Game Logs).")
-                with c_ai_2:
-                    # Unique key ensures no conflict
-                    ask_ai = st.button("Consult groq", key="tab1_ask_ai", use_container_width="stretch")
-
-                if ask_ai:
-                        with st.spinner(f"Analyzing {result.player_name}..."):
-                            # 1. PREPARE CONTEXT
-                            team_str = "N/A"
-                            if result.game_logs is not None and not result.game_logs.empty:
-                                try:
-                                    team_str = result.game_logs.iloc[-1]['MATCHUP'].split()[0]
-                                except: pass
-
-                            feats = result.features
-                            is_home = feats.is_home
-                            loc_avg = feats.home_avg if is_home else feats.away_avg
-                            loc_type = "Home" if is_home else "Away"
-                            
-                            # ---------------------------------------------------------
-                            #  FIX: FORCE AI TO SEE THE "SMART" NUMBER (23.2)
-                            # ---------------------------------------------------------
-                            final_proj = None
-                            
-                            # 1. Check the PROJECTION Object (Correct Location)
-                            # This is where the card gets its "23.2"
-                            if hasattr(result, 'projection') and hasattr(result.projection, 'final_projection'):
-                                final_proj = result.projection.final_projection
-                            
-                            # 2. Check Decision/Result (Backups)
-                            if final_proj is None:
-                                if hasattr(result.decision, 'final_projection'):
-                                    final_proj = result.decision.final_projection
-                                elif hasattr(result, 'projected_value'):
-                                    final_proj = result.projected_value
-                                
-                            # 3. Fallback to EMA (Only if everything else fails)
-                            if final_proj is None:
-                                final_proj = feats.ema
-
-                            # Calculate the Gap (Cushion)
-                            gap = float(result.line) - float(final_proj)
-                            if result.decision.recommended_side == 'OVER':
-                                gap = -gap 
-
-                            # ---------------------------------------------------------
-                            # PAYLOAD WITH FULL FEATURE CONTEXT FOR AI ANALYST
-                            # V21.2: Pass ALL features so AI can detect red flags
-                            # ---------------------------------------------------------
-                            prop_payload = {
-                                # --- Core Identifiers ---
-                                "player": result.player_name,
-                                "team": team_str,
-                                "position": getattr(result, 'player_position', '') or '',  # V21.2: Safe fallback for cached results
-                                "opponent": result.opponent_name,
-                                "market": result.market,
-                                "line": result.line,
-                                
-                                # --- Model Outputs ---
-                                "predicted_side": result.decision.recommended_side,
-                                "signal": result.decision.recommended_side,  # Alias
-                                "ev": result.decision.expected_value,
-                                "prob": result.decision.probability,
-                                "projected": round(final_proj, 1),
-                                "projected_value": round(final_proj, 1),  # Alias
-                                "gap": round(gap, 1),
-                                "spread": feats.spread,
-                                
-                                # --- Performance Features ---
-                                # NOTE: FeatureVector uses 'feat_*' prefix for these
-                                "feat_season_avg": getattr(feats, 'feat_season_avg', 0.0),
-                                "feat_l10_avg": getattr(feats, 'feat_l10_avg', 0.0),
-                                "feat_ema": round(feats.ema, 1),
-                                "ema": round(feats.ema, 1),  # Alias
-                                "feat_std": feats.std,
-                                "std": feats.std,  # Alias
-                                "feat_h2h_avg": getattr(feats, 'feat_h2h_avg', -1.0),
-                                
-                                # --- Trend & Form ---
-                                "feat_trend_5g": feats.trend_5g,
-                                "feat_form_gap": getattr(feats, 'feat_form_gap', 0.0),
-                                "feat_cv": getattr(feats, 'feat_cv', 0.0),
-                                
-                                # --- Minutes & Role ---
-                                "feat_avg_minutes": feats.avg_minutes,
-                                "avg_minutes": feats.avg_minutes,  # Alias
-                                "feat_min_volatility": getattr(feats, 'feat_min_volatility', 0.0),
-                                "feat_depth_rank": getattr(feats, 'feat_depth_rank', 4),
-                                
-                                # --- Fatigue & Rest ---
-                                "feat_days_rest": feats.days_rest,
-                                "days_rest": feats.days_rest,  # Alias
-                                "feat_is_b2b": feats.is_b2b,
-                                "is_b2b": feats.is_b2b,  # Alias
-                                "feat_is_home": feats.is_home,
-                                "is_home": feats.is_home,  # Alias
-                                
-                                # --- Hit Rates ---
-                                "feat_hit_rate_l10": getattr(feats, 'feat_hit_rate_l10', 0.0),
-                                "feat_hit_rate_l20": getattr(feats, 'feat_hit_rate_l20', 0.0),
-                                
-                                # --- Matchup Quality ---
-                                "feat_opponent_drtg_season": feats.opponent_drtg_season,
-                                "opponent_drtg_season": feats.opponent_drtg_season,  # Alias
-                                "feat_opp_rank_vs_pos": getattr(feats, 'feat_opp_rank_vs_pos', 15),
-                                
-                                # --- Location Splits ---
-                                "feat_home_avg": feats.home_avg,
-                                "feat_away_avg": feats.away_avg,
-                                "loc_type": loc_type,
-                                "loc_avg": round(loc_avg, 1),
-                                
-                                # --- Absence Context ---
-                                "feat_team_out_count": feats.team_out_count,
-                                "team_out_count": feats.team_out_count,  # Alias
-                                "feat_team_out_ppg": getattr(feats, 'team_out_ppg', 0.0), 
-                                "team_out_ppg": getattr(feats, 'team_out_ppg', 0.0),
-                                "feat_opp_out_count": feats.opp_out_count,
-                                "opp_out_count": feats.opp_out_count,  # Alias
-                                
-                                # --- Games Played (CRITICAL FOR AI) ---
-                                "feat_games_played": feats.games_played,
-                                "games_played": feats.games_played,  # Alias
-                                
-                                # --- Additional Context ---
-                                "feat_usage_rate": getattr(feats, 'feat_usage_rate', 0.0),
-                                "total": feats.game_total,
-                            }
-
-                            # 2. RUN LIVE BACKTEST (Robust Settings)
-                            status_text = st.empty()
-                            status_text.text("Running Simulation (Matching CSV + Buckets)...")
-                            
-                            history_context = None
-                            backtest_payload = {}
-                            
-                            try:
-                                # Canonicalize Name
-                                p_list = players.find_players_by_full_name(result.player_name)
-                                canonical_name = p_list[0]['full_name'] if p_list else result.player_name
-                                p_id = p_list[0]['id'] if p_list else None
-                                
-                                # A. Scientific Backtest
-                                bt_summary = orchestrator.run_backtest(
-                                    player_name=canonical_name,
-                                    market=result.market,
-                                    lookback=25,    
-                                    test_days=45    
-                                )
-                                
-                                res_df = getattr(bt_summary, 'results', None) if bt_summary else None
-
-                                # B. Fallback
-                                if (res_df is None or res_df.empty) and p_id:
-                                    status_text.text("Scientific Backtest incomplete. Running Manual Fallback...")
-                                    raw_logs = orchestrator.data_loader.fetch_game_logs(p_id)
-                                    if not raw_logs.empty:
-                                        mkt = result.market
-                                        if mkt not in raw_logs.columns:
-                                            if mkt == 'PRA': raw_logs['PRA'] = raw_logs.get('PTS',0) + raw_logs.get('REB',0) + raw_logs.get('AST',0)
-                                            elif mkt == 'PA': raw_logs['PA'] = raw_logs.get('PTS',0) + raw_logs.get('AST',0)
-                                            elif mkt == 'PR': raw_logs['PR'] = raw_logs.get('PTS',0) + raw_logs.get('REB',0)
-                                            elif mkt == 'RA': raw_logs['RA'] = raw_logs.get('REB',0) + raw_logs.get('AST',0)
-                                        
-                                        if mkt in raw_logs.columns:
-                                            raw_logs = raw_logs.sort_values('GAME_DATE', ascending=False).head(30)
-                                            raw_logs['hit'] = raw_logs.apply(
-                                                lambda x: 1 if (result.decision.recommended_side == 'OVER' and x[mkt] > result.line) or 
-                                                             (result.decision.recommended_side == 'UNDER' and x[mkt] <= result.line) else 0, axis=1
-                                            )
-                                            raw_logs['margin'] = raw_logs[mkt] - result.line
-                                            if result.decision.recommended_side == 'UNDER': raw_logs['margin'] = -raw_logs['margin']
-                                            
-                                            res_df = pd.DataFrame({
-                                                'date': raw_logs['GAME_DATE'], 'market': mkt, 'line': result.line,
-                                                'pred': result.decision.recommended_side, 'actual': raw_logs[mkt],
-                                                'hit': raw_logs['hit'], 'margin': raw_logs['margin']
-                                            })
-
-                                # C. Calibration (Buckets)
-                                bucket_name = "N/A"
-                                bucket_wr = "N/A"
-                                bucket_count = 0
-                                if bt_summary and hasattr(bt_summary, 'calibration_by_bucket'):
-                                    prob_pct = result.decision.probability * 100
-                                    found_bucket = None
-                                    if 50 <= prob_pct < 55: found_bucket = "50-55%"
-                                    elif 55 <= prob_pct < 60: found_bucket = "55-60%"
-                                    elif 60 <= prob_pct < 65: found_bucket = "60-65%"
-                                    elif 65 <= prob_pct < 70: found_bucket = "65-70%"
-                                    elif 70 <= prob_pct < 75: found_bucket = "70-75%"
-                                    elif prob_pct >= 75: found_bucket = "75-100%"
-                                    
-                                    if found_bucket and found_bucket in bt_summary.calibration_by_bucket:
-                                        b_data = bt_summary.calibration_by_bucket[found_bucket]
-                                        bucket_name = found_bucket
-                                        try:
-                                            bucket_wr = round(b_data['actual'] * 100, 1)
-                                            bucket_count = b_data['count']
-                                        except: pass
-
-                                # D. Format Output
-                                if res_df is not None and not res_df.empty:
-                                    res_df = res_df.sort_values('date', ascending=False)
-                                    wins = res_df[res_df['hit'] == 1].shape[0]
-                                    total = len(res_df)
-                                    win_rate = (wins / total) * 100
-                                    
-                                    last_5_str = []
-                                    for _, row in res_df.head(5).iterrows():
-                                        icon = "" if row['hit'] == 1 else ""
-                                        m_val = row.get('margin', 0)
-                                        last_5_str.append(f"{icon}({m_val:+.1f})")
-
-                                    history_context = {
-                                        'record': f"{wins}-{total-wins}",
-                                        'win_rate': round(win_rate, 1),
-                                        'count': total,
-                                        'last_5': ", ".join(last_5_str)
-                                    }
-                                    
-                                    csv_cols = [c for c in ['date', 'market', 'line', 'pred', 'actual', 'margin'] if c in res_df.columns]
-                                    logs_csv = res_df[csv_cols].head(10).to_csv(index=False)
-                                    
-                                    backtest_payload = {
-                                        "l30_rate": int(win_rate),
-                                        "avg_diff": res_df['margin'].mean(),
-                                        "logs_csv": logs_csv,
-                                        "bucket_name": bucket_name,
-                                        "bucket_wr": bucket_wr,
-                                        "bucket_count": bucket_count
-                                    }
-                                    status_text.empty()
-                                else:
-                                    status_text.warning(f"No game data found for {result.player_name}")
-
-                            except Exception as e:
-                                st.error(f"Analysis Error: {e}")
-                                
-                            # 3. GET OPINION
-                            from llm_engine import get_active_llm_provider
-                            active_llm = get_active_llm_provider()
-                            llm_badge = f"🟢 {active_llm['name']}" if active_llm.get('is_local') else f"☁️ {active_llm['name']}"
-                            insight = get_ai_second_opinion(prop_payload, backtest_payload, history_context=history_context)
-                            st.markdown(f"### 🤖 AI Analyst Verdict ({llm_badge})")
-                            st.markdown(insight)
             
             col_track, col_parlay = st.columns(2)
             # Tag selection
@@ -10175,83 +8262,8 @@ def main():
             with st.expander("Details & Chart", expanded=False):
                 render_distribution_chart(result)
     
-    # Tab 2: Backtest
-    with tab2:
-        render_backtest_tab(orchestrator)
-    with tab3:
-        render_watchlist_tab(orchestrator)
-    # Tab 4: H2H
-    with tab4:
-        result = st.session_state.analysis_result
-        if result and result.success:
-            st.markdown(f"{result.player_name} vs {result.opponent_name}")
-            with st.spinner("Loading..."):
-                full_history = orchestrator.data_loader.fetch_multi_season_logs(result.player_id)
-            
-            if len(full_history) > 0:
-                opp_code = result.opponent_name
-                h2h_df = full_history[full_history['MATCHUP'].str.contains(opp_code, case=False)].copy()
-                
-                if len(h2h_df) > 0:
-                    h2h_df = h2h_df.sort_values('GAME_DATE', ascending=False)
-                    c1, c2, c3 = st.columns(3)
-                    avg_h2h = h2h_df[result.market].mean()
-                    h2h_hit_rate = (h2h_df[result.market] > result.line).mean()
-                    c1.metric(f"Avg {result.market}", f"{avg_h2h:.1f}")
-                    c2.metric("Games", len(h2h_df))
-                    c3.metric(f"Hit%", f"{h2h_hit_rate:.0%}")
-                    
-                    display_cols = ['GAME_DATE', 'WL', 'MIN', result.market]
-                    st.dataframe(h2h_df[display_cols].head(8), hide_index=True, width="stretch")
-                else:
-                    st.info(f"No games vs {opp_code}")
-            else: 
-                st.info("No history available")
-        else:
-            st.info("Run analysis first")
-    
-    # Tab 5: Splits
-    with tab5:
-        result = st.session_state.analysis_result
-        if result and result.success:
-            df = result.game_logs
-            market = result.market
-            line = result.line
-            
-            st.markdown(f"{result.player_name} Splits")
-            
-            splits = {
-                "L15": df.tail(15),
-                "Home": df[df['IS_HOME'] == True].tail(15),
-                "Away": df[df['IS_HOME'] == False].tail(15),
-                "W": df[df['WL'] == 'W'].tail(15),
-                "L": df[df['WL'] == 'L'].tail(15),
-            }
-            
-            if 'DAYS_REST' in df.columns:
-                splits["Rest"] = df[df['DAYS_REST'] >= 3].tail(15)
-                splits[" B2B"] = df[df['DAYS_REST'] <= 1].tail(15)
-            
-            data = []
-            for k, v in splits.items():
-                if len(v) >= 3:
-                    hit_rate = (v[market] > line).mean()
-                    data.append({
-                        "Split": k,
-                        "N": len(v),
-                        "Avg": f"{v[market].mean():.1f}",
-                        "Hit%": f"{hit_rate:.0%}",
-                    })
-            
-            if data:
-                st.dataframe(pd.DataFrame(data), hide_index=True, width="stretch")
-            else:
-                st.info("Not enough data")
-        else:
-            st.info("Run analysis first")
-    
-        # Tab 6: Bets
-        with tab6:
+    # Tab 6: Bets
+    with tab6:
             # Modern Top Bar with Auto-Settle
             stats = tracker.get_stats()
             all_bets = tracker.get_bets()
@@ -10266,8 +8278,14 @@ def main():
                         with st.spinner("Grading against official final scores & box scores..."):
                             settle_res = tracker.auto_settle_pending_bets()
                             if settle_res.get('settled_count', 0) > 0:
+                                # Clear cached widget state so Result dropdowns & Actual boxes reflect settled values
+                                for _d in settle_res.get('details', []):
+                                    _sid = _d.get('id')
+                                    for _pfx in ("s_", "av_", "cl_", "_disk_res_"):
+                                        st.session_state.pop(f"{_pfx}{_sid}", None)
+                                st.session_state.pop("last_shared_slip_png", None)
                                 st.success(f"Settled {settle_res['settled_count']} bets! ({settle_res['wins']}W - {settle_res['losses']}L - {settle_res['pushes']}P)")
-                                time.sleep(1)
+                                time.sleep(0.8)
                                 st.rerun()
                             else:
                                 st.info("No matching final scores found yet (games may still be in progress).")
@@ -10369,7 +8387,9 @@ def main():
                         for _, bet in approved.iterrows():
                             with st.container(border=True):
                                 proj_val = bet.get('predicted_mean', bet.get('proj', 0))
-                                st.markdown(f"**{bet['player']}** {bet['market']} - {bet['side']} {bet['line']} @ {bet['odds']}")
+                                _side_str = str(bet.get('side', '')).strip()
+                                _pick_disp = _side_str if any(c.isdigit() for c in _side_str) else f"{_side_str} {bet['line']}"
+                                st.markdown(f"**{bet['player']}** {bet['market']} - {_pick_disp} @ {bet['odds']}")
                                 st.caption(f"Proj: {proj_val:.1f} | EV: {bet['predicted_ev']:.3%} | Stake: {bet['rec_stake']:.0f}")
                     else:
                         st.info("No bets approved.")
@@ -10379,7 +8399,9 @@ def main():
                         for _, bet in rejected.iterrows():
                             with st.container(border=True):
                                 proj_val = bet.get('predicted_mean', bet.get('proj', 0))
-                                st.markdown(f"**{bet['player']}** {bet['market']} - {bet['side']} {bet['line']} @ {bet['odds']}")
+                                _side_str = str(bet.get('side', '')).strip()
+                                _pick_disp = _side_str if any(c.isdigit() for c in _side_str) else f"{_side_str} {bet['line']}"
+                                st.markdown(f"**{bet['player']}** {bet['market']} - {_pick_disp} @ {bet['odds']}")
                                 st.caption(f"Proj: {proj_val:.1f} | EV: {bet['predicted_ev']:.3%} | Stake: {bet['rec_stake']:.0f}", help="Rejected due to low EV or stake")
                     else:
                         st.info("No bets rejected.")
@@ -10479,11 +8501,331 @@ def main():
                 if view_limit != "All":
                     filtered_bets = filtered_bets[:int(view_limit)]
                 
-                if not filtered_bets:
-                    st.info("No bets found.")
+                # -------------------------------------------------------------
+                # 📤 Share Tracked Bets (Social Slip Generator)
+                # -------------------------------------------------------------
+                if bet_type_seg == "🏀 Game Lines":
+                    cat_pool = [b for b in all_bets if b.get('market') in ['SPREAD', 'TOTAL', 'spread', 'total'] or b.get('bet_type') in ['spread', 'total']]
+                elif bet_type_seg == "👤 Player Props":
+                    cat_pool = [b for b in all_bets if not (b.get('market') in ['SPREAD', 'TOTAL', 'spread', 'total'] or b.get('bet_type') in ['spread', 'total'])]
                 else:
-                    st.caption(f"Showing {len(filtered_bets)} of {total_count} bets")
-                    
+                    cat_pool = list(all_bets)
+
+                pending_cat_bets = [b for b in cat_pool if b.get('result', 'Pending') == 'Pending']
+                settled_cat_bets = [b for b in cat_pool if b.get('result') in ('Win', 'Loss', 'Push')]
+
+                with st.container(border=True):
+                    share_subtab_slip, share_subtab_recap = st.tabs([
+                        "📋 Share Bet Slip (Picks List)",
+                        "📊 Performance Recap Card (Week / Month Summary)",
+                    ])
+
+                    with share_subtab_slip:
+                        st.markdown("##### 📤 Share Bet Slip (Dark-Mode PNG)")
+                        sh_m_col, sh_st_col, sh_btn_col = st.columns([1.8, 1.2, 1.6])
+
+                        with sh_m_col:
+                            share_mode = st.selectbox(
+                                "Share Scope:",
+                                [
+                                    f"⏳ Pending Picks Only ({len(pending_cat_bets)})",
+                                    f"📋 Current Table Filter ({len(filtered_bets)})",
+                                    f"🏆 Settled Results Recap ({len(settled_cat_bets)})",
+                                    "🎯 Custom Pick Selection",
+                                ],
+                                index=0,
+                                key="share_bets_mode_select",
+                                help="Default 'Pending Picks Only' ensures only active upcoming plays are included in your shared slip without mixing in past settled bets."
+                            )
+
+                        with sh_st_col:
+                            share_show_stakes = st.checkbox(
+                                "Show Stakes / P&L",
+                                value=bool(bankroll_enabled),
+                                key="share_png_show_stakes",
+                                help="Uncheck to hide dollar amounts/units. The slip will display Edge & EV instead for public/social sharing."
+                            )
+
+                        # Determine bets to share based on mode
+                        if share_mode.startswith("⏳ Pending Picks"):
+                            bets_to_share = list(pending_cat_bets)
+                            pending_dates = sorted(list(set(b.get('date') for b in pending_cat_bets if b.get('date'))))
+                            if len(pending_dates) > 1:
+                                sh_date_sel = st.selectbox(
+                                    "Filter Slate Date:",
+                                    ["All Upcoming Dates"] + pending_dates,
+                                    index=0,
+                                    key="share_slate_date_select",
+                                )
+                                if sh_date_sel != "All Upcoming Dates":
+                                    bets_to_share = [b for b in bets_to_share if b.get('date') == sh_date_sel]
+                        elif share_mode.startswith("🏆 Settled Results"):
+                            bets_to_share = list(settled_cat_bets)
+                        elif share_mode.startswith("🎯 Custom Pick"):
+                            pick_options = {}
+                            for b in cat_pool:
+                                res_tag = b.get('result', 'Pending')
+                                lbl = f"[{res_tag}] {b.get('player', 'Unknown')} {b.get('side', '')} ({b.get('date', '')}) [#{b.get('id', '')}]"
+                                pick_options[lbl] = b
+                            default_keys = [k for k, v in pick_options.items() if v.get('result') == 'Pending'][:5]
+                            selected_pick_keys = st.multiselect(
+                                "Choose Picks to Include on Slip:",
+                                options=list(pick_options.keys()),
+                                default=default_keys,
+                                key="custom_share_multiselect"
+                            )
+                            bets_to_share = [pick_options[k] for k in selected_pick_keys]
+                        else:
+                            bets_to_share = list(filtered_bets)
+
+                        with sh_btn_col:
+                            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)  # vertical spacing alignment
+                            share_btn_text = f"📸 Copy Slip ({len(bets_to_share)} Picks)" if bets_to_share else "📸 No Matching Bets"
+                            if st.button(
+                                share_btn_text,
+                                use_container_width=True,
+                                disabled=(len(bets_to_share) == 0),
+                                help="Generates a dark-mode PNG slip and copies it directly to your Windows Clipboard (Ctrl+V ready)",
+                                key="btn_generate_shared_slip"
+                            ):
+                                try:
+                                    from bet_slip_share import render_tracked_bets_png, copy_png_bytes_to_windows_clipboard
+                                    if share_mode.startswith("⏳ Pending Picks"):
+                                        slip_title = (
+                                            "NBA GAME LINES - ACTIVE PICKS"
+                                            if bet_type_seg == "🏀 Game Lines"
+                                            else ("NBA PLAYER PROPS - ACTIVE PICKS" if bet_type_seg == "👤 Player Props" else "NBA ACTIVE PICKS SLIP")
+                                        )
+                                    elif share_mode.startswith("🏆 Settled Results"):
+                                        slip_title = (
+                                            "NBA GAME LINES RECAP"
+                                            if bet_type_seg == "🏀 Game Lines"
+                                            else ("NBA PLAYER PROPS RECAP" if bet_type_seg == "👤 Player Props" else "NBA RESULTS RECAP")
+                                        )
+                                    else:
+                                        slip_title = (
+                                            "NBA GAME LINES SLIP"
+                                            if bet_type_seg == "🏀 Game Lines"
+                                            else ("NBA PLAYER PROPS SLIP" if bet_type_seg == "👤 Player Props" else "NBA QUANT BET SLIP")
+                                        )
+                                    
+                                    png_bytes = render_tracked_bets_png(
+                                        bets_to_share,
+                                        title=slip_title,
+                                        show_stakes=share_show_stakes,
+                                    )
+                                    st.session_state["last_shared_slip_png"] = png_bytes
+                                    ok_clip, clip_msg = copy_png_bytes_to_windows_clipboard(png_bytes)
+                                    if ok_clip:
+                                        st.toast(f"📋 {clip_msg}")
+                                        st.success(f"📋 **{clip_msg}**")
+                                    else:
+                                        st.info("PNG generated below! Right-click the image to copy or click Download PNG.")
+                                except Exception as _share_err:
+                                    st.error(f"Failed to generate bet slip PNG: {_share_err}")
+
+                    with share_subtab_recap:
+                        st.markdown("##### 📊 Performance Recap Card (Week / Month Summary)")
+                        st.caption("Generate a high-level dark-mode recap card displaying your Record, Win Rate, ROI %, Net Units (±), and Hypothetical Fiat Profit simulation without listing individual picks.")
+
+                        rc_col1, rc_col2, rc_col3, rc_col4 = st.columns([1.5, 1.2, 1.3, 1.5])
+                        with rc_col1:
+                            now_dt = datetime.now()
+                            cur_month_name = now_dt.strftime('%B %Y')
+                            recap_tf = st.selectbox(
+                                "Timeframe Scope:",
+                                [
+                                    "🗓️ Past 7 Days (Last Week)",
+                                    "🗓️ Past 14 Days",
+                                    f"📅 Current Month ({cur_month_name})",
+                                    "🏆 All-Time Record",
+                                    "🎯 Custom Date Range",
+                                ],
+                                index=0,
+                                key="recap_timeframe_select"
+                            )
+
+                        with rc_col2:
+                            recap_cat = st.selectbox(
+                                "Picks Category:",
+                                [
+                                    "All Markets (Props + Game)",
+                                    "👤 Player Props Only",
+                                    "🏀 Game Lines Only",
+                                ],
+                                index=0 if bet_type_seg == "All Bets" else (1 if bet_type_seg == "👤 Player Props" else 2),
+                                key="recap_category_select"
+                            )
+
+                        with rc_col3:
+                            curr_choice = st.selectbox(
+                                "Hypothetical Currency:",
+                                ["PHP (₱)", "USD ($)", "EUR (€)", "GBP (£)", "AUD (A$)", "CAD (C$)", "JPY (¥)"],
+                                index=0,
+                                key="recap_curr_choice"
+                            )
+                            c_code = curr_choice.split(" ")[0]
+                            c_symbol = curr_choice.split("(")[1].replace(")", "") if "(" in curr_choice else "$"
+
+                        with rc_col4:
+                            default_stake = 1000.0 if c_code == "PHP" else (25.0 if c_code in ("USD", "EUR", "GBP") else 50.0)
+                            hypo_stake = st.number_input(
+                                f"Hypothetical Stake ({c_code}):",
+                                min_value=1.0,
+                                value=float(default_stake),
+                                step=100.0 if c_code == "PHP" else 5.0,
+                                key="recap_hypo_stake_input",
+                                help="Used to simulate hypothetical fiat earnings: e.g. 'If put 1,000 PHP / bet → Net Profit: +2,641 PHP'."
+                            )
+
+                        # Filter decided bets according to category
+                        if recap_cat == "👤 Player Props Only":
+                            base_pool = [b for b in all_bets if not (b.get('market') in ['SPREAD', 'TOTAL', 'spread', 'total'] or b.get('bet_type') in ['spread', 'total'])]
+                            cat_suffix = "PLAYER PROPS"
+                        elif recap_cat == "🏀 Game Lines Only":
+                            base_pool = [b for b in all_bets if b.get('market') in ['SPREAD', 'TOTAL', 'spread', 'total'] or b.get('bet_type') in ['spread', 'total']]
+                            cat_suffix = "GAME LINES"
+                        else:
+                            base_pool = list(all_bets)
+                            cat_suffix = "ALL MARKETS"
+
+                        decided_pool = [b for b in base_pool if b.get('result') in ('Win', 'Loss', 'Push')]
+
+                        # Timeframe date filtering
+                        today_str = now_dt.strftime('%Y-%m-%d')
+                        if recap_tf.startswith("🗓️ Past 7 Days"):
+                            c_date = (now_dt - timedelta(days=7)).strftime('%Y-%m-%d')
+                            recap_bets = [b for b in decided_pool if b.get('date', '') >= c_date]
+                            period_title = f"PAST 7 DAYS PERFORMANCE RECAP - {cat_suffix}"
+                            period_sub = f"Period: {c_date} to {today_str} • Verified Settled Plays"
+                        elif recap_tf.startswith("🗓️ Past 14 Days"):
+                            c_date = (now_dt - timedelta(days=14)).strftime('%Y-%m-%d')
+                            recap_bets = [b for b in decided_pool if b.get('date', '') >= c_date]
+                            period_title = f"PAST 14 DAYS PERFORMANCE RECAP - {cat_suffix}"
+                            period_sub = f"Period: {c_date} to {today_str} • Verified Settled Plays"
+                        elif recap_tf.startswith("📅 Current Month"):
+                            m_prefix = now_dt.strftime('%Y-%m')
+                            recap_bets = [b for b in decided_pool if b.get('date', '').startswith(m_prefix)]
+                            period_title = f"{now_dt.strftime('%B %Y').upper()} RECAP - {cat_suffix}"
+                            period_sub = f"Full Monthly Graded Results • {cur_month_name}"
+                        elif recap_tf.startswith("🏆 All-Time"):
+                            recap_bets = list(decided_pool)
+                            period_title = f"ALL-TIME PERFORMANCE RECAP - {cat_suffix}"
+                            period_sub = "Complete Historical Record • All Verified Plays"
+                        else:  # Custom Date Range
+                            cd_c1, cd_c2 = st.columns(2)
+                            with cd_c1:
+                                start_d = st.date_input("Start Date:", value=(now_dt - timedelta(days=7)).date(), key="recap_custom_start")
+                            with cd_c2:
+                                end_d = st.date_input("End Date:", value=now_dt.date(), key="recap_custom_end")
+                            s_str = start_d.strftime('%Y-%m-%d')
+                            e_str = end_d.strftime('%Y-%m-%d')
+                            recap_bets = [b for b in decided_pool if s_str <= b.get('date', '') <= e_str]
+                            period_title = f"PERFORMANCE RECAP ({s_str} TO {e_str}) - {cat_suffix}"
+                            period_sub = f"Custom Window: {s_str} to {e_str} • {len(recap_bets)} Settled Bets"
+
+                        # Generate Button
+                        rc_btn_c1, rc_btn_c2 = st.columns([1.5, 2.5])
+                        with rc_btn_c1:
+                            btn_text = f"📸 Copy Recap Card ({len(recap_bets)} Bets)" if recap_bets else "📸 No Settled Bets"
+                            if st.button(
+                                btn_text,
+                                use_container_width=True,
+                                disabled=(len(recap_bets) == 0),
+                                help="Generates a dark-mode summary card (Record, Win Rate, ROI %, Net Units, and hypothetical profit) and copies to Windows Clipboard (Ctrl+V ready).",
+                                key="btn_generate_recap_png"
+                            ):
+                                try:
+                                    from bet_slip_share import render_performance_recap_png, copy_png_bytes_to_windows_clipboard
+                                    recap_png_bytes = render_performance_recap_png(
+                                        recap_bets,
+                                        period_title=period_title,
+                                        period_subtitle=period_sub,
+                                        currency=c_code,
+                                        currency_symbol=c_symbol,
+                                        hypothetical_stake=float(hypo_stake),
+                                    )
+                                    st.session_state["last_shared_recap_png"] = recap_png_bytes
+                                    ok_clip, clip_msg = copy_png_bytes_to_windows_clipboard(recap_png_bytes)
+                                    if ok_clip:
+                                        st.toast(f"📋 {clip_msg}")
+                                        st.success(f"📋 **{clip_msg}**")
+                                    else:
+                                        st.info("Recap card generated below! Right-click the image to copy or click Download PNG.")
+                                except Exception as _recap_err:
+                                    st.error(f"Failed to generate recap card PNG: {_recap_err}")
+
+                        with rc_btn_c2:
+                            if recap_bets:
+                                r_wins = sum(1 for b in recap_bets if b.get('result') == 'Win')
+                                r_losses = sum(1 for b in recap_bets if b.get('result') == 'Loss')
+                                r_wr = (r_wins / (r_wins + r_losses) * 100.0) if (r_wins + r_losses) > 0 else 0.0
+                                st.caption(f"🎯 Selected Scope: **{len(recap_bets)} settled bets** • Record: **{r_wins}W - {r_losses}L** ({r_wr:.1f}% WR)")
+                            else:
+                                st.caption("⚠️ No settled bets found in this timeframe. Select a broader timeframe above.")
+
+                if st.session_state.get("last_shared_recap_png"):
+                    with st.expander("🖼️ Performance Recap PNG Preview (Copied to Clipboard — Press Ctrl+V to Paste)", expanded=True):
+                        rdl_c1, rdl_c2, rdl_c3 = st.columns([1, 1, 0.8])
+                        with rdl_c1:
+                            st.download_button(
+                                "📥 Download Recap Card (.png)",
+                                data=st.session_state["last_shared_recap_png"],
+                                file_name=f"nba_performance_recap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                                mime="image/png",
+                                use_container_width=True,
+                                key="btn_dl_recap_png"
+                            )
+                        with rdl_c2:
+                            if st.button("📋 Re-copy to Clipboard", key="recopy_recap_btn", use_container_width=True):
+                                from bet_slip_share import copy_png_bytes_to_windows_clipboard
+                                ok_recopy, msg_recopy = copy_png_bytes_to_windows_clipboard(st.session_state["last_shared_recap_png"])
+                                if ok_recopy:
+                                    st.toast("📋 Re-copied to clipboard!")
+                                else:
+                                    st.warning(msg_recopy)
+                        with rdl_c3:
+                            if st.button("✖️ Close Preview", key="close_recap_preview", use_container_width=True):
+                                del st.session_state["last_shared_recap_png"]
+                                st.rerun()
+
+                        prev_col1, prev_col2, prev_col3 = st.columns([0.5, 3.0, 0.5])
+                        with prev_col2:
+                            st.image(st.session_state["last_shared_recap_png"], width=600)
+
+                if st.session_state.get("last_shared_slip_png"):
+                    with st.expander("🖼️ Shared Bet Slip PNG Preview (Copied to Clipboard — Press Ctrl+V to Paste)", expanded=True):
+                        dl_c1, dl_c2, dl_c3 = st.columns([1, 1, 0.8])
+                        with dl_c1:
+                            st.download_button(
+                                "📥 Download Bet Slip (.png)",
+                                data=st.session_state["last_shared_slip_png"],
+                                file_name=f"nba_bet_slip_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                                mime="image/png",
+                                use_container_width=True,
+                            )
+                        with dl_c2:
+                            if st.button("📋 Re-copy to Clipboard", key="recopy_slip_btn", use_container_width=True):
+                                from bet_slip_share import copy_png_bytes_to_windows_clipboard
+                                ok_recopy, msg_recopy = copy_png_bytes_to_windows_clipboard(st.session_state["last_shared_slip_png"])
+                                if ok_recopy:
+                                    st.toast("📋 Re-copied to clipboard!")
+                                else:
+                                    st.warning(msg_recopy)
+                        with dl_c3:
+                            if st.button("✖️ Close Preview", key="close_slip_preview", use_container_width=True):
+                                del st.session_state["last_shared_slip_png"]
+                                st.rerun()
+
+                        # Constrain preview width for better UX (scrollable & centered preview card)
+                        prev_col1, prev_col2, prev_col3 = st.columns([1, 2.5, 1])
+                        with prev_col2:
+                            st.image(st.session_state["last_shared_slip_png"], width=440)
+
+                if not filtered_bets:
+                    st.info("No bets found matching current table filters.")
+                else:
+                    st.caption(f"Showing {len(filtered_bets)} of {total_count} bets in batch editor table")
                     with st.form(key="batch_bet_editor"):
                         c1, c2, c3, c4, c5 = st.columns([3, 1.2, 1, 1, 0.5])
                         c1.caption("Bet Details")
@@ -10515,20 +8857,44 @@ def main():
                                         clv_badge = f" | CLV: :{clv_color}[{clv_val:+.1f} pts]"
 
                                     tag_badge = f" `[{bet.get('tag')}]`" if bet.get('tag') else ""
-                                    opponent_text = f" vs {bet.get('opponent')}" if bet.get('opponent') else ""
+                                    _opp_raw = str(bet.get('opponent', '') or '').strip()
+                                    if _opp_raw and not is_game_bet and '@' not in str(bet.get('player', '')):
+                                        opponent_text = f" ({_opp_raw})" if '@' in _opp_raw else f" vs {_opp_raw}"
+                                    else:
+                                        opponent_text = ""
+                                    _side_raw = str(bet.get('side', '')).strip()
+                                    _pick_disp = _side_raw if any(c.isdigit() for c in _side_raw) else f"{_side_raw} {bet['line']}"
+                                    
+                                    tracked_time_badge = ""
+                                    _trk = bet.get('tracked_at')
+                                    if _trk:
+                                        try:
+                                            _dt = datetime.strptime(str(_trk).split('.')[0], "%Y-%m-%d %H:%M:%S")
+                                            tracked_time_badge = f" | 🕒 {_dt.strftime('%b %d, %I:%M %p')}"
+                                        except Exception:
+                                            tracked_time_badge = f" | 🕒 {_trk}"
+                                    elif isinstance(b_id, (int, float)) and b_id > 1_600_000_000_000:
+                                        _dt = datetime.fromtimestamp(b_id / 1000.0)
+                                        tracked_time_badge = f" | 🕒 {_dt.strftime('%b %d, %I:%M %p')}"
+
                                     st.markdown(f"**{type_icon} {bet['player']}** `{bet['market']}`{tag_badge}")
-                                    st.caption(f"{icon} :{color}[{bet['side']} {bet['line']}]{opponent_text} | Proj: {proj_val:.1f} | EV: {bet.get('ev',0):.1%} | Stake: ${bet.get('stake', 0):.0f} | Odds: {odds_text}{clv_badge}")
+                                    st.caption(f"{icon} :{color}[{_pick_disp}]{opponent_text} | Proj: {proj_val:.1f} | EV: {bet.get('ev',0):.1%} | Stake: ${bet.get('stake', 0):.0f} | Odds: {odds_text}{clv_badge}{tracked_time_badge}")
                                 
                                 with c2:
                                     opts = ["Pending", "Win", "Loss", "Push"]
-                                    idx = opts.index(bet_res) if bet_res in opts else 0
-                                    st.selectbox("Res", opts, index=idx, key=f"s_{b_id}", label_visibility="collapsed")
+                                    # Ensure widget session_state stays synced if disk result changed via Auto-Settle
+                                    if f"s_{b_id}" not in st.session_state or st.session_state.get(f"_disk_res_{b_id}") != bet_res:
+                                        st.session_state[f"_disk_res_{b_id}"] = bet_res
+                                        st.session_state[f"s_{b_id}"] = bet_res if bet_res in opts else "Pending"
+                                        st.session_state[f"av_{b_id}"] = float(bet.get('actual_value', 0) or 0)
+                                        st.session_state[f"cl_{b_id}"] = float(bet.get('closing_line', bet['line']) or bet['line'])
+                                    st.selectbox("Res", opts, index=None, key=f"s_{b_id}", label_visibility="collapsed")
                                 
                                 with c3:
-                                    st.number_input("Act", value=float(bet.get('actual_value', 0)), step=1.0, key=f"av_{b_id}", label_visibility="collapsed")
+                                    st.number_input("Act", step=1.0, key=f"av_{b_id}", label_visibility="collapsed")
                                 
                                 with c4:
-                                    st.number_input("Clv", value=float(bet.get('closing_line', bet['line'])), step=0.5, key=f"cl_{b_id}", label_visibility="collapsed")
+                                    st.number_input("Clv", step=0.5, key=f"cl_{b_id}", label_visibility="collapsed")
                                 
                                 with c5:
                                     # Accessibility: provide a non-empty label but hide it visually
@@ -10583,7 +8949,7 @@ def main():
                             st.experimental_rerun()
                     with c2:
                         if st.button("Backup & reset tracker (safe)"):
-                            import shutil, time
+                            import shutil
                             bak = tracker_path.with_name(f"{tracker_path.name}.bak.{int(time.time())}")
                             shutil.copy2(tracker_path, bak)
                             tracker._save([])
@@ -10599,50 +8965,129 @@ def main():
             st.markdown("---")
             with st.expander("📊 Real Harvested Closing Odds Feed (League-Wide Database)", expanded=False):
                 st.caption("Farmed daily closing lines and settled game outcomes from official sportsbooks (DraftKings, FanDuel, BetMGM).")
+
+                # Action Bar
+                act_c1, act_c2, act_c3 = st.columns([2.5, 1.3, 1.2])
+                with act_c1:
+                    st.caption("Closing odds & box scores automatically graded against official NBA final box scores.")
+                with act_c2:
+                    if st.button("🔄 Settle Recent Slates", use_container_width=True, help="Check and settle finished games & player props across the last 5 slates against ESPN box scores"):
+                        with st.spinner("Settling games & props against ESPN final box scores..."):
+                            from scripts.harvest_closing_odds import settle_games_for_date
+                            from scripts.harvest_player_props import settle_player_props_for_date
+                            settled_g_cnt = 0
+                            settled_p_cnt = 0
+                            for d_offset in range(4, -1, -1):
+                                chk_d = (datetime.now() - timedelta(days=d_offset)).strftime("%Y-%m-%d")
+                                try:
+                                    g_res = settle_games_for_date(chk_d)
+                                    settled_g_cnt += len(g_res)
+                                except Exception:
+                                    pass
+                                try:
+                                    p_res = settle_player_props_for_date(chk_d)
+                                    if p_res is not None:
+                                        settled_p_cnt += len(p_res)
+                                except Exception:
+                                    pass
+                            st.success(f"Settlement complete! ({settled_g_cnt} games, {settled_p_cnt} props)")
+                            time.sleep(0.5)
+                            st.rerun()
+                with act_c3:
+                    if st.button("📡 Sync TrueNAS", use_container_width=True, help="Pull latest harvested odds & settled databases from TrueNAS / GitHub"):
+                        try:
+                            from server_sync import sync_from_home_server
+                            s_res = sync_from_home_server()
+                            st.toast(f"✅ {s_res.get('message', 'Synced!')}")
+                        except Exception as _sync_err:
+                            st.warning(f"Sync note: {_sync_err}")
+                        time.sleep(0.5)
+                        st.rerun()
+
+                games_csv = Path("data/harvested_odds/settled_games.csv")
+                props_pqt = Path("data/harvested_odds/settled_player_props.parquet")
+                
+                g_df = pd.read_csv(games_csv) if games_csv.exists() else pd.DataFrame()
+                p_df = pd.read_parquet(props_pqt) if props_pqt.exists() else pd.DataFrame()
+
+                # Metric Cards
+                total_settled_games = len(g_df)
+                total_settled_props = len(p_df)
+                latest_game_date = str(g_df['date'].max()) if not g_df.empty and 'date' in g_df.columns else "None"
+                latest_prop_date = str(p_df['date'].max()) if not p_df.empty and 'date' in p_df.columns else "None"
+
+                sm1, sm2, sm3, sm4 = st.columns(4)
+                sm1.metric("Settled Games", f"{total_settled_games:,}")
+                sm2.metric("Latest Game Slate", latest_game_date)
+                sm3.metric("Settled Props", f"{total_settled_props:,}")
+                sm4.metric("Latest Prop Slate", latest_prop_date)
+
                 h_tab1, h_tab2 = st.tabs(["🏀 Settled Games (Spreads & Totals)", "👤 Settled Player Props (Closing Lines)"])
                 with h_tab1:
-                    games_csv = Path("data/harvested_odds/settled_games.csv")
-                    if games_csv.exists():
-                        g_df = pd.read_csv(games_csv)
-                        if not g_df.empty:
-                            st.dataframe(g_df.tail(20), use_container_width=True)
-                        else:
-                            st.info("No settled games harvested yet.")
+                    if not g_df.empty:
+                        g_df = g_df.sort_values("date", ascending=False)
+                        all_g_dates = ["ALL Slates"] + sorted(g_df['date'].unique().tolist(), reverse=True)
+
+                        g_f1, g_f2, g_f3 = st.columns([1.5, 1.5, 1])
+                        with g_f1:
+                            sel_g_date = st.selectbox("Filter Game Slate:", all_g_dates, index=0, key="feed_game_date_filter")
+                        with g_f2:
+                            g_search = st.text_input("Search Team / Matchup:", "", key="feed_game_search").strip().upper()
+                        with g_f3:
+                            g_limit = st.selectbox("Show Rows:", [25, 50, 100, "All"], index=0, key="feed_game_limit")
+
+                        filtered_g = g_df.copy()
+                        if sel_g_date != "ALL Slates":
+                            filtered_g = filtered_g[filtered_g['date'] == sel_g_date]
+                        if g_search:
+                            filtered_g = filtered_g[
+                                filtered_g['matchup'].astype(str).str.upper().str.contains(g_search) |
+                                filtered_g['home_team'].astype(str).str.upper().str.contains(g_search) |
+                                filtered_g['away_team'].astype(str).str.upper().str.contains(g_search)
+                            ]
+
+                        st.caption(f"Showing {len(filtered_g)} of {len(g_df)} settled games")
+                        disp_cols_g = [c for c in ['date', 'matchup', 'away_score', 'home_score', 'actual_margin', 'closing_spread', 'ats_winner', 'actual_total', 'closing_total', 'ou_winner', 'settled_at'] if c in filtered_g.columns]
+                        if g_limit != "All":
+                            filtered_g = filtered_g.head(int(g_limit))
+                        st.dataframe(filtered_g[disp_cols_g], use_container_width=True)
                     else:
-                        st.info("Harvested games database will appear here after first game settlement.")
+                        st.info("No settled games harvested yet. Click '🔄 Settle Recent Slates' above to populate.")
+
                 with h_tab2:
-                    props_pqt = Path("data/harvested_odds/settled_player_props.parquet")
-                    if props_pqt.exists():
-                        p_df = pd.read_parquet(props_pqt)
-                        if not p_df.empty:
-                            m_filter = st.selectbox("Filter Market:", ["ALL"] + sorted(p_df['market'].unique()), key="harvest_market_filter")
-                            if m_filter != "ALL":
-                                p_df = p_df[p_df['market'] == m_filter]
-                            disp_cols = [c for c in ['date', 'player', 'market', 'closing_line', 'line_movement', 'actual_value', 'margin', 'result', 'side', 'minutes_played'] if c in p_df.columns]
-                            st.dataframe(p_df[disp_cols].tail(50), use_container_width=True)
-                        else:
-                            st.info("No settled player props harvested yet.")
+                    if not p_df.empty:
+                        p_df = p_df.sort_values("date", ascending=False)
+                        all_p_dates = ["ALL Slates"] + sorted(p_df['date'].unique().tolist(), reverse=True)
+                        all_markets = ["ALL"] + sorted([str(m) for m in p_df['market'].dropna().unique()])
+
+                        p_f1, p_f2, p_f3, p_f4 = st.columns([1.2, 1.2, 1.4, 0.8])
+                        with p_f1:
+                            def_idx = 1 if len(all_p_dates) > 1 else 0
+                            sel_p_date = st.selectbox("Filter Prop Slate:", all_p_dates, index=def_idx, key="feed_prop_date_filter")
+                        with p_f2:
+                            sel_mkt = st.selectbox("Filter Market:", all_markets, index=0, key="feed_prop_mkt_filter")
+                        with p_f3:
+                            p_search = st.text_input("Search Player:", "", key="feed_prop_player_search").strip().lower()
+                        with p_f4:
+                            p_limit = st.selectbox("Show Rows:", [50, 100, 250, "All"], index=0, key="feed_prop_limit")
+
+                        filtered_p = p_df.copy()
+                        if sel_p_date != "ALL Slates":
+                            filtered_p = filtered_p[filtered_p['date'] == sel_p_date]
+                        if sel_mkt != "ALL":
+                            filtered_p = filtered_p[filtered_p['market'] == sel_mkt]
+                        if p_search:
+                            filtered_p = filtered_p[filtered_p['player'].astype(str).str.lower().str.contains(p_search)]
+
+                        st.caption(f"Showing {len(filtered_p)} of {len(p_df):,} settled player props (Date: {sel_p_date})")
+                        disp_cols_p = [c for c in ['date', 'player', 'matchup', 'market', 'side', 'closing_line', 'actual_value', 'margin', 'result', 'odds_american', 'book_name', 'minutes_played'] if c in filtered_p.columns]
+                        if p_limit != "All":
+                            filtered_p = filtered_p.head(int(p_limit))
+                        st.dataframe(filtered_p[disp_cols_p], use_container_width=True)
                     else:
-                        st.info("Harvested player props database will appear here after first prop settlement.")
+                        st.info("No settled player props harvested yet. Click '🔄 Settle Recent Slates' above to populate.")
 
-    # Tab 7: Parlays
-    with tab7:
-        render_parlay_tab(parlay_tracker, bankroll, bankroll_enabled)
-    
-    # Tab 8: ML Data (UPDATED)
-    with tab8:
-        # We now have 3 sub-tabs
-        ml_subtab1, ml_subtab2, ml_subtab3 = st.tabs(["Training Data", "Generate Dataset", "Train Brain"])
-        
-        with ml_subtab1:
-            render_ml_data_tab(tracker)
-        
-        with ml_subtab2:
-            generate_ml_data_streamlit()
-            
-        with ml_subtab3:
-            render_train_model_tab()
-
+    # Tab 9: Analytics
     with tab9:
         render_analytics_tab(tracker)
 

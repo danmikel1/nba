@@ -265,27 +265,51 @@ def harvest_from_espn(date_str: str) -> List[Dict[str, Any]]:
         if not home_team or not away_team:
             continue
 
-        # Look up odds in summary pickcenter
+        # 1. Primary: Extract odds directly from comp.get("odds") in scoreboard (fast & reliable)
         spread_home = None
         total_line = None
         provider = "DraftKings"
 
-        try:
-            r_sum = requests.get(ESPN_SUMMARY, params={"event": event_id}, timeout=10)
-            if r_sum.status_code == 200:
-                sum_data = r_sum.json()
-                pickcenter = sum_data.get("pickcenter", [])
-                if pickcenter:
-                    pc = pickcenter[0]
-                    provider = pc.get("provider", {}).get("name", "DraftKings")
-                    total_val = pc.get("overUnder")
-                    spread_val = pc.get("spread")
-                    if total_val is not None:
-                        total_line = float(total_val)
-                    if spread_val is not None:
-                        spread_home = float(spread_val)
-        except Exception as ex:
-            logger.debug(f"Could not load ESPN summary for event {event_id}: {ex}")
+        comp_odds = comp.get("odds", [])
+        if comp_odds:
+            co = comp_odds[0]
+            provider = co.get("provider", {}).get("name", "DraftKings")
+            if co.get("overUnder") is not None:
+                try:
+                    total_line = float(co["overUnder"])
+                except (ValueError, TypeError):
+                    pass
+            # In ESPN scoreboard odds, pointSpread has home line
+            ps_home = co.get("pointSpread", {}).get("home", {}).get("close", {}).get("line")
+            if ps_home is not None:
+                try:
+                    spread_home = float(str(ps_home).replace("+", ""))
+                except (ValueError, TypeError):
+                    pass
+            if spread_home is None and co.get("spread") is not None:
+                try:
+                    spread_home = float(co["spread"])
+                except (ValueError, TypeError):
+                    pass
+
+        # 2. Fallback: Query summary pickcenter if odds still missing
+        if spread_home is None or total_line is None:
+            try:
+                r_sum = requests.get(ESPN_SUMMARY, params={"event": event_id}, timeout=10)
+                if r_sum.status_code == 200:
+                    sum_data = r_sum.json()
+                    pickcenter = sum_data.get("pickcenter", [])
+                    if pickcenter:
+                        pc = pickcenter[0]
+                        provider = pc.get("provider", {}).get("name", provider)
+                        total_val = pc.get("overUnder")
+                        spread_val = pc.get("spread")
+                        if total_line is None and total_val is not None:
+                            total_line = float(total_val)
+                        if spread_home is None and spread_val is not None:
+                            spread_home = float(spread_val)
+            except Exception as ex:
+                logger.debug(f"Could not load ESPN summary for event {event_id}: {ex}")
 
         games.append({
             "source": "espn",
@@ -468,7 +492,7 @@ def settle_games_for_date(date_str: str) -> List[Dict[str, Any]]:
                 pred = model_pred_func(
                     home=home,
                     away=away,
-                    vegas_spread=-spread if spread < 0 else spread,  # match model conventions
+                    vegas_spread=-float(spread),  # sportsbook home spread (-3.5) -> model expected margin (+3.5)
                     vegas_total=total,
                 )
                 if pred:

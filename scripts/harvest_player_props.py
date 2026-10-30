@@ -73,6 +73,25 @@ PROP_MARKET_MAP = {
     "RA": "core_bet_type_88_rebounds_assists",
 }
 
+# Action Network Sportsbook IDs in raw_markets:
+#   "30" = Official Opening Line ("Open")
+#   "68" = DraftKings
+#   "69" = FanDuel
+#   "15" = Market Consensus
+#   "49" = Caesars
+#   "71" = BetRivers
+#   "75" = BetMGM (often contains alt/ladder lines when main lines exist elsewhere)
+BOOK_ID_NAMES = {
+    "30": "Open",
+    "68": "DraftKings",
+    "69": "FanDuel",
+    "15": "Consensus",
+    "49": "Caesars",
+    "71": "BetRivers",
+    "75": "BetMGM",
+}
+CLOSING_BOOK_PRIORITY = ["68", "69", "15", "49", "71", "30", "75"]
+
 API_BASE = "https://api.actionnetwork.com/web/v2/scoreboard/nba/markets"
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
@@ -97,15 +116,19 @@ def american_to_decimal(american_odds: int) -> float:
 
 
 def normalize_player_name(raw_name: str) -> str:
-    """Clean and normalize player names."""
+    """Clean and normalize player names (stripping accents, apostrophes, periods, hyphens, and suffixes)."""
     if not raw_name:
         return ""
-    clean = raw_name.strip()
-    for suffix in [" Jr.", " Sr.", " Jr", " Sr", " III", " II", " IV"]:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(raw_name)).encode("ASCII", "ignore").decode("utf-8")
+    clean = s.strip()
+    for suffix in [" Jr.", " Sr.", " Jr", " Sr", " III", " II", " IV", " jr", " sr", " iii", " ii", " iv"]:
         if clean.endswith(suffix):
             clean = clean[:-len(suffix)]
-    clean = clean.replace(".", "").replace("'", "")
-    return clean.strip()
+    for ch in ("'", "’", "`", "."):
+        clean = clean.replace(ch, "")
+    clean = clean.replace("-", " ")
+    return " ".join(clean.split())
 
 
 def is_game_started(start_time_str: str) -> bool:
@@ -218,93 +241,136 @@ def harvest_player_props_for_date(date_str: str) -> List[Dict[str, Any]]:
                 }
 
         market_count = 0
-        for gid, g_market_dict in raw_markets.items():
-            if not isinstance(g_market_dict, dict):
+        # raw_markets is keyed by book_id ("30"=Open, "68"=DraftKings, "69"=FanDuel, "15"=Consensus, etc.)
+        # Group all book quotes by (player_id, event_id, side) so we never overwrite Open with Alt books
+        grouped_quotes: Dict[Tuple[Any, Any, str], Dict[str, Dict[str, Any]]] = {}
+        for book_id_str, book_market_dict in raw_markets.items():
+            if not isinstance(book_market_dict, dict):
                 continue
-            event_items = g_market_dict.get("event", {}).get(pick_type, [])
-
+            event_items = book_market_dict.get("event", {}).get(pick_type, [])
             for line_item in event_items:
+                if line_item.get("is_alt_market"):
+                    continue
                 pid = line_item.get("player_id")
                 event_id = line_item.get("event_id")
-                p_info = player_lookup.get(pid, {})
-                g_info = game_lookup.get(event_id, {})
-
-                player_name = p_info.get("full_name") or p_info.get("abbr", f"Player_{pid}")
-                line_val = float(line_item.get("value", 0))
                 side = str(line_item.get("side", "over")).upper()
-                odds_american = int(line_item.get("odds", -110))
-                odds_decimal = american_to_decimal(odds_american)
+                if pid is None or event_id is None:
+                    continue
+                grouped_quotes.setdefault((pid, event_id, side), {})[str(book_id_str)] = line_item
 
-                key = (player_name, market_code, side)
-                start_time_str = g_info.get("start_time", "")
-                game_started = is_game_started(start_time_str)
+        for (pid, event_id, side), books_map in grouped_quotes.items():
+            p_info = player_lookup.get(pid, {})
+            g_info = game_lookup.get(event_id, {})
+            player_name = p_info.get("full_name") or p_info.get("abbr", f"Player_{pid}")
 
-                if key in existing_lookup:
-                    existing = existing_lookup[key]
-                    # If game already started, do not overwrite closing lines with in-game live odds
-                    if existing.get("is_closed"):
-                        all_props_dict[key] = existing
-                        continue
-                    if game_started:
-                        # Game just started: lock closing line
-                        existing["is_closed"] = True
-                        existing["closed_at"] = now_iso
-                        all_props_dict[key] = existing
-                        continue
+            # 1. Select best Current / Closing quote according to sharp book priority
+            curr_item = None
+            selected_book_id_str = None
+            for b_id in CLOSING_BOOK_PRIORITY:
+                if b_id in books_map:
+                    curr_item = books_map[b_id]
+                    selected_book_id_str = b_id
+                    break
+            if not curr_item:
+                selected_book_id_str, curr_item = next(iter(books_map.items()))
 
-                    # Game still pre-game: update closing quote and measure line movement
-                    open_line = existing.get("opening_line", line_val)
-                    open_odds_am = existing.get("opening_odds_american", odds_american)
-                    open_odds_dec = existing.get("opening_odds_decimal", odds_decimal)
+            line_val = float(curr_item.get("value", 0))
+            odds_american = int(curr_item.get("odds", -110))
+            odds_decimal = american_to_decimal(odds_american)
+            book_id_int = int(curr_item.get("book_id") or selected_book_id_str)
+            book_name = BOOK_ID_NAMES.get(str(selected_book_id_str), f"Book_{selected_book_id_str}")
 
-                    line_mov = round(line_val - open_line, 2)
-                    odds_mov = round(odds_decimal - open_odds_dec, 3)
+            # 2. Extract official Opening quote from Book "30" ("Open") when available
+            open_item = books_map.get("30")
+            api_open_line = float(open_item.get("value", line_val)) if open_item else None
+            api_open_odds_am = int(open_item.get("odds", odds_american)) if open_item else None
+            api_open_odds_dec = american_to_decimal(api_open_odds_am) if api_open_odds_am is not None else None
 
-                    prop_record = {
-                        **existing,
-                        "line": line_val,
-                        "closing_line": line_val,
-                        "line_movement": line_mov,
-                        "opening_line": open_line,
-                        "odds_american": odds_american,
-                        "odds_decimal": odds_decimal,
-                        "opening_odds_american": open_odds_am,
-                        "opening_odds_decimal": open_odds_dec,
-                        "odds_movement": odds_mov,
-                        "is_closed": False,
-                        "last_updated_at": now_iso,
-                    }
-                else:
-                    # Initial line capture
-                    prop_record = {
-                        "date": date_str,
-                        "event_id": event_id,
-                        "player_id": pid,
-                        "player": player_name,
-                        "position": p_info.get("position", ""),
-                        "home_team": g_info.get("home_team", ""),
-                        "away_team": g_info.get("away_team", ""),
-                        "matchup": g_info.get("matchup", ""),
-                        "start_time": start_time_str,
-                        "market": market_code,
-                        "line": line_val,
-                        "opening_line": line_val,
-                        "closing_line": line_val,
-                        "line_movement": 0.0,
-                        "side": side,
-                        "odds_american": odds_american,
-                        "odds_decimal": odds_decimal,
-                        "opening_odds_american": odds_american,
-                        "opening_odds_decimal": odds_decimal,
-                        "odds_movement": 0.0,
-                        "book_id": line_item.get("book_id"),
-                        "first_seen_at": now_iso,
-                        "last_updated_at": now_iso,
-                        "is_closed": game_started,
-                    }
+            key = (player_name, market_code, side)
+            start_time_str = g_info.get("start_time", "")
+            game_started = is_game_started(start_time_str)
 
-                all_props_dict[key] = prop_record
-                market_count += 1
+            if key in existing_lookup:
+                existing = existing_lookup[key]
+                # Determine true opening line (prefer official Book 30 "Open" if existing had 0 movement or no Book 30 backfill)
+                open_line = api_open_line if api_open_line is not None else existing.get("opening_line", line_val)
+                open_odds_am = api_open_odds_am if api_open_odds_am is not None else existing.get("opening_odds_american", odds_american)
+                open_odds_dec = api_open_odds_dec if api_open_odds_dec is not None else existing.get("opening_odds_decimal", odds_decimal)
+
+                # If game already started and was previously locked, preserve locked closing line (unless existing came from Book 75 alt)
+                if existing.get("is_closed") and str(existing.get("book_id")) != "75":
+                    locked_close = float(existing.get("closing_line", existing.get("line", line_val)))
+                    locked_odds_am = int(existing.get("odds_american", odds_american))
+                    locked_odds_dec = float(existing.get("odds_decimal", odds_decimal))
+                    existing["opening_line"] = open_line
+                    existing["opening_odds_american"] = open_odds_am
+                    existing["opening_odds_decimal"] = open_odds_dec
+                    existing["line_movement"] = round(locked_close - open_line, 2)
+                    existing["odds_movement"] = round(locked_odds_dec - open_odds_dec, 3)
+                    all_props_dict[key] = existing
+                    market_count += 1
+                    continue
+
+                line_mov = round(line_val - open_line, 2)
+                odds_mov = round(odds_decimal - open_odds_dec, 3)
+
+                prop_record = {
+                    **existing,
+                    "line": line_val,
+                    "closing_line": line_val,
+                    "line_movement": line_mov,
+                    "opening_line": open_line,
+                    "odds_american": odds_american,
+                    "odds_decimal": odds_decimal,
+                    "opening_odds_american": open_odds_am,
+                    "opening_odds_decimal": open_odds_dec,
+                    "odds_movement": odds_mov,
+                    "book_id": book_id_int,
+                    "book_name": book_name,
+                    "is_closed": game_started,
+                    "last_updated_at": now_iso,
+                }
+                if game_started and not existing.get("closed_at"):
+                    prop_record["closed_at"] = now_iso
+            else:
+                # Initial line capture — use Book 30 ("Open") as opening_line if available
+                open_line = api_open_line if api_open_line is not None else line_val
+                open_odds_am = api_open_odds_am if api_open_odds_am is not None else odds_american
+                open_odds_dec = api_open_odds_dec if api_open_odds_dec is not None else odds_decimal
+
+                line_mov = round(line_val - open_line, 2)
+                odds_mov = round(odds_decimal - open_odds_dec, 3)
+
+                prop_record = {
+                    "date": date_str,
+                    "event_id": event_id,
+                    "player_id": pid,
+                    "player": player_name,
+                    "position": p_info.get("position", ""),
+                    "home_team": g_info.get("home_team", ""),
+                    "away_team": g_info.get("away_team", ""),
+                    "matchup": g_info.get("matchup", ""),
+                    "start_time": start_time_str,
+                    "market": market_code,
+                    "line": line_val,
+                    "opening_line": open_line,
+                    "closing_line": line_val,
+                    "line_movement": line_mov,
+                    "side": side,
+                    "odds_american": odds_american,
+                    "odds_decimal": odds_decimal,
+                    "opening_odds_american": open_odds_am,
+                    "opening_odds_decimal": open_odds_dec,
+                    "odds_movement": odds_mov,
+                    "book_id": book_id_int,
+                    "book_name": book_name,
+                    "first_seen_at": now_iso,
+                    "last_updated_at": now_iso,
+                    "is_closed": game_started,
+                }
+
+            all_props_dict[key] = prop_record
+            market_count += 1
 
         logger.info(f"  {market_code:5s}: processed {market_count} lines")
 
@@ -345,6 +411,19 @@ def fetch_espn_player_boxscores(date_str: str) -> Dict[str, Dict[str, float]]:
         eid = ev.get("id")
         if not eid:
             continue
+
+        # Strictly enforce that games must be FINAL/completed before taking boxscores
+        status = ev.get("status", {}).get("type", {})
+        if not status:
+            comp_status = ev.get("competitions", [{}])[0].get("status", {}).get("type", {})
+            status = comp_status or {}
+        state = str(status.get("state", "")).lower()
+        completed = status.get("completed", False) is True
+        desc = str(status.get("description", "")).upper()
+        is_final = (state == "post" and completed) or ("FINAL" in desc and state == "post")
+        if not is_final:
+            continue
+
         try:
             r_sum = requests.get(ESPN_SUMMARY, params={"event": eid}, timeout=10)
             if r_sum.status_code != 200:

@@ -255,6 +255,22 @@ class ModelEngine:
             'feat_form_gap': float(getattr(features, 'feat_form_gap', 0.0)),
             'feat_market_rare': float(getattr(features, 'market_rare', 0.0)),
         }
+
+        lstm_mom = float(getattr(features, 'feat_lstm_momentum', 0.0) or 0.0)
+        lstm_fg = float(getattr(features, 'feat_lstm_fatigue_gate', 0.5) if getattr(features, 'feat_lstm_fatigue_gate', None) is not None else 0.5)
+        if lstm_mom == 0.0 and abs(lstm_fg - 0.5) < 1e-6 and (
+            'feat_lstm_momentum' in expected_features or 'feat_lstm_fatigue_gate' in expected_features
+        ):
+            try:
+                if not hasattr(self, '_lstm_scout') or self._lstm_scout is None:
+                    from lstm_feature_scout import LSTMFeatureScoutEngine
+                    self._lstm_scout = LSTMFeatureScoutEngine()
+                mkt = getattr(features, 'market', None) or 'PTS'
+                lstm_mom, lstm_fg = self._lstm_scout.predict_live_features(features, mkt)
+            except Exception:
+                pass
+        feature_map['feat_lstm_momentum'] = lstm_mom
+        feature_map['feat_lstm_fatigue_gate'] = lstm_fg
         
         values = []
         for feat_name in expected_features:

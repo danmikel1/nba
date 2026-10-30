@@ -41,8 +41,9 @@ from xgboost import XGBRegressor
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path("data")
-MODELS_DIR = Path("models") / "game"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+MODELS_DIR = BASE_DIR / "models" / "game"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 GAME_CSV = DATA_DIR / "nba_2008-2025.csv"

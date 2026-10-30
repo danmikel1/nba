@@ -11,6 +11,7 @@ import pytest
 
 from scripts.harvest_player_props import (
     american_to_decimal,
+    harvest_player_props_for_date,
     normalize_player_name,
     PROP_MARKET_MAP,
     settle_player_props_for_date,
@@ -95,3 +96,67 @@ def test_settle_player_props_logic(tmp_path):
         assert mitchell_row["margin"] == -1.5
         assert mitchell_row["result"] == "WIN"
         assert bool(mitchell_row["over_hit"]) is False
+
+
+def test_harvest_extracts_open_vs_closing_line_movement(tmp_path):
+    """
+    Verify that harvest_player_props_for_date extracts Book '30' (Open) as opening_line,
+    selects sharp closing book '68' (DraftKings) over '75' (BetMGM alt), and computes
+    nonzero line_movement and odds_movement.
+    """
+    mock_api_payload = {
+        "players": [
+            {"id": 999, "full_name": "Nikola Jokic", "abbr": "N.Jokic", "position": "C", "team_id": 1}
+        ],
+        "games": [
+            {
+                "id": 295142,
+                "start_time": "2099-10-23T01:30:00.000Z",
+                "home_team": {"abbr": "OKC"},
+                "away_team": {"abbr": "DEN"},
+            }
+        ],
+        "markets": {
+            "30": {  # Official Open Book
+                "event": {
+                    "core_bet_type_27_points": [
+                        {"player_id": 999, "event_id": 295142, "side": "over", "value": 27.5, "odds": -104, "book_id": 30}
+                    ]
+                }
+            },
+            "68": {  # DraftKings Current/Closing
+                "event": {
+                    "core_bet_type_27_points": [
+                        {"player_id": 999, "event_id": 295142, "side": "over", "value": 24.5, "odds": -110, "book_id": 68}
+                    ]
+                }
+            },
+            "75": {  # BetMGM Ladder/Alt (should not override DraftKings)
+                "event": {
+                    "core_bet_type_27_points": [
+                        {"player_id": 999, "event_id": 295142, "side": "over", "value": 18.5, "odds": -350, "book_id": 75}
+                    ]
+                }
+            },
+        },
+    }
+
+    def fake_fetch(pick_type, date_compact):
+        if pick_type == "core_bet_type_27_points":
+            return mock_api_payload
+        return {"players": [], "games": [], "markets": {}}
+
+    with patch("scripts.harvest_player_props.HARVEST_DIR", tmp_path), \
+         patch("scripts.harvest_player_props.fetch_market_lines_http", side_effect=fake_fetch):
+        props = harvest_player_props_for_date("2026-10-22")
+        assert len(props) == 1
+        p = props[0]
+        assert p["player"] == "Nikola Jokic"
+        assert p["opening_line"] == 27.5
+        assert p["closing_line"] == 24.5
+        assert p["line"] == 24.5
+        assert p["line_movement"] == -3.0
+        assert p["book_name"] == "DraftKings"
+        assert p["opening_odds_american"] == -104
+        assert p["odds_american"] == -110
+
