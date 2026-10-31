@@ -2434,6 +2434,13 @@ class ModelEngine:
                 
                 # Validate it's a proper quantile dict
                 if isinstance(quantile_dict, dict) and 'q50' in quantile_dict:
+                    for _qk, _qm in quantile_dict.items():
+                        if hasattr(_qm, 'set_params'):
+                            try:
+                                _qm.set_params(device='cpu')
+                                _qm.get_booster().set_param({'device': 'cpu'})
+                            except Exception:
+                                pass
                     # Detect quantile width: new models have q05/q95, old have q10/q90
                     is_wide_quantile = 'q05' in quantile_dict or 'q95' in quantile_dict
                     quantile_dict['_wide_quantile'] = is_wide_quantile
