@@ -58,6 +58,7 @@ SETTLED_CSV = HARVEST_DIR / "settled_games.csv"
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary"
 ODDS_API_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
+ODDSPAPI_BASE_URL = "https://api.oddspapi.io/v4"
 
 # Standard NBA team abbreviations
 TEAM_MAP = {
@@ -216,7 +217,183 @@ def harvest_from_the_odds_api(api_key: Optional[str] = None) -> List[Dict[str, A
 
 
 # ===========================================================================
-# 2. ESPN PUBLIC API INGESTION (FREE FALLBACK + SCORES)
+# 2. ODDSPAPI BC.GAME INGESTION (PRIMARY USER SPORTSBOOK)
+# ===========================================================================
+
+def harvest_from_oddspapi_bcgame(api_key: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Harvest live NBA game odds (spreads, totals, moneylines, and alternate lines)
+    directly from BC.Game via OddsPapi.io.
+    """
+    key = api_key or os.getenv("ODDSPAPI_API_KEY")
+    if not key:
+        logger.info("ODDSPAPI_API_KEY not found in environment; skipping BC.Game OddsPapi source.")
+        return []
+
+    # Load or fetch markets catalog
+    catalog_path = PROJECT_ROOT / "data" / "oddspapi_cache" / "_markets_catalog.json"
+    markets_map: Dict[int, Dict[str, Any]] = {}
+    if catalog_path.exists():
+        try:
+            raw_cat = safe_json_load(catalog_path, default=[])
+            if isinstance(raw_cat, list):
+                markets_map = {m["marketId"]: m for m in raw_cat if "marketId" in m}
+            elif isinstance(raw_cat, dict):
+                markets_map = {int(k) if str(k).isdigit() else k: v for k, v in raw_cat.items()}
+        except Exception as e:
+            logger.warning(f"Failed loading cached markets catalog: {e}")
+
+    if not markets_map:
+        try:
+            r_m = requests.get(f"{ODDSPAPI_BASE_URL}/markets", params={"apiKey": key, "sportId": 11}, timeout=15)
+            if r_m.status_code == 200:
+                raw_list = r_m.json()
+                if isinstance(raw_list, list):
+                    markets_map = {m["marketId"]: m for m in raw_list}
+        except Exception as e:
+            logger.warning(f"Could not fetch markets catalog from OddsPapi: {e}")
+
+    try:
+        resp = requests.get(
+            f"{ODDSPAPI_BASE_URL}/odds-by-tournaments",
+            params={
+                "apiKey": key,
+                "tournamentIds": "132",
+                "bookmakers": "bcgame",
+                "verbosity": 3,
+                "oddsFormat": "decimal",
+            },
+            timeout=25,
+        )
+        if resp.status_code != 200:
+            logger.warning(f"OddsPapi returned status {resp.status_code}: {resp.text[:200]}")
+            return []
+
+        fixtures = resp.json()
+        if not isinstance(fixtures, list):
+            return []
+
+        games = []
+        for f in fixtures:
+            p1 = f.get("participant1Name", "")  # Home
+            p2 = f.get("participant2Name", "")  # Away
+            home = normalize_team(p1)
+            away = normalize_team(p2)
+            if not home or not away:
+                continue
+
+            start_time = f.get("startTime", "")
+            game_date = start_time[:10] if start_time else ""
+
+            bc = (f.get("bookmakerOdds") or {}).get("bcgame") or {}
+            mkts = bc.get("markets") or {}
+            if not mkts:
+                continue
+
+            main_spread = None
+            main_total = None
+            ml_home = None
+            ml_away = None
+            spread_home_price = None
+            spread_away_price = None
+            total_over_price = None
+            total_under_price = None
+
+            alt_totals = []
+            alt_spreads = []
+
+            for mid_str, m in mkts.items():
+                try:
+                    mid = int(mid_str)
+                except ValueError:
+                    continue
+                info = markets_map.get(mid, {})
+                mtype = info.get("marketType")
+                hcap = info.get("handicap")
+                outs = m.get("outcomes", {})
+
+                if mtype == "moneyline":
+                    for oid, oval in outs.items():
+                        p0 = oval.get("players", {}).get("0", {})
+                        if oid == "111":  # 1 = Home
+                            ml_home = p0.get("price")
+                        elif oid == "112":  # 2 = Away
+                            ml_away = p0.get("price")
+
+                elif mtype == "totals":
+                    over_p, under_p = None, None
+                    for oid, oval in outs.items():
+                        p0 = oval.get("players", {}).get("0", {})
+                        oid_name = ""
+                        for cat_out in info.get("outcomes", []):
+                            if str(cat_out.get("outcomeId")) == str(oid):
+                                oid_name = cat_out.get("outcomeName", "")
+                        if oid_name.lower() == "over":
+                            over_p = p0.get("price")
+                        elif oid_name.lower() == "under":
+                            under_p = p0.get("price")
+                        if p0.get("mainLine"):
+                            main_total = hcap
+
+                    if over_p is not None and under_p is not None:
+                        alt_totals.append({"line": hcap, "over": over_p, "under": under_p})
+                        if main_total == hcap:
+                            total_over_price = over_p
+                            total_under_price = under_p
+
+                elif mtype == "spreads":
+                    home_p, away_p = None, None
+                    for oid, oval in outs.items():
+                        p0 = oval.get("players", {}).get("0", {})
+                        oid_name = ""
+                        for cat_out in info.get("outcomes", []):
+                            if str(cat_out.get("outcomeId")) == str(oid):
+                                oid_name = cat_out.get("outcomeName", "")
+                        if oid_name in ("1", "Home"):
+                            home_p = p0.get("price")
+                        elif oid_name in ("2", "Away"):
+                            away_p = p0.get("price")
+                        if p0.get("mainLine"):
+                            main_spread = hcap
+
+                    if home_p is not None and away_p is not None:
+                        alt_spreads.append({"line": hcap, "home": home_p, "away": away_p})
+                        if main_spread == hcap:
+                            spread_home_price = home_p
+                            spread_away_price = away_p
+
+            games.append({
+                "source": "oddspapi_bcgame",
+                "event_id": f.get("fixtureId"),
+                "date": game_date,
+                "commence_time": start_time,
+                "home_team": home,
+                "away_team": away,
+                "matchup": f"{away} @ {home}",
+                "spread_home": main_spread,
+                "spread_away": -main_spread if main_spread is not None else None,
+                "spread_home_price": spread_home_price,
+                "spread_away_price": spread_away_price,
+                "total": main_total,
+                "total_over_price": total_over_price,
+                "total_under_price": total_under_price,
+                "ml_home_decimal": ml_home,
+                "ml_away_decimal": ml_away,
+                "bookmaker": "BC.Game",
+                "alternate_totals": sorted(alt_totals, key=lambda x: x["line"]),
+                "alternate_spreads": sorted(alt_spreads, key=lambda x: x["line"]),
+                "harvested_at": datetime.now(timezone.utc).isoformat(),
+            })
+
+        logger.info(f"Harvested {len(games)} games from BC.Game via OddsPapi")
+        return games
+    except Exception as e:
+        logger.error(f"Error fetching from OddsPapi for BC.Game: {e}")
+        return []
+
+
+# ===========================================================================
+# 3. ESPN PUBLIC API INGESTION (FREE FALLBACK + SCORES)
 # ===========================================================================
 
 def harvest_from_espn(date_str: str) -> List[Dict[str, Any]]:
@@ -349,6 +526,7 @@ def harvest_daily_odds(target_date: Optional[str] = None) -> List[Dict[str, Any]
     logger.info(f"--- Starting Odds Harvest for {target_date} ---")
 
     # Fetch from sources
+    bcgame_games = harvest_from_oddspapi_bcgame()
     odds_api_games = harvest_from_the_odds_api()
     espn_games = harvest_from_espn(target_date)
 
@@ -380,6 +558,34 @@ def harvest_daily_odds(target_date: Optional[str] = None) -> List[Dict[str, Any]
                 existing["ml_away"] = g["ml_away_decimal"]
         else:
             merged_games[key] = g
+
+    # 3. Enrich/overlay with BC.Game (HIGHEST PRIORITY - User Primary Sportsbook)
+    for g in bcgame_games:
+        key = (g["home_team"], g["away_team"])
+        if key in merged_games:
+            existing = merged_games[key]
+            if g.get("spread_home") is not None:
+                existing["spread_home"] = g["spread_home"]
+                existing["spread_away"] = g["spread_away"]
+                existing["spread_book"] = "BC.Game"
+            if g.get("total") is not None:
+                existing["total"] = g["total"]
+                existing["total_book"] = "BC.Game"
+            if g.get("ml_home_decimal") is not None:
+                existing["ml_home"] = g["ml_home_decimal"]
+                existing["ml_away"] = g["ml_away_decimal"]
+            existing["bookmaker"] = "BC.Game"
+            existing["spread_home_price"] = g.get("spread_home_price")
+            existing["spread_away_price"] = g.get("spread_away_price")
+            existing["total_over_price"] = g.get("total_over_price")
+            existing["total_under_price"] = g.get("total_under_price")
+            existing["alternate_totals"] = g.get("alternate_totals", [])
+            existing["alternate_spreads"] = g.get("alternate_spreads", [])
+        else:
+            # Game not in ESPN for this date yet; include if date matches or within 1 day
+            g_d = g.get("date", "")
+            if g_d == target_date:
+                merged_games[key] = g
 
     result_list = list(merged_games.values())
 
