@@ -516,7 +516,7 @@ def render_tracked_bets_png(
     fy = total_h - pad_outer - 28
     draw.text(
         (pad_outer + 8, fy),
-        "NBA Prop & Game Analyzer  •  Sweet-Spot Quant Engine  •  Closing Line Value (CLV) Verified",
+        "NBA BetLab  •  Sweet-Spot Quant Engine  •  Graded vs Official Box Scores",
         font=f_footer,
         fill=TEXT_SECONDARY,
     )
